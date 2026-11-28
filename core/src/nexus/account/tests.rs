@@ -24,7 +24,7 @@ fn round_trip<T: wire::Message + fmt::Debug + PartialEq>(value: T) {
 #[test]
 fn every_account_path_is_plain_and_has_its_own_name() {
     assert_eq!(SIGN_IN, "/nexus/api/signin");
-    assert_eq!(PATHS.len(), 6);
+    assert_eq!(PATHS.len(), 7);
     let mut seen = BTreeSet::new();
     for path in PATHS {
         assert!(path.starts_with(API));
@@ -39,7 +39,7 @@ fn a_password_and_a_code_each_make_one_sign_in_shape() {
         email: Email::new("  ADA@example.org ").unwrap(),
         password: Password::new("ten characters 🔑").unwrap(),
     }));
-    round_trip(signin(Credential::Code(OneTimeCode::new(CODE).unwrap())));
+    round_trip(signin(code_credential()));
 }
 
 const PASSWORD: &str = "a made-up password";
@@ -86,14 +86,32 @@ fn done<T>(result: T) -> Reply<T> {
     Reply::Done { result, receipt: receipt() }
 }
 
+fn code_credential() -> Credential {
+    Credential::Code {
+        code: OneTimeCode::new(CODE).unwrap(),
+        new_password: Password::new(PASSWORD).unwrap(),
+    }
+}
+
+fn sid(number: u64) -> SessionId {
+    SessionId::new(number).unwrap()
+}
+
+fn sign_out_note() -> SignOutNote {
+    SignOutNote { session: sid(11), secret: SignOutSecret::from_bytes([81; SECRET_BYTES]) }
+}
+
 fn good_sign_in() -> SignInReply {
-    done(SignInAnswer::SignedIn(SignedIn {
+    done(SignedIn {
         person: person(),
-        device: DeviceId::new(7).unwrap(),
+        device: id(7),
         session: session(),
-        music: music(),
+        session_id: sid(11),
+        sign_out: sign_out_note(),
+        restore: 8,
+        music: MusicLoginResult::Login(music()),
         notice: Notice::new("What this server records\nWhat you play.").unwrap(),
-    }))
+    })
 }
 
 fn head() -> RequestHead {
@@ -115,107 +133,127 @@ fn device(number: u64) -> Device {
         kind: DeviceKind::Pc,
         app_version: Version { major: 1, minor: 2, patch: 3 },
         last_seen_ms: 5,
-        signed_in: true,
+        session: Some(sid(number)),
+        this_device: false,
     }
 }
 
 #[test]
 fn every_call_and_success_reply_round_trips() {
     round_trip(good_sign_in());
-    round_trip(done(SignInAnswer::PasswordSetup(PasswordSetup {
-        session: session(),
-        person: person(),
-        device: id(7),
-    })));
-    round_trip(SignOut { head: head(), request_id: request_id() });
+    for music in [MusicLoginResult::NoneSetYet, MusicLoginResult::UnusableNow] {
+        let Reply::Done { mut result, receipt } = good_sign_in() else { unreachable!() };
+        result.music = music;
+        round_trip(Reply::Done { result, receipt });
+    }
+    round_trip(SignOut { head: head(), request_id: request_id(), revoke: None });
+    round_trip(SignOut { head: head(), request_id: request_id(), revoke: Some(sign_out_note()) });
     round_trip(done(SignedOut {}));
     round_trip(ListDevices { head: head(), after: Some(id(7)) });
     round_trip(ListDevices { head: head(), after: None });
-    round_trip(done(DevicePage::new(vec![device(8), device(9)], true).unwrap()));
-    round_trip(ForceOut { head: head(), device: id(9) });
+    let mut inactive = device(9);
+    inactive.session = None;
+    let mut own = device(8);
+    own.this_device = true;
+    round_trip(done(DevicePage::new(vec![own, inactive], true).unwrap()));
+    round_trip(ForceOut { head: head(), device: id(9), session: sid(11) });
     round_trip(done(ForcedOut { music_cut_off: true }));
     round_trip(done(ForcedOut { music_cut_off: false }));
     round_trip(ChangePassword {
         head: head(),
         request_id: request_id(),
-        current_password: Some(Password::new(PASSWORD).unwrap()),
-        new_password: Password::new("an even newer password").unwrap(),
-    });
-    round_trip(ChangePassword {
-        head: head(),
-        request_id: request_id(),
-        current_password: None,
+        current_password: Password::new(PASSWORD).unwrap(),
         new_password: Password::new("an even newer password").unwrap(),
     });
     round_trip(done(PasswordChanged {}));
     round_trip(GetMusicLogin { head: head() });
-    round_trip(done(music()));
+    round_trip(done(MusicLoginResult::Login(music())));
+    round_trip(done(MusicLoginResult::NoneSetYet));
+    round_trip(done(MusicLoginResult::UnusableNow));
     round_trip(music());
+    round_trip(GrantRequest {
+        head: head(),
+        change: GrantChange::ChangePassword { account: person().id },
+        password: Password::new(PASSWORD).unwrap(),
+    });
+    round_trip(GrantedChange {
+        head: head(),
+        request_id: request_id(),
+        change: GrantChange::DeleteListeningData { account: person().id },
+        grant: GrantSecret::from_bytes([21; SECRET_BYTES]),
+    });
+    round_trip(done(GrantIssued { grant: GrantSecret::from_bytes([21; SECRET_BYTES]) }));
 }
 
 #[test]
-fn the_code_session_has_no_music_or_regular_sign_in_fields() {
-    let value = done(SignInAnswer::PasswordSetup(PasswordSetup {
-        session: session(),
-        person: person(),
-        device: id(7),
-    }));
-    let body = encode(&value).unwrap();
-    let json: serde_json::Value = serde_json::from_slice(body.bytes()).unwrap();
-    let result = json.pointer("/done/result").unwrap();
-    assert!(result.get("signed_in").is_none());
-    let setup = result.get("password_setup").unwrap().as_object().unwrap();
-    assert_eq!(setup.keys().collect::<Vec<_>>(), ["device", "person", "session"]);
+fn a_code_needs_its_new_password_and_change_needs_its_current_password() {
+    let sample = encode(&signin(code_credential())).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(sample.bytes()).unwrap();
+    json["credential"]["code"] = serde_json::json!(CODE);
+    assert_eq!(read::<SignIn>(json.to_string().as_bytes()), Err(BadMessage::Form));
+    let incomplete = br#"{"head":{"speaks":[1,1],"restore":0},"request_id":1,"current_password":null,"new_password":"a valid new password"}"#;
+    assert_eq!(read::<ChangePassword>(incomplete), Err(BadMessage::Form));
 }
 
 #[test]
 fn bad_credentials_have_one_fixed_reply_and_cannot_carry_a_receipt() {
-    let response: SignInReply = Reply::Refused(Refusal::WrongLogin);
+    let response: SignInReply = Reply::Refused(Refusal::NotAllowed(NotAllowed::WrongLogin));
     let body = encode(&response).unwrap();
-    assert_eq!(body.bytes(), br#"{"refused":"wrong_login"}"#);
-    assert_eq!(read_reply::<SignInAnswer>(200, body.bytes()), Ok(response));
-    assert!(RefusedWithReceipt::new(Refusal::WrongLogin, receipt()).is_none());
+    assert_eq!(body.bytes(), br#"{"refused":{"not_allowed":"wrong_login"}}"#);
+    assert_eq!(response.status(), 403);
+    assert_eq!(read_reply::<SignInAnswer>(403, body.bytes()), Ok(response));
+    assert!(RefusedWithReceipt::new(Refusal::NotAllowed(NotAllowed::WrongLogin), receipt()).is_none());
     let reply = serde_json::json!({
-        "refused_with_receipt": {"reason": "wrong_login", "receipt": receipt()}
+        "refused_with_receipt": {"reason": {"not_allowed": "wrong_login"}, "receipt": receipt()}
     });
     assert_eq!(read::<SignInReply>(reply.to_string().as_bytes()), Err(BadMessage::Form));
 }
 
 #[test]
-fn every_refusal_round_trips_and_other_statuses_are_nothing() {
-    for reason in [
-        Refusal::WrongLogin,
-        Refusal::TooManyTries { wait: Wait::new(1).unwrap() },
-        Refusal::AccountOff,
-        Refusal::Busy,
-        Refusal::StartAgain,
-        Refusal::NotSignedIn,
-        Refusal::NoSuchDevice,
-        Refusal::PasswordNotAllowed,
-        Refusal::PasswordSetupOnly,
-        Refusal::BadRequest,
-        Refusal::NoMusicLogin,
-        Refusal::Incompatible { speaks: Speaks::new(21, 32).unwrap() },
+fn each_answer_kind_has_its_own_status_and_refusal_round_trips() {
+    for (status, reason) in [
+        (400, Refusal::Malformed),
+        (401, Refusal::NotSignedIn(NotSignedIn::SessionEnded)),
+        (401, Refusal::NotSignedIn(NotSignedIn::DataPutBack)),
+        (403, Refusal::NotAllowed(NotAllowed::Denied)),
+        (403, Refusal::NotAllowed(NotAllowed::WrongLogin)),
+        (403, Refusal::NotAllowed(NotAllowed::AccountOff)),
+        (403, Refusal::NotAllowed(NotAllowed::NoSuchDevice)),
+        (403, Refusal::NotAllowed(NotAllowed::PasswordNotAllowed)),
+        (403, Refusal::NotAllowed(NotAllowed::Incompatible { speaks: Speaks::new(21, 32).unwrap() })),
+        (429, Refusal::Busy { retry_after_seconds: Some(Wait::new(60).unwrap()) }),
+        (429, Refusal::Busy { retry_after_seconds: None }),
+        (503, Refusal::NotDealtWith),
     ] {
-        round_trip(Reply::<SignInAnswer>::Refused(reason));
+        let reply = Reply::<SignInAnswer>::Refused(reason);
+        let body = encode(&reply).unwrap();
+        assert_eq!(reply.status(), status);
+        assert_eq!(read_reply::<SignInAnswer>(status, body.bytes()), Ok(reply));
+        assert_eq!(read_reply::<SignInAnswer>(200, body.bytes()), Err(BadMessage::Status(200)));
     }
+    let sample = good_sign_in();
+    let body = encode(&sample).unwrap();
+    assert_eq!(sample.status(), 200);
+    assert_eq!(read_reply::<SignInAnswer>(200, body.bytes()), Ok(sample));
+    assert_eq!(read_reply::<SignInAnswer>(429, body.bytes()), Err(BadMessage::Status(429)));
     round_trip(Reply::<SignedOut>::RefusedWithReceipt(
-        RefusedWithReceipt::new(Refusal::StartAgain, receipt()).unwrap(),
+        RefusedWithReceipt::new(Refusal::NotAllowed(NotAllowed::Denied), receipt()).unwrap(),
     ));
+    assert!(RefusedWithReceipt::new(Refusal::NotSignedIn(NotSignedIn::DataPutBack), receipt()).is_none());
 
-    let body = br#"{"refused":"wrong_login"}"#;
-    for status in [201, 204, 302, 400, 401, 404, 405, 502] {
+    let body = br#"{"refused":"not_dealt_with"}"#;
+    for status in [201, 204, 302, 404, 405, 502] {
         assert_eq!(read_reply::<SignInAnswer>(status, body), Err(BadMessage::Status(status)));
     }
     assert_eq!(read_reply::<SignInAnswer>(200, b""), Err(BadMessage::Form));
-    assert_eq!(read_reply::<SignInAnswer>(200, b"<html>"), Err(BadMessage::Form));
+    assert_eq!(read_reply::<SignInAnswer>(400, b"<html>"), Err(BadMessage::Form));
     for raw in [
-        br#"{"refused":{"too_many_tries":{"wait":0}}}"#.as_slice(),
-        br#"{"refused":{"too_many_tries":{"wait":900001}}}"#,
-        br#"{"refused":{"too_many_tries":{"wait":"10"}}}"#,
-        br#"{"refused":{"incompatible":{"speaks":[0,1]}}}"#,
-        br#"{"refused":{"incompatible":{"speaks":[2,1]}}}"#,
-        br#"{"refused":"no_such_account"}"#,
+        br#"{"refused":{"busy":{"retry_after_seconds":0}}}"#.as_slice(),
+        br#"{"refused":{"busy":{"retry_after_seconds":61}}}"#,
+        br#"{"refused":{"busy":{"retry_after_seconds":"10"}}}"#,
+        br#"{"refused":{"not_allowed":{"incompatible":{"speaks":[0,1]}}}}"#,
+        br#"{"refused":{"not_allowed":{"incompatible":{"speaks":[2,1]}}}}"#,
+        br#"{"refused":{"not_allowed":"no_such_account"}}"#,
     ] {
         assert_eq!(read::<SignInReply>(raw), Err(BadMessage::Form));
     }
@@ -224,31 +262,31 @@ fn every_refusal_round_trips_and_other_statuses_are_nothing() {
 #[test]
 fn only_a_complete_utf8_body_without_duplicate_keys_is_read() {
     type Answer = Reply<SignedOut>;
-    let accepted = br#"{"refused":"wrong_login","future":{"a":[1,2,"x"]}}"#;
+    let accepted = br#"{"refused":"not_dealt_with","future":{"a":[1,2,"x"]}}"#;
     // A valid body can have whitespace, and known keys are compared after unescaping.
     assert!(read::<Answer>(accepted).is_ok());
-    assert!(read::<Answer>(br#" { "r\u0065fused": "wrong_login" } "#).is_ok());
+    assert!(read::<Answer>(br#" { "r\u0065fused": "not_dealt_with" } "#).is_ok());
 
     for end in 0..accepted.len() {
         assert_eq!(read::<Answer>(&accepted[..end]), Err(BadMessage::Form));
     }
     for raw in [
-        br#"{"refused":"wrong_login"}{}"#.as_slice(),
-        br#"{"refused":"wrong_login",}"#,
-        br#"{"refused":"wrong_login","refused":"busy"}"#,
-        br#"{"refused":"wrong_login","r\u0065fused":"busy"}"#,
-        br#"{"refused":"wrong_login","later":null,"later":false}"#,
-        br#"{"refused":"wrong_login","later":{"key":1,"k\u0065y":2}}"#,
-        br#"{"refused":"wrong_login","later":[{"k":true,"k":false}]}"#,
-        br#"{"refused":"wrong_login","later":[1,]}"#,
-        br#"{"refused":"wrong_login","later":"\ud800"}"#,
-        br#"{"refused":"wrong_login","later":"\udc00"}"#,
-        br#"{"refused":"wrong_login","later":"\ud801\u007f"}"#,
-        br#"{"refused":"wrong_login","later":"\ud801\ud801"}"#,
-        br#"{"refused":"wrong_login","later":"\uabcdx\q"}"#,
-        b"{\"refused\":\"wrong_login\",\"later\":\"\xff\"}",
-        b"{\"refused\":\"wrong_login\",\"later\":\"\x01\"}",
-        b"{\"refused\":\"wrong_login\",\"\xff\":true}",
+        br#"{"refused":"not_dealt_with"}{}"#.as_slice(),
+        br#"{"refused":"not_dealt_with",}"#,
+        br#"{"refused":"not_dealt_with","refused":"busy"}"#,
+        br#"{"refused":"not_dealt_with","r\u0065fused":"busy"}"#,
+        br#"{"refused":"not_dealt_with","later":null,"later":false}"#,
+        br#"{"refused":"not_dealt_with","later":{"key":1,"k\u0065y":2}}"#,
+        br#"{"refused":"not_dealt_with","later":[{"k":true,"k":false}]}"#,
+        br#"{"refused":"not_dealt_with","later":[1,]}"#,
+        br#"{"refused":"not_dealt_with","later":"\ud800"}"#,
+        br#"{"refused":"not_dealt_with","later":"\udc00"}"#,
+        br#"{"refused":"not_dealt_with","later":"\ud801\u007f"}"#,
+        br#"{"refused":"not_dealt_with","later":"\ud801\ud801"}"#,
+        br#"{"refused":"not_dealt_with","later":"\uabcdx\q"}"#,
+        b"{\"refused\":\"not_dealt_with\",\"later\":\"\xff\"}",
+        b"{\"refused\":\"not_dealt_with\",\"later\":\"\x01\"}",
+        b"{\"refused\":\"not_dealt_with\",\"\xff\":true}",
     ] {
         assert_eq!(read::<Answer>(raw), Err(BadMessage::Form));
     }
@@ -259,7 +297,7 @@ fn both_known_and_unknown_parts_obey_the_body_and_depth_limits() {
     type Answer = Reply<SignedOut>;
     let depth = |count: usize, open: &str, close: &str| {
         format!(
-            "{{\"refused\":\"wrong_login\",\"later\":{}null{}}}",
+            "{{\"refused\":\"not_dealt_with\",\"later\":{}null{}}}",
             open.repeat(count),
             close.repeat(count)
         )
@@ -268,8 +306,8 @@ fn both_known_and_unknown_parts_obey_the_body_and_depth_limits() {
         assert!(read::<Answer>(depth(15, open, close).as_bytes()).is_ok());
         assert_eq!(read::<Answer>(depth(16, open, close).as_bytes()), Err(BadMessage::Form));
     }
-    let mut bytes = br#"{"refused":"wrong_login"}"#.to_vec();
-    bytes.resize(BODY_MAX_BYTES, b' ');
+    let mut bytes = br#"{"refused":"not_dealt_with"}"#.to_vec();
+    bytes.resize(SMALL_REPLY_MAX_BYTES, b' ');
     assert!(read::<Answer>(&bytes).is_ok());
     bytes.push(b' ');
     assert_eq!(read::<Answer>(&bytes), Err(BadMessage::TooLarge));
@@ -278,7 +316,7 @@ fn both_known_and_unknown_parts_obey_the_body_and_depth_limits() {
 #[test]
 fn escaped_passwords_keep_their_exact_characters() {
     let raw = format!(
-        r#"{{"credential":{{"password":{{"email":"ADA@example.org","password":"word\u00e9\ud83d\udd11\b\t\n\r\f\\\"\/"}}}},"device_secret":"{}","device_name":"Ada's phone","device_kind":"phone","app_version":"1.2.3","speaks":[1,1],"restore":null}}"#,
+        r#"{{"credential":{{"password":{{"email":"ADA@example.org","password":"words\u00e9\ud83d\udd11\b\t\n\r\f\\\"\/"}}}},"device_secret":"{}","device_name":"Ada's phone","device_kind":"phone","app_version":"1.2.3","speaks":[1,1],"restore":null}}"#,
         "21".repeat(32),
     );
     let value = read::<SignIn>(raw.as_bytes()).unwrap();
@@ -286,7 +324,7 @@ fn escaped_passwords_keep_their_exact_characters() {
         panic!("password credential required");
     };
     assert_eq!(account, email());
-    assert_eq!(password, Password::new("wordé🔑\u{08}\t\n\r\u{0c}\\\"/").unwrap());
+    assert_eq!(password, Password::new("wordsé🔑\u{08}\t\n\r\u{0c}\\\"/").unwrap());
 }
 
 /// Try a value of the wrong type and then omit each named field.
@@ -321,24 +359,24 @@ fn each_known_request_field_is_required_and_typed() {
         "/speaks",
         "/restore",
     ]);
-    bad_fields(&signin(Credential::Code(OneTimeCode::new(CODE).unwrap())), &["/credential/code"]);
-    bad_fields(&SignOut { head: head(), request_id: request_id() }, &[
-        "/head", "/head/speaks", "/head/restore", "/request_id",
+    bad_fields(&signin(code_credential()), &["/credential/code", "/credential/code/code", "/credential/code/new_password"]);
+    bad_fields(&SignOut { head: head(), request_id: request_id(), revoke: None }, &[
+        "/head", "/head/speaks", "/head/restore", "/request_id", "/revoke",
     ]);
     bad_fields(&ListDevices { head: head(), after: Some(id(7)) }, &["/head", "/after"]);
-    bad_fields(&ForceOut { head: head(), device: id(7) }, &["/head", "/device"]);
+    bad_fields(&ForceOut { head: head(), device: id(7), session: sid(11) }, &["/head", "/device", "/session"]);
     bad_fields(&GetMusicLogin { head: head() }, &["/head"]);
     bad_fields(&ChangePassword {
         head: head(),
         request_id: request_id(),
-        current_password: None,
+        current_password: Password::new(PASSWORD).unwrap(),
         new_password: Password::new(PASSWORD).unwrap(),
     }, &["/head", "/request_id", "/current_password", "/new_password"]);
-    assert_eq!(read::<ForceOut>(br#"{"head":{"speaks":[1,1],"restore":0},"device":0}"#), Err(BadMessage::Form));
-    assert_eq!(read::<SignOut>(br#"{"head":{"speaks":[1,1],"restore":0},"request_id":0}"#), Err(BadMessage::Form));
-    assert_eq!(read::<SignOut>(br#"{"head":[[1,1],0],"request_id":1}"#), Err(BadMessage::Form));
+    assert_eq!(read::<ForceOut>(br#"{"head":{"speaks":[1,1],"restore":0},"device":0,"session":1}"#), Err(BadMessage::Form));
+    assert_eq!(read::<SignOut>(br#"{"head":{"speaks":[1,1],"restore":0},"request_id":0,"revoke":null}"#), Err(BadMessage::Form));
+    assert_eq!(read::<SignOut>(br#"{"head":[[1,1],0],"request_id":1,"revoke":null}"#), Err(BadMessage::Form));
 
-    let setup = encode(&signin(Credential::Code(OneTimeCode::new(CODE).unwrap()))).unwrap();
+    let setup = encode(&signin(code_credential())).unwrap();
     let mut competing: serde_json::Value = serde_json::from_slice(setup.bytes()).unwrap();
     competing["credential"]["password"] = serde_json::json!({
         "email": "ada@example.org", "password": PASSWORD
@@ -349,21 +387,27 @@ fn each_known_request_field_is_required_and_typed() {
 #[test]
 fn each_known_answer_field_is_required_and_typed() {
     bad_fields(&good_sign_in(), &[
-        "/done/result/signed_in/session",
-        "/done/result/signed_in/person",
-        "/done/result/signed_in/person/id",
-        "/done/result/signed_in/person/revision",
-        "/done/result/signed_in/person/email",
-        "/done/result/signed_in/person/name",
-        "/done/result/signed_in/person/admin",
-        "/done/result/signed_in/device",
-        "/done/result/signed_in/music",
-        "/done/result/signed_in/music/address",
-        "/done/result/signed_in/music/name",
-        "/done/result/signed_in/music/salt",
-        "/done/result/signed_in/music/token",
-        "/done/result/signed_in/music/count",
-        "/done/result/signed_in/notice",
+        "/done/result/session",
+        "/done/result/session_id",
+        "/done/result/sign_out",
+        "/done/result/sign_out/session",
+        "/done/result/sign_out/secret",
+        "/done/result/restore",
+        "/done/result/person",
+        "/done/result/person/id",
+        "/done/result/person/revision",
+        "/done/result/person/email",
+        "/done/result/person/name",
+        "/done/result/person/admin",
+        "/done/result/device",
+        "/done/result/music",
+        "/done/result/music/login",
+        "/done/result/music/login/address",
+        "/done/result/music/login/name",
+        "/done/result/music/login/salt",
+        "/done/result/music/login/token",
+        "/done/result/music/login/count",
+        "/done/result/notice",
         "/done/receipt",
         "/done/receipt/music_login_count",
         "/done/receipt/stamp",
@@ -380,7 +424,8 @@ fn each_known_answer_field_is_required_and_typed() {
         "/done/result/devices/0/kind",
         "/done/result/devices/0/app_version",
         "/done/result/devices/0/last_seen_ms",
-        "/done/result/devices/0/signed_in",
+        "/done/result/devices/0/session",
+        "/done/result/devices/0/this_device",
         "/done/result/more",
     ]);
     bad_fields(&done(ForcedOut { music_cut_off: false }), &["/done/result/music_cut_off"]);
@@ -404,31 +449,32 @@ fn a_new_password_counts_characters_and_cannot_be_the_email() {
     assert!(Password::new(&"🔑".repeat(PASSWORD_MIN_CHARS)).is_some());
     assert!(Password::new(&"🔑".repeat(PASSWORD_MAX_CHARS)).is_some());
     assert!(Password::new(&"🔑".repeat(PASSWORD_MAX_CHARS + 1)).is_none());
-    assert!(Password::new("          ").unwrap().allowed_for(&email()));
+    assert!(Password::new("               ").unwrap().allowed_for(&email(), ""));
     for text in ["ada@example.org", "ADA@EXAMPLE.ORG", "  Ada@example.org\u{2003}"] {
-        assert!(!Password::new(text).unwrap().allowed_for(&email()));
+        assert!(!Password::new(text).unwrap().allowed_for(&email(), ""));
     }
-    assert!(Password::new("ada@another.example.org").unwrap().allowed_for(&email()));
+    assert!(Password::new("ada@another.example.org").unwrap().allowed_for(&email(), ""));
     assert_ne!(Password::new(PASSWORD), Password::new(&format!("{PASSWORD}\0")));
     assert_ne!(Password::new("b made-up password"), Password::new(PASSWORD));
     assert_ne!(Password::new("a made-up passworD"), Password::new(PASSWORD));
 }
 
 #[test]
-fn codes_use_exactly_twelve_symbols_and_exclude_each_look_alike() {
+fn codes_use_twelve_crockford_symbols_and_normalize_typed_aliases() {
     let alphabet: BTreeSet<u8> = CODE_ALPHABET.iter().copied().collect();
-    assert_eq!(alphabet.len(), 21);
+    assert_eq!(alphabet.len(), 32);
     for &byte in CODE_ALPHABET {
         assert!(OneTimeCode::new(&char::from(byte).to_string().repeat(12)).is_some());
     }
-    for bad in b"ABEGILOQSTZ0125" {
-        assert!(!alphabet.contains(bad));
-        assert!(OneTimeCode::new(&format!("CDFHJKMN347{}", char::from(*bad))).is_none());
+    assert_eq!(OneTimeCode::new("oIlCDFHJKMPq").unwrap().expose(), "011CDFHJKMPQ");
+    assert_eq!(OneTimeCode::new("cdfhjkmn3479"), OneTimeCode::new(CODE));
+    for bad in ["CDFHJKMN347U", "CDFHJKMN347-", "CDFHJKMN347", "CDFHJKMN34799"] {
+        assert!(OneTimeCode::new(bad).is_none());
     }
-    assert!(OneTimeCode::new("cdfhjkmn3479").is_none());
-    assert!(OneTimeCode::new("CDFHJKMN347").is_none());
-    assert!(OneTimeCode::new("CDFHJKMN34799").is_none());
     assert_ne!(OneTimeCode::new(CODE), OneTimeCode::new("CDFHJKMN3478"));
+    assert_eq!(OneTimeCode::from_random(0).expose(), "000000000000");
+    assert_eq!(OneTimeCode::from_random(u64::MAX).expose(), "ZZZZZZZZZZZZ");
+    assert_eq!(OneTimeCode::from_random(32).expose(), "000000000010");
 }
 
 #[test]
@@ -448,7 +494,7 @@ fn names_notices_and_music_addresses_obey_their_byte_bounds() {
     let exact = format!("{base}{}", "a".repeat(MUSIC_ADDRESS_MAX_BYTES - base.len()));
     assert!(MusicAddress::new(&exact).is_some());
     assert!(MusicAddress::new(&format!("{exact}x")).is_none());
-    for good in [ADDRESS, "https://[2001:db8::1]:443/music", "https://music.example.org/a%20b"] {
+    for good in [ADDRESS, "https://[2001:db8::1]:443/music", "https://music.example.org/a-b"] {
         assert!(MusicAddress::new(good).is_some());
     }
     for bad in [
@@ -457,7 +503,7 @@ fn names_notices_and_music_addresses_obey_their_byte_bounds() {
         "https://ada:example@music.example.org", "https://music.example.org?q=1",
         "https://music.example.org/#music", "https://music.example.org\\x",
         "https://music.example.org:65536", "https://[::::]/music",
-        "https://music.example.org/a%", "https://music.example.org/a%xy",
+        "https://music.example.org/a%", "https://music.example.org/a%xy", "https://music.example.org/a%20b",
         "https://music.example.org/no\u{7f}",
     ] {
         assert!(MusicAddress::new(bad).is_none());
@@ -502,7 +548,7 @@ fn debug_and_wire_errors_reveal_no_secret() {
     });
     let body = encode(&value).unwrap();
     assert_eq!(format!("{body:?}"), "WireBody(..)");
-    let code = signin(Credential::Code(OneTimeCode::new(CODE).unwrap()));
+    let code = signin(code_credential());
     let reply = good_sign_in();
     for (printed, hidden) in [
         (format!("{value:?}"), PASSWORD.to_string()),
@@ -512,6 +558,7 @@ fn debug_and_wire_errors_reveal_no_secret() {
         (format!("{reply:#?}"), "2d".repeat(32)),
         (format!("{reply:?}"), "39".repeat(16)),
         (format!("{reply:?}"), "45".repeat(32)),
+        (format!("{reply:?}"), "51".repeat(32)),
         (format!("{:?}", session().authorization()), "2d".repeat(32)),
     ] {
         assert!(!printed.contains(&hidden));
@@ -551,92 +598,9 @@ fn a_login_must_agree_with_its_stamp_and_count_in_both_directions() {
     assert_eq!(read::<SignInReply>(&bytes), Err(BadMessage::Form));
     let mut wrong_count = music();
     wrong_count.count = 5;
-    let value = done(wrong_count);
+    let value = done(MusicLoginResult::Login(wrong_count));
     assert!(matches!(encode(&value), Err(BadMessage::Form)));
     assert_eq!(read::<MusicLoginReply>(&serde_json::to_vec(&value).unwrap()), Err(BadMessage::Form));
-}
-
-#[test]
-fn the_fifth_wrong_password_locks_until_the_first_miss_is_fifteen_minutes_old() {
-    let first = 600;
-    let mut failures = AccountFailures::default();
-    assert!(failures.is_expired(first));
-    for n in 0..u64::from(WRONG_PASSWORDS) {
-        let now = first + 37 * n;
-        assert_eq!(failures.retry_after(now), None);
-        failures.record_wrong(now);
-    }
-    assert_eq!(failures.retry_after(first - 1).map(Wait::ms), Some(WRONG_PASSWORD_WINDOW_MS));
-    let end = first + WRONG_PASSWORD_WINDOW_MS;
-    assert_eq!(failures.retry_after(end - 1).map(Wait::ms), Some(1));
-    assert!(!failures.is_expired(end - 1));
-    assert_eq!(failures.retry_after(end), None);
-    assert!(failures.is_expired(end));
-    failures.record_wrong(end);
-    assert_eq!(failures.retry_after(end + 1), None);
-}
-
-#[test]
-fn successful_checks_leave_the_wrong_password_count_and_its_start_alone() {
-    let mut failures = AccountFailures::default();
-    for _ in 0..4 {
-        failures.record_wrong(100);
-    }
-    // A successful password check only asks the gate. It does not update failures.
-    assert_eq!(failures.retry_after(110), None);
-    failures.record_wrong(120);
-    assert_eq!(failures.retry_after(121).map(Wait::ms), Some(WRONG_PASSWORD_WINDOW_MS - 21));
-    assert_eq!(AccountFailures::default().retry_after(121), None);
-}
-
-fn wait_ms(result: Result<(), Refusal>) -> Option<u64> {
-    match result {
-        Ok(()) => None,
-        Err(Refusal::TooManyTries { wait }) => Some(wait.ms()),
-        Err(other) => panic!("unexpected refusal {other:?}"),
-    }
-}
-
-#[test]
-fn a_restart_takes_no_sign_ins_until_twenty_seconds_have_passed() {
-    let start = 1000;
-    let mut limit = SignInLimit::new(start);
-    assert_eq!(wait_ms(limit.admit(start - 1)), Some(20_000));
-    assert_eq!(wait_ms(limit.admit(start)), Some(20_000));
-    assert_eq!(wait_ms(limit.admit(start + 19_999)), Some(1));
-    assert_eq!(limit.admit(start + 20_000), Ok(()));
-    let mut restart = SignInLimit::new(start + 25_000);
-    assert_eq!(wait_ms(restart.admit(start + 25_000)), Some(20_000));
-    let mut last = SignInLimit::new(u64::MAX - STARTUP_QUIET_MS);
-    assert_eq!(wait_ms(last.admit(u64::MAX - 1)), Some(1));
-    assert_eq!(last.admit(u64::MAX), Ok(()));
-}
-
-#[test]
-fn every_rolling_minute_takes_at_most_thirty_sign_ins() {
-    let mut limit = SignInLimit::new(0);
-    let first = 59_999;
-    for time in first..first + 30 {
-        assert_eq!(limit.admit(time), Ok(()));
-    }
-    assert_eq!(wait_ms(limit.admit(first + 30)), Some(59_970));
-    assert_eq!(wait_ms(limit.admit(first + 1)), Some(59_970));
-    for oldest in first..first + 30 {
-        assert_eq!(wait_ms(limit.admit(oldest + 60_000 - 1)), Some(1));
-        assert_eq!(limit.admit(oldest + 60_000), Ok(()));
-    }
-}
-
-#[test]
-fn password_work_uses_two_places_then_eight_waiting_places() {
-    assert_eq!(admit_password_check(0, 0), PasswordAdmission::Check);
-    assert_eq!(admit_password_check(1, 0), PasswordAdmission::Check);
-    for waiting in 0..8 {
-        assert_eq!(admit_password_check(2, waiting), PasswordAdmission::Wait);
-    }
-    assert_eq!(admit_password_check(2, 8), PasswordAdmission::Busy);
-    assert_eq!(admit_password_check(1, 1), PasswordAdmission::Wait);
-    assert_eq!(admit_password_check(usize::MAX, usize::MAX), PasswordAdmission::Busy);
 }
 
 #[test]
@@ -644,20 +608,21 @@ fn session_values_use_strict_numbers_version_and_protocol_range() {
     let sample = SignOut {
         head: RequestHead { speaks: Speaks::new(u32::MAX, u32::MAX).unwrap(), restore: u64::MAX },
         request_id: RequestId::new(u64::MAX).unwrap(),
+        revoke: None,
     };
     round_trip(sample);
     for text in [
-        r#"{"head":{"speaks":[1],"restore":3},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,1,1],"restore":3},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,4294967296],"restore":3},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,1],"restore":18446744073709551616},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,1],"restore":-1},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,1],"restore":1.0},"request_id":2}"#,
-        r#"{"head":{"speaks":[1,1],"restore":3},"request_id":-1}"#,
+        r#"{"head":{"speaks":[1],"restore":3},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,1,1],"restore":3},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,4294967296],"restore":3},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,1],"restore":18446744073709551616},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,1],"restore":-1},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,1],"restore":1.0},"request_id":2,"revoke":null}"#,
+        r#"{"head":{"speaks":[1,1],"restore":3},"request_id":-1,"revoke":null}"#,
     ] {
         assert_eq!(read::<SignOut>(text.as_bytes()), Err(BadMessage::Form));
     }
-    let sample = signin(Credential::Code(OneTimeCode::new(CODE).unwrap()));
+    let sample = signin(code_credential());
     let mut json = serde_json::to_value(sample).unwrap();
     for version in ["01.2.3", "1.2", "1.2.3-alpha", "4294967296.2.3"] {
         json["app_version"] = serde_json::Value::String(version.to_owned());
@@ -676,6 +641,87 @@ fn the_sign_in_and_retry_wire_spellings_are_fixed() {
         "21".repeat(SECRET_BYTES),
     );
     assert!(body.bytes() == expected.as_bytes());
-    let wire = encode(&SignOut { head: head(), request_id: request_id() }).unwrap();
-    assert_eq!(wire.bytes(), br#"{"head":{"speaks":[1,1],"restore":8},"request_id":9}"#);
+    let wire = encode(&SignOut { head: head(), request_id: request_id(), revoke: None }).unwrap();
+    assert_eq!(wire.bytes(), br#"{"head":{"speaks":[1,1],"restore":8},"request_id":9,"revoke":null}"#);
+}
+
+#[test]
+fn nexus_origins_come_from_the_typed_name_and_music_is_checked_on_handover() {
+    let nexus = NexusOrigin::typed("Nexus.example.org:8443").unwrap();
+    let sign_in = nexus.call(SIGN_IN).unwrap();
+    assert_eq!(sign_in.wire(), "https://nexus.example.org:8443/nexus/api/signin");
+    for input in [
+        "http://nexus.example.org", "nexus.example.org/extra", "nexus.example.org?",
+        "nexus.example.org#test", "ada@nexus.example.org",
+    ] {
+        assert!(NexusOrigin::typed(input).is_err());
+    }
+    assert!(nexus.call("/elsewhere").is_err());
+    let music = MusicAddress::new(ADDRESS).unwrap();
+    assert!(music.handed_over(&nexus, HandoverSource::DeviceTokenAnswer(&sign_in)).is_ok());
+    assert!(music.handed_over(&nexus, HandoverSource::Other).is_err());
+    let other = NexusOrigin::typed("other.example.org").unwrap().call(SIGN_IN).unwrap();
+    assert!(music.handed_over(&nexus, HandoverSource::DeviceTokenAnswer(&other)).is_err());
+}
+
+#[test]
+fn a_new_password_is_checked_against_the_backend_list() {
+    let list = "not this password\r\n a made-up password \r\nanother long password";
+    assert!(!Password::new(PASSWORD).unwrap().allowed_for(&email(), list));
+    assert!(!Password::new(" A MADE-UP PASSWORD ").unwrap().allowed_for(&email(), list));
+    assert!(Password::new("a different password").unwrap().allowed_for(&email(), list));
+}
+
+#[test]
+fn request_and_reply_ceilings_depend_on_the_call_and_status() {
+    fn padded(body: &WireBody, len: usize) -> Vec<u8> {
+        let mut bytes = body.bytes().to_vec();
+        assert!(bytes.len() <= len);
+        bytes.resize(len, b' ');
+        bytes
+    }
+
+    let request = encode(&signin(code_credential())).unwrap();
+    assert!(read::<SignIn>(&padded(&request, PASSWORD_REQUEST_MAX_BYTES)).is_ok());
+    assert_eq!(read::<SignIn>(&padded(&request, PASSWORD_REQUEST_MAX_BYTES + 1)), Err(BadMessage::TooLarge));
+    let request = encode(&ListDevices { head: head(), after: None }).unwrap();
+    assert!(read::<ListDevices>(&padded(&request, SMALL_REQUEST_MAX_BYTES)).is_ok());
+    assert_eq!(read::<ListDevices>(&padded(&request, SMALL_REQUEST_MAX_BYTES + 1)), Err(BadMessage::TooLarge));
+
+    let first = encode(&good_sign_in()).unwrap();
+    assert!(read_reply::<SignInAnswer>(200, &padded(&first, SIGN_IN_REPLY_MAX_BYTES)).is_ok());
+    assert_eq!(read_reply::<SignInAnswer>(200, &padded(&first, SIGN_IN_REPLY_MAX_BYTES + 1)), Err(BadMessage::TooLarge));
+
+    let list = encode(&done(DevicePage::new(vec![device(1)], false).unwrap())).unwrap();
+    assert!(read_reply::<DevicePage>(200, &padded(&list, LIST_REPLY_MAX_BYTES)).is_ok());
+    assert_eq!(read_reply::<DevicePage>(200, &padded(&list, LIST_REPLY_MAX_BYTES + 1)), Err(BadMessage::TooLarge));
+
+    let refusal = encode(&Reply::<DevicePage>::Refused(Refusal::Malformed)).unwrap();
+    assert!(read_reply::<DevicePage>(400, &padded(&refusal, SMALL_REPLY_MAX_BYTES)).is_ok());
+    assert_eq!(read_reply::<DevicePage>(400, &padded(&refusal, SMALL_REPLY_MAX_BYTES + 1)), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn sign_out_can_only_revoke_the_session_named_by_its_separate_secret() {
+    let Reply::Done { mut result, receipt } = good_sign_in() else { unreachable!() };
+    result.sign_out.session = sid(12);
+    let wrong_id = Reply::Done { result, receipt };
+    assert!(matches!(encode(&wrong_id), Err(BadMessage::Form)));
+    assert_eq!(read::<SignInReply>(&serde_json::to_vec(&wrong_id).unwrap()), Err(BadMessage::Form));
+
+    let Reply::Done { mut result, receipt } = good_sign_in() else { unreachable!() };
+    result.sign_out.secret = SignOutSecret::from_bytes(*result.session.expose_bytes());
+    assert!(matches!(encode(&Reply::Done { result, receipt }), Err(BadMessage::Form)));
+    // The note is a body credential. Its encoding is not a session Authorization value.
+    assert!(Session::from_authorization(sign_out_note().secret.expose_hex().as_str()).is_none());
+}
+
+#[test]
+fn a_force_out_retry_keeps_the_old_session_number() {
+    let force = ForceOut { head: head(), device: id(7), session: sid(11) };
+    let encoded = encode(&force).unwrap();
+    let live = Device { session: Some(sid(12)), ..device(7) };
+    let retried: ForceOut = read(encoded.bytes()).unwrap();
+    assert_eq!(retried.device, live.id);
+    assert_ne!(Some(retried.session), live.session);
 }
