@@ -240,6 +240,14 @@ pub struct Settings {
     /// The person has been told that the settings folder's drive can't make hard links
     /// (`no_links_note`).
     pub said_no_links: bool,
+    /// The address and email last signed in with to the Nexus server, put in the sign-in
+    /// screen's fields (nothing secret: the session is kept where secrets are kept).
+    pub sign_in_address: String,
+    pub sign_in_email: String,
+    /// Who took over the folder this PC had before the Nexus server (the backend's id and
+    /// their account), and that folder's name: written once, at that sign-in (`folder_for`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_over: Option<(String, String)>,
 }
 
 impl Default for Settings {
@@ -307,6 +315,9 @@ impl Default for Settings {
             check_updates: true,
             update_notified: String::new(),
             said_no_links: false,
+            sign_in_address: String::new(),
+            sign_in_email: String::new(),
+            carried_over: None,
         }
     }
 }
@@ -1094,9 +1105,7 @@ pub fn forget_old_password(paths: &Paths, _server: &str, _username: &str) {
 
 /// The sign-in to the music server this device was handed by the Nexus server (design 9.4):
 /// the server's address, the name of the person's user there, and a salt and token made for
-/// this device. Kept where secrets are kept, under [`MUSIC_LOGIN`], and read at a cold start
-/// so that the app plays without asking the Nexus server anything first (design 6.1). Never
-/// a password.
+/// this device, with the number of the login they were made from. Never a password.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MusicLogin {
     pub server: String,
@@ -1113,24 +1122,130 @@ impl std::fmt::Debug for MusicLogin {
     }
 }
 
-/// The name the music login is kept under.
-const MUSIC_LOGIN: &str = "nexus-music-login";
-
-/// The music login this device keeps, if it keeps one that can be read.
-pub fn load_music_login(paths: &Paths) -> Option<MusicLogin> {
-    let text = read_kept(paths, MUSIC_LOGIN).ok()??;
-    let login: MusicLogin = serde_json::from_str(&text).ok()?;
-    (!login.server.is_empty() && !login.username.is_empty() && !login.salt.is_empty() && !login.token.is_empty()).then_some(login)
+/// What a sign-in to the Nexus server leaves on this PC (design 11): **one thing, kept where
+/// secrets are kept and put in place in one step**, so that a write cut short leaves the one
+/// before it whole. A cold start reads it and plays from its music login without asking the
+/// Nexus server anything (design 6.1). The device's own secret is kept beside it; the
+/// password typed, nowhere.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedIn {
+    /// The Nexus origin, from the address the person typed: where every call goes.
+    pub nexus: String,
+    /// The backend's id, expected at that origin from now on.
+    pub backend: String,
+    /// Who the person is to the backend: their account, by its email.
+    pub account: String,
+    /// This device's number at the backend.
+    pub device: u64,
+    /// The session, as hex.
+    pub session: String,
+    /// The backend's restore number as last told (design 12.3).
+    pub restore: u64,
+    pub music: MusicLogin,
+    /// The name of the folder this person's things are kept under on this PC (downloads,
+    /// the changes waiting for the music server, the pages kept): decided once, at the
+    /// sign-in that made it (`folder_for`), and from then on tied to who they are to the
+    /// backend, never to the music server and user.
+    pub folder: String,
 }
 
-/// Keeps the music login; says whether it was kept.
-pub fn save_music_login(paths: &Paths, login: &MusicLogin) -> bool {
-    serde_json::to_string(login).is_ok_and(|text| write_kept(paths, MUSIC_LOGIN, &text))
+impl std::fmt::Debug for SignedIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignedIn {{ nexus: {:?}, account: {:?}, device: {}, music: {:?}, folder: {:?} }}", self.nexus, self.account, self.device, self.music, self.folder)
+    }
 }
 
-/// Forgets the music login (signed out, or forced out and signed out).
-pub fn forget_music_login(paths: &Paths) {
-    write_kept(paths, MUSIC_LOGIN, "");
+/// The name it is kept under.
+const SIGNED_IN: &str = "nexus-sign-in";
+
+/// What the last sign-in left, if it is there and can be read whole.
+pub fn load_sign_in(paths: &Paths) -> Option<SignedIn> {
+    let text = read_kept(paths, SIGNED_IN).ok()??;
+    let kept: SignedIn = serde_json::from_str(&text).ok()?;
+    let music = &kept.music;
+    (!kept.nexus.is_empty() && !kept.session.is_empty() && !kept.folder.is_empty() && !music.server.is_empty() && !music.username.is_empty() && !music.salt.is_empty() && !music.token.is_empty())
+        .then_some(kept)
+}
+
+/// Puts what a sign-in left in place, whole, in one step; says whether it was kept.
+pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
+    serde_json::to_string(kept).is_ok_and(|text| write_kept(paths, SIGNED_IN, &text))
+}
+
+/// Forgets it: signed out, or the Nexus server has said the session has ended.
+pub fn forget_sign_in(paths: &Paths) {
+    write_kept(paths, SIGNED_IN, "");
+}
+
+/// The folder a person's things are kept under, decided at their first sign-in on this PC
+/// (design 11). **What is carried over, exactly:** the folder of the sign-in this PC had
+/// before the Nexus server (named by the music server and user, `account_stem`) becomes
+/// the person's, **once**, if the music login they are handed names that same music server
+/// and that same user. Every other person, and anyone handed that music user later, gets a
+/// folder named by who they are to the backend: its id and their account. The carry-over is
+/// written down (`Settings::carried_over`) by whoever calls this, so that it happens once.
+pub fn folder_for(settings: &Settings, backend: &str, account: &str, music_server: &str, music_user: &str) -> (String, bool) {
+    if let Some((owner, folder)) = &settings.carried_over
+        && owner == &format!("{backend}\n{account}")
+    {
+        return (folder.clone(), false);
+    }
+    let before = !settings.server.is_empty() && !settings.username.is_empty();
+    if settings.carried_over.is_none() && before && settings.server == music_server && settings.username == music_user {
+        return (crate::controller::account_stem(music_server, music_user), true);
+    }
+    (person_folder(backend, account), false)
+}
+
+/// A folder named by who a person is to the backend: as much of their account as reads
+/// easily, and a short hash of exactly that and the backend's id, so that no two share one
+/// on a disk that ignores case either.
+pub fn person_folder(backend: &str, account: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut readable = String::new();
+    for c in account.chars() {
+        match c.to_ascii_lowercase() {
+            c if c.is_ascii_lowercase() || c.is_ascii_digit() => readable.push(c),
+            _ if readable.ends_with('-') || readable.is_empty() => {}
+            _ => readable.push('-'),
+        }
+    }
+    let readable: String = readable.chars().take(32).collect();
+    let hash: String = Sha256::digest(format!("{backend}\n{account}").as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    format!("nexus-{}-{hash}", readable.trim_end_matches('-'))
+}
+
+/// A sign-out the Nexus server could not be told of (design 11): the one thing kept of a
+/// session after signing out, which is used for nothing but to end it, and is tried again
+/// until the backend has it or it is 90 days old.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SignOutNote {
+    pub nexus: String,
+    pub backend: String,
+    pub session: String,
+    pub restore: u64,
+    /// When the sign-out was made, in seconds since 1970.
+    pub at: i64,
+}
+
+impl std::fmt::Debug for SignOutNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignOutNote {{ nexus: {:?}, at: {} }}", self.nexus, self.at)
+    }
+}
+
+const SIGN_OUT_NOTE: &str = "nexus-sign-out-note";
+
+pub fn load_sign_out_note(paths: &Paths) -> Option<SignOutNote> {
+    serde_json::from_str(&read_kept(paths, SIGN_OUT_NOTE).ok()??).ok()
+}
+
+pub fn save_sign_out_note(paths: &Paths, note: &SignOutNote) -> bool {
+    serde_json::to_string(note).is_ok_and(|text| write_kept(paths, SIGN_OUT_NOTE, &text))
+}
+
+pub fn forget_sign_out_note(paths: &Paths) {
+    write_kept(paths, SIGN_OUT_NOTE, "");
 }
 
 /// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this
@@ -1237,7 +1352,14 @@ pub fn write_kept(paths: &Paths, name: &str, value: &str) -> bool {
     if value.is_empty() {
         return save_secret(paths, name, "");
     }
-    fs::write(&file, kept_bytes(value)).is_ok() && fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).is_ok()
+    // Whole or not at all, as the credential store writes it: a file only this user can
+    // read, renamed into place.
+    let temp = temp_for(&file);
+    let written = fs::write(&temp, kept_bytes(value)).is_ok() && fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).is_ok() && fs::rename(&temp, &file).is_ok();
+    if !written {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 #[cfg(not(windows))]
