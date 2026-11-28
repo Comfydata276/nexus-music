@@ -1,8 +1,10 @@
 # The Nexus server
 
 One small service of our own, in one container, beside the music server. The design is
-`docs/backend-design.md` on its own branch. **This is its first slice (S1): it answers
-`GET /nexus/api/hello` and nothing else.** It holds no data, no sessions and nothing secret.
+`docs/backend-design.md` on its own branch. It answers `hello` (S1), keeps its data and a
+store kept apart (S3), and signs people in with an email and a password (S8). The music login
+(S9) and the admin's page's working calls (S10b) are not in yet: every sign-in says there is
+no music login yet.
 
 ## Building and testing
 
@@ -12,7 +14,9 @@ Built apart from the app, as the relay is:
     docker build -f server/Dockerfile -t nexus-music-server .
 
 `tests/e6.rs` is the design's experiment E6, over real sockets on loopback. Every bound it
-holds the backend to is a number in `src/bounds.rs`.
+holds the backend to is a number in `src/bounds.rs`. `tests/x2.rs` is X2 (the data and the
+store kept apart, cut, put back and lost); `tests/signin.rs` signs a person in end to end
+against the program itself; `tests/program.rs` is the program's settings, log and health.
 
 ## Settings
 
@@ -20,11 +24,31 @@ holds the backend to is a number in `src/bounds.rs`.
 |---|---|
 | `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533`. **Must be given.** (Not used yet.) |
 | `NEXUS_PROXY` | The one IP address the proxy connects to this container from, for example `172.18.0.2`. **Must be given.** Nothing else is answered. |
-| `NEXUS_DATA` | The data folder. `/data` unless given. Not used yet. |
-| `NEXUS_STATE` | The folder of the store kept apart. `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. The backend's id is kept here, in `id`. |
+| `NEXUS_DATA` | The data folder: one SQLite file, `nexus.db`, and its nightly copies in `copies/`. `/data` unless given. On a disk of the machine's own, not a network folder. |
+| `NEXUS_STATE` | The folder of the store kept apart: the backend's id (`id`), its restore number, its keys, and what must never go backwards when the data does (`kept`). `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. **Never copied or put back with the data.** |
 | `NEXUS_LISTEN` | `0.0.0.0:8080` unless given. Not port 0. The health check asks on this machine's loopback, so listen on every address or on loopback. |
+| `NEXUS_PUBLIC_ORIGIN` | The admin's page's address as a browser has it: `https://` and the name, and `:port` only if it is not 443, nothing after it, for example `https://nexus.example.org`. The page's sign-in and set-up are taken only from it. Unset, they are refused, and the log says so once at the start. |
 
 A setting that is wrong or missing is said by name as it starts, and it stops.
+
+## The owner's commands
+
+Each is run in the container **while the backend is stopped** (it refuses while the backend
+serves: one program has the folders at a time), with the same settings, for example
+`docker run --rm --env-file nexus.env -v …:/data -v …:/state nexus-music-server set-up you@example.org`.
+
+| Command | |
+|---|---|
+| `nexus-music-server health` | The container's own check: `hello` answers with the id kept, and the store kept apart and the data each open and are this backend's. |
+| `nexus-music-server set-up <email> [<name>]` | Sets the backend up and makes its first admin, **without printing anything to the log**: a one-time code is said on this command's own terminal, once. Sign in with it from the app, choosing a password there. Refused once set up. |
+| `nexus-music-server recover <email>` | A one-time code for the account with that email, the owner's own included, with no sign-in: every session of it ends, its password stops working until the code is used, and it is an admin's and switched on. With no account by that email (the data was emptied, the last admin deleted) an admin's is made. |
+| `nexus-music-server put-back [<copy>]` | Puts a copy of the data back (with nothing after it, lists the nightly copies). Every session ends; what the store says was taken away since is taken away again. |
+| `nexus-music-server take-as-is` | Takes the data as it is when the store kept apart is lost or does not belong with it. Every session ends, and every account then waits for a new one-time code (`recover`). |
+
+**Setting up with the log.** While the backend is not set up, each start writes a set-up code
+to its log, good for fifteen minutes and once; a restart makes a new one. **Whoever can read
+that log can read it while it lives.** If your logs are collected anywhere, use `set-up`
+instead. Once the backend is set up, no code is written.
 
 ## Setting it up beside the proxy
 
@@ -87,6 +111,8 @@ In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit*
            access_log off;
            error_log /dev/null crit;
            client_max_body_size 1m;
+           client_body_buffer_size 1m;
+           client_body_in_file_only off;
            proxy_http_version 1.1;
            proxy_set_header Upgrade $http_upgrade;
            proxy_set_header Connection $http_connection;
@@ -105,6 +131,17 @@ and the rest above), and its cookies, are emptied and never reach the backend (m
 without these lines the caller's own values arrive). The three lines after them keep the
 proxy from caching, or from putting answers of its own in place of the backend's, whatever
 the host is set to. The last three before `proxy_pass` pass a WebSocket (stage 2).
+
+**`client_body_buffer_size 1m;` and `client_body_in_file_only off;` are required** (design 7.2):
+the proxy takes a body whole before the backend sees it, and with a body allowed to be larger
+than its memory for one it wrote a body carrying a password to a file of its own (measured).
+With these, a body either fits in the proxy's memory or is refused; it is never put on its
+disk. (Measured at 4 KiB on 2.17.1; to be checked again on the owner's 2.16.0 before anything
+of his is changed, E2b. If it does not hold there, the calls that carry a password get a
+`location` of their own at 4 KiB.) **The backend itself takes no more than 4 KiB on any call
+that carries a password**, refused from its `Content-Length` before a byte of the body is
+read. Where the TLS is ended (the proxy, or a content network in front of it) everything can
+be read, passwords included: have that edge refuse plain HTTP outright.
 
 **An Access List on the host does not cover `/nexus/`** (measured: with one, the music
 server's own paths asked for the password and `/nexus/` did not). The backend has its own
@@ -140,13 +177,20 @@ other path of the music server.
   cause, so that the proxy hands the caller a plain answer and logs nothing.
 - **Then:** the target exactly as it came, in plain form (400); the method, `GET` alone for
   `hello` (any other is 405, a path there is not is 404); a body counted by
-  `Content-Length` alone, at most 1 MiB (no chunks, no `Expect`: the proxy sends every body
-  counted). Each refusal is a bare answer, and the body is not read before it.
+  `Content-Length` alone, at most the call's own ceiling (1 KiB for most calls, 4 KiB for
+  one that carries a password, 1 MiB at most; no chunks, no `Expect`: the proxy sends every
+  body counted). Each refusal is a bare answer, and the body is not read before it.
 - Every answer has `Cache-Control: no-store`, sets no cookie, and nothing about a request
   is written to the log.
 
 `/nexus/api/hello` answers, for example,
-`{"has":[],"id":"0123456789abcdef0123456789abcdef","nexus":"0.1.0","speaks":[1,1]}`.
+`{"has":["accounts"],"id":"0123456789abcdef0123456789abcdef","nexus":"0.1.0","speaks":[1,1]}`.
+
+Every other call is a `POST` under `/nexus/api/` with a JSON body of the shared library's
+shapes (`nexus_core::nexus::account`): `signin`, `signout`, `devices`, `force-out`,
+`change-password`, `music-login`. Each answers 200 (done), 400 (malformed), 401 (not signed in:
+this session has ended, or the data was put back), 403 (not allowed: a wrong email or password
+is one answer, whichever it was), 429 (busy, come back) or 503 (not dealt with).
 The id is made at random at first start and kept for as long as `NEXUS_STATE/id` is: a
 device asks its person again if it ever changes. Two copies started at once on the same
 store end with one id, which both serve.
