@@ -2,9 +2,9 @@
 
 One small service of our own, in one container, beside the music server. The design is
 `docs/backend-design.md` on its own branch. It answers `hello` (S1), keeps its data and a
-store kept apart (S3), and signs people in with an email and a password (S8). The music login
-(S9) and the admin's page's working calls (S10b) are not in yet: every sign-in says there is
-no music login yet.
+store kept apart (S3), signs people in with an email and a password (S8), and hands each of a
+person's devices a music login made for it from the one an admin typed in (S9). The admin's
+page's other calls (S10b) are not in yet.
 
 ## Building and testing
 
@@ -22,7 +22,9 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 
 | Setting | |
 |---|---|
-| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533`. **Must be given.** (Not used yet.) |
+| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. A login typed in is checked here and at the address people use; a login checked at another value of this is not handed out until it is typed again. |
+| `NEXUS_DATA_BUDGET` | How large the data may grow before new events wait: bytes, or a whole number of MB, GB or TB (`4GB`), at least 1 MB. 4 GB unless given. |
+| `SSL_CERT_FILE` | Optional: a file of the certificates the backend trusts when it checks the address people use by HTTPS, in place of the container's own. |
 | `NEXUS_PROXY` | The one IP address the proxy connects to this container from, for example `172.18.0.2`. **Must be given.** Nothing else is answered. |
 | `NEXUS_DATA` | The data folder: one SQLite file, `nexus.db`, and its nightly copies in `copies/`. `/data` unless given. On a disk of the machine's own, not a network folder. |
 | `NEXUS_STATE` | The folder of the store kept apart: the backend's id (`id`), its restore number, its keys, and what must never go backwards when the data does (`kept`). `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. **Never copied or put back with the data.** |
@@ -197,6 +199,23 @@ location (a header too large for it, say) is written to the host's own log.
   body counted). Each refusal is a bare answer, and the body is not read before it.
 - Every answer has `Cache-Control: no-store`, sets no cookie, and nothing about a request
   is written to the log.
+
+## The music login (S9)
+
+An admin types a person's music-server name and password once (the page's
+`/nexus/api/admin/set-music-login`, with a grant for that account, after
+`/nexus/api/admin/set-music-server` has set the address people use, by HTTPS). The backend
+asks the music server `ping` then `getUser` at `NEXUS_MUSIC_SERVER` and then at the address
+people use, each a POST of a form it builds, following no redirect, and keeps the login only if
+both answer with that very name. It is sealed (XChaCha20-Poly1305, a key of its own in the
+store kept apart) and bound to this backend, the account, the address, the name and the
+login's number, so a copy of the data holds nothing usable, and an older login put back does
+not open. A device is never handed the password: at sign-in and at `/nexus/api/music-login`
+it gets a salt made then and its token, or "none set yet", or "cannot be used now" (the page
+then asks for it to be typed again). "Wrong name or password" (403 `music_login_refused`) is
+told apart from "could not reach it" (503); neither touches the login the account had.
+**Forcing a device out does not change this login**: that device still holds a salt and token
+the music server accepts until that user's password is changed on the music server.
 
 `/nexus/api/hello` answers, for example,
 `{"has":["accounts"],"id":"0123456789abcdef0123456789abcdef","nexus":"0.1.0","speaks":[1,1]}`.
