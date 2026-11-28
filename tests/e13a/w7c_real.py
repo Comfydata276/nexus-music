@@ -42,7 +42,7 @@ def check(ok, what):
 def copy(home, n, size):
     import shutil
     shutil.rmtree(os.path.join(R.A.HOMES, home), ignore_errors=True)
-    c = Copy2(home, n, env={"NEXUS_MUSIC_NEXUS": "1", "NEXUS_WINDOW_SIZE": size, "NEXUS_TEST_NEXUS_LOG": f"/work/target/walk/{home}/nexus.log"})
+    c = Copy2(home, n, env={"NEXUS_MUSIC_NEXUS": "1", "COMPUTERNAME": f"walk-pc-{n}", "NEXUS_WINDOW_SIZE": size, "NEXUS_TEST_NEXUS_LOG": f"/work/target/walk/{home}/nexus.log"})
     return c, c.launch()
 
 
@@ -85,6 +85,10 @@ def devices(a):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
+    # A fresh backend: its admin's one-time code is redeemed again by the admin's tool.
+    marker = os.path.join(R.STATE, "admin-redeemed")
+    if os.path.exists(marker):
+        os.remove(marker)
     R.setup()
     R.serve()
     import json
@@ -124,11 +128,16 @@ def main():
         step("B signed in with the password")
         # B forces A out; A learns it at its next call carrying the session (a press).
         devices(b)
-        rows = until(lambda: [e for e in b.find(role="Button", label="Sign out") if e], 30, "the device rows")
-        time.sleep(2)
-        buttons = b.find(role="Button", label="Sign out")
-        check(len(buttons) >= 2, f"A's row has its Sign out ({len(buttons)} Sign out buttons)")
-        b.click(buttons[-1]["handle"])
+        # A's row (its name is the PC's), and the Sign out in that row.
+        def a_row_button():
+            tree = b.tree()
+            at = next((i for i, e in enumerate(tree) if (e.get("accessibleLabel") or "") == "walk-pc-1"), None)
+            if at is None:
+                return None
+            return next((e for e in tree[at:] if e.get("accessibleRole") == "Button" and e.get("accessibleLabel") == "Sign out"), None)
+        button = until(a_row_button, 30, "A's row in B's Devices list")
+        b.shot(os.path.join(SHOTS, "w7c-devices-1143x746.png"))
+        b.click(button["handle"])
         time.sleep(3)
         step("B signed A out from its Devices list")
         devices(a)
