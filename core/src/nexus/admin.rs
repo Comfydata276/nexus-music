@@ -1,4 +1,4 @@
-//! Step 1 administration calls and the rules for password-backed grants.
+//! Administration calls and the rules for password-backed grants.
 //! Time and random bytes come from the caller. The backend authenticates the
 //! session, checks the password and applies each mutation under its write lock.
 
@@ -29,6 +29,7 @@ pub const LIST_DEVICES: &str = "/nexus/api/admin/devices";
 pub const FORCE_OUT: &str = "/nexus/api/admin/force-out";
 pub const GET_DIAGNOSTICS_DEFAULT: &str = "/nexus/api/admin/diagnostics-default";
 pub const SET_DIAGNOSTICS_DEFAULT: &str = "/nexus/api/admin/set-diagnostics-default";
+pub const GET_LIDARR_SETTING: &str = "/nexus/api/admin/lidarr";
 pub const SET_REQUESTS_ENABLED: &str = "/nexus/api/admin/set-requests-enabled";
 pub const REQUEST_GRANT: &str = "/nexus/api/admin/grant";
 
@@ -37,7 +38,7 @@ pub const POST_PATHS: &[&str] = &[
     LIST_ACCOUNTS, CREATE_ACCOUNT, SET_ACCOUNT_ENABLED, SET_ADMIN, DELETE_ACCOUNT,
     RESET_PASSWORD, GET_MUSIC_SERVER, SET_MUSIC_SERVER, SET_MUSIC_LOGIN, LIST_DEVICES,
     FORCE_OUT, GET_DIAGNOSTICS_DEFAULT, SET_DIAGNOSTICS_DEFAULT, SET_REQUESTS_ENABLED,
-    REQUEST_GRANT,
+    GET_LIDARR_SETTING, REQUEST_GRANT,
 ];
 
 // §7.2 bounds password-bearing calls at 4 KiB. Use that ceiling for all admin
@@ -247,6 +248,17 @@ pub type Devices = Page<AdminDevice>;
 object! { GetMusicServer { head: RequestHead } }
 object! { MusicServer { internal: InternalAddress, public: Option<MusicAddress> } }
 object! { GetDiagnosticsDefault { head: RequestHead } }
+object! { GetLidarrSetting { head: RequestHead } }
+object! {
+    /// The configured container address and whether its current key is usable.
+    LidarrSetting { address: Option<InternalAddress>, configured: bool }
+    check(value) {
+        if value.configured && value.address.is_none() {
+            return Err(BadMessage::Form);
+        }
+        Ok(())
+    }
+}
 object! { DiagnosticsDefault { enabled: bool } }
 
 object! { NewAccount { email: Email, name: Name } }
@@ -545,7 +557,7 @@ macro_rules! read_requests {
     };
 }
 
-read_requests!(ListAccounts, ListDevices, GetMusicServer, GetDiagnosticsDefault);
+read_requests!(ListAccounts, ListDevices, GetMusicServer, GetDiagnosticsDefault, GetLidarrSetting);
 
 pub trait ResultBody: wire::Value + Serialize {
     const MAX_BYTES: usize = REPLY_MAX_BYTES;
@@ -560,6 +572,7 @@ impl ResultBody for Devices {
     const MAX_BYTES: usize = LIST_REPLY_MAX_BYTES;
 }
 impl ResultBody for MusicServer {}
+impl ResultBody for LidarrSetting {}
 impl ResultBody for DiagnosticsDefault {}
 impl ResultBody for GrantIssued {}
 
@@ -631,6 +644,24 @@ mod tests {
             device: DeviceId::new(26).unwrap(),
             session: SessionId::new(28).unwrap(),
         }
+    }
+
+    #[test]
+    fn lidarr_setting_shows_only_the_configured_address_and_key_status() {
+        round_trip(GetLidarrSetting { head: head() });
+        round_trip(Reply::Done(LidarrSetting { address: None, configured: false }));
+        let address = InternalAddress::new("http://lidarr.example.test:8686").unwrap();
+        let reply = Reply::Done(LidarrSetting { address: Some(address), configured: true });
+        let body = encode(&reply).unwrap();
+        assert_eq!(
+            body.bytes(),
+            br#"{"done":{"address":"http://lidarr.example.test:8686","configured":true}}"#
+        );
+        assert_eq!(read_reply(200, body.bytes()), Ok(reply));
+        assert_eq!(
+            read_reply::<LidarrSetting>(200, br#"{"done":{"address":null,"configured":true}}"#),
+            Err(BadMessage::Form)
+        );
     }
 
     #[test]
