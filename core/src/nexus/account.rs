@@ -738,6 +738,17 @@ object! {
     check(value) { value.new_password.check_new_length() }
 }
 
+impl ChangePassword {
+    /// Apply the worker's comparison of the candidate with the current verifier
+    /// before creating or consuming leave for this change.
+    pub fn check_replacement(matches_current: bool) -> Result<(), Refusal> {
+        if matches_current {
+            return Err(Refusal::Malformed);
+        }
+        Ok(())
+    }
+}
+
 object! {
     Device {
         id: DeviceId, name: Name, kind: DeviceKind,

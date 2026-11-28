@@ -978,6 +978,15 @@ fn a_short_presented_password_is_checked_but_a_short_new_password_is_malformed()
 }
 
 #[test]
+fn a_replacement_matching_the_current_verifier_is_malformed() {
+    let refusal = ChangePassword::check_replacement(true).unwrap_err();
+    assert_eq!(refusal, Refusal::Malformed);
+    assert_eq!(refusal.status(), 400);
+    round_trip(ChangePasswordReply::Refused(refusal));
+    assert_eq!(ChangePassword::check_replacement(false), Ok(()));
+}
+
+#[test]
 fn a_grant_request_requires_an_exact_valid_change_and_has_its_own_body_ceiling() {
     let grant = data_deletion_grant(Password::presented("x").unwrap());
     bad_fields(&grant, &[
