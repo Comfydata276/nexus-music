@@ -985,6 +985,18 @@ impl Controller {
 
     /// Sets up what happens when the window is closed, and the tray icon.
     fn start_shell(self: &Rc<Self>) {
+        // For the walks only (a development build): the app quits as its own Quit does when
+        // this file appears, so that what it writes at its end is walked too (W7c item 6).
+        #[cfg(debug_assertions)]
+        if let Some(file) = std::env::var_os("NEXUS_TEST_QUIT_FILE") {
+            std::thread::spawn(move || {
+                let file = PathBuf::from(file);
+                while !file.exists() {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                post(|ctl| ctl.quit());
+            });
+        }
         self.ui.window().on_close_requested(|| {
             with(|ctl| {
                 // The window goes (to the tray, or the app ends): a sign-in form on it is
