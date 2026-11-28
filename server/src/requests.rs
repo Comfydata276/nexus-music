@@ -1572,7 +1572,6 @@ impl Requests {
 
     fn run(self: &Arc<Self>, mut job: Job, credential: Credential, runtime: Handle) {
         let Some(endpoint) = &self.endpoint else { return };
-        let _turn = self.mutation_turn(&job, &runtime);
         let journal = Journal {
             service: self.clone(), runtime: runtime.clone(), binding: job.plan.binding,
             restore: job.restore, row: job.row,
@@ -1621,13 +1620,14 @@ impl Requests {
             deadline: None, before_write: Some(pre_write),
         }));
         if let Change::Batch { singles, lines } = &job.change {
-            if let Err(reason) = self.run_batch(&job, &journal, &lidarr, *singles, lines, &stopped) {
+            if let Err(reason) = self.run_batch(&job, &journal, &lidarr, credential.key.expose(), *singles, lines, &stopped) {
                 let _ = journal.ask(move |keeper, now, row| {
                     finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)
                 });
             }
             return;
         }
+        let _turn = self.mutation_turn(&job, &runtime);
         let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, credential.key.expose(), None));
         let result = cleaned.and_then(|()| {
             if job.recovering {
@@ -2111,7 +2111,7 @@ fn check_pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBra
 
 impl Requests {
     fn run_batch(
-        &self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine], stopped: &AtomicBool,
+        &self, job: &Job, journal: &Journal, lidarr: &Lidarr, lidarr_key: &str, singles: bool, lines: &[BatchLine], stopped: &AtomicBool,
     ) -> Result<(), Refusal> {
         let desk = BatchDesk { journal: journal.clone(), singles };
         let batch = if let Some(payload) = &job.plan.prepared_batch {
@@ -2121,7 +2121,11 @@ impl Requests {
             let mut waiting = Vec::new();
             for (index, line) in lines.iter().enumerate() {
                 let index = index as u16;
-                match prepare_line(journal, lidarr, index, line, singles)? {
+                let _place = journal.runtime.block_on(self.upstream_for_job(job));
+                let deadline = Instant::now() + SEARCH_TIMEOUT;
+                let endpoint = self.endpoint.as_ref().ok_or(Refusal::LidarrNotSetUp)?;
+                let lookup = endpoint.lidarr(journal.runtime.clone(), lidarr_key, Some(deadline));
+                match prepare_line(journal, &lookup, index, line, singles)? {
                     Some(want) => wants.push(want),
                     None => waiting.push(BatchLineView { index, placed: false, progress: BatchLineProgress::NeedsResolution }),
                 }
@@ -2139,6 +2143,7 @@ impl Requests {
             batch
         };
 
+        let _turn = self.mutation_turn(job, &journal.runtime);
         journal.restore_pending(lidarr)?;
         if job.plan.prepared_batch.is_some() {
             let indexed = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;

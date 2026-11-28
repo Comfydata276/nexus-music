@@ -192,6 +192,22 @@ fn an_account_gets_only_one_upstream_place() {
     others.push(Place::upstream(rooms, 10).unwrap());
 }
 
+#[test]
+fn claimed_jobs_wait_without_taking_upstream_places() {
+    let rooms = Arc::<Mutex<Rooms>>::default();
+    let jobs: Vec<_> = (1..=wire::RUNNING_MAX as u64)
+        .map(|account| JobReservation::take(rooms.clone(), account as i64, account).unwrap())
+        .collect();
+    assert!(JobReservation::take(rooms.clone(), 20, 20).is_none());
+    let upstream: Vec<_> = (1..=wire::RUNNING_MAX as u64)
+        .map(|account| Place::upstream(rooms.clone(), account).unwrap())
+        .collect();
+    let held = lock(&rooms);
+    assert_eq!(held.jobs.len(), jobs.len());
+    assert_eq!(held.upstream.len(), upstream.len());
+    assert!(held.working_jobs.is_empty());
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Condvar, atomic::AtomicU64};
