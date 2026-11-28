@@ -90,7 +90,25 @@ struct Inner {
     /// R10): nothing is sent with it again. Set once, by the first refusal; a new pair is a
     /// new `Client`.
     refused: std::sync::atomic::AtomicBool,
+    /// Whether the music server has answered this sign-in yet, other than with a refusal
+    /// (`Proof`): until it has, one request goes first and the others wait for its answer.
+    proof: Proof,
 }
+
+/// Until a sign-in has been answered once, **one request goes first** and the rest wait for
+/// what it finds, at most [`PROOF_WAIT`]: a login the music server refuses is then sent
+/// once, not by every request a cold start begins at once. That matters beyond this PC:
+/// Navidrome refuses a name outright after five refusals in twenty seconds, which would
+/// shut the person's other devices out too, and refuse the renewed login as well (design
+/// 6.3). Once answered, requests go side by side as before.
+#[derive(Default)]
+struct Proof {
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+/// The longest a request waits for the first one's answer before it goes anyway.
+const PROOF_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct Client {
@@ -342,6 +360,7 @@ impl Client {
                 agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
                 refused: std::sync::atomic::AtomicBool::new(false),
+                proof: Proof::default(),
             }),
         }
     }
@@ -385,6 +404,52 @@ impl Client {
             let refused = self.clone();
             crate::controller::post(move |ctl| ctl.music_refused(&refused));
         }
+        // Whoever waited for the first answer learns it now.
+        self.inner.proof.changed.notify_all();
+    }
+
+    /// A request may begin: online, not refused, and either the sign-in has been answered
+    /// once, or this is the one that goes first, or the first has been waited for long
+    /// enough (`Proof`).
+    fn begin(&self) -> ApiResult<()> {
+        self.check_online()?;
+        let proof = &self.inner.proof;
+        let until = std::time::Instant::now() + PROOF_WAIT;
+        let mut state = proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let (proven, probing) = *state;
+            if proven {
+                return Ok(());
+            }
+            if !probing {
+                *state = (false, true);
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= until {
+                return Ok(());
+            }
+            state = proof.changed.wait_timeout(state, until - now).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+            drop(state);
+            self.check_online()?;
+            state = proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// What a request found, for those waiting on the first: an answer of the music
+    /// server's (anything but a refused sign-in) proves the sign-in; no answer lets the next
+    /// one go first.
+    fn settle(&self, error: Option<&ApiError>) {
+        let proof = &self.inner.proof;
+        let mut state = proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match error {
+            None => *state = (true, false),
+            Some(ApiError::Server { code, .. }) if *code != WRONG_SIGN_IN => *state = (true, false),
+            Some(ApiError::Server { .. }) => {}
+            Some(_) => state.1 = false,
+        }
+        drop(state);
+        proof.changed.notify_all();
     }
 
     /// In offline mode nothing is sent: requests fail straight away.
@@ -488,6 +553,19 @@ impl Client {
         field: Option<&str>,
         limit: Duration,
     ) -> ApiResult<Timed<T>> {
+        let answer = self.call_timed_once(app, endpoint, params, field, limit);
+        self.settle(answer.as_ref().err());
+        answer
+    }
+
+    fn call_timed_once<T: DeserializeOwned + Default>(
+        &self,
+        app: &str,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        field: Option<&str>,
+        limit: Duration,
+    ) -> ApiResult<Timed<T>> {
         let url = self.url_as(app, endpoint, params);
         // A long list of song ids can outgrow what servers and proxies accept in an address,
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
@@ -540,7 +618,11 @@ impl Client {
         url: &str,
         overall: Option<Duration>,
     ) -> ApiResult<ureq::http::Response<ureq::Body>> {
-        self.check_online()?;
+        if url.starts_with(&self.inner.base) {
+            self.begin()?;
+        } else {
+            self.check_online()?;
+        }
         self.inner.agent.get(url).config().timeout_global(overall).build().call().map_err(|e| {
             // The server may have moved; look its address up afresh next time.
             dns::forget();
@@ -549,7 +631,7 @@ impl Client {
     }
 
     fn post_form(&self, address: &str, form: &str) -> ApiResult<ureq::http::Response<ureq::Body>> {
-        self.check_online()?;
+        self.begin()?;
         self.inner
             .agent
             .post(address)
@@ -584,6 +666,7 @@ impl Client {
                 agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
                 refused: std::sync::atomic::AtomicBool::new(false),
+                proof: Proof::default(),
             }),
         };
         dns::forget();
@@ -970,6 +1053,14 @@ impl Client {
     /// a success with a small JSON body, is told apart before anything is used as a picture
     /// (design 6.3).
     pub fn fetch_bytes(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
+        let fetched = self.fetch_bytes_once(url, limit);
+        if url.starts_with(&self.inner.base) {
+            self.settle(fetched.as_ref().err());
+        }
+        fetched
+    }
+
+    fn fetch_bytes_once(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
         let mut response = self.get(url, Some(API_TIMEOUT))?;
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {}.", response.status().as_u16())));
@@ -1031,7 +1122,26 @@ impl Client {
         hops: u8,
         live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>, bool)> {
-        self.check_online()?;
+        // (Only the music server's own addresses wait for, and prove, the sign-in: a radio
+        // station's stream does neither.)
+        let ours = url.starts_with(&self.inner.base);
+        if !ours {
+            self.check_online()?;
+            return self.open_stream_once(url, range, hops, live);
+        }
+        self.begin()?;
+        let opened = self.open_stream_once(url, range, hops, live);
+        self.settle(opened.as_ref().err());
+        opened
+    }
+
+    fn open_stream_once(
+        &self,
+        url: &str,
+        range: Option<(u64, Option<u64>)>,
+        hops: u8,
+        live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
+    ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>, bool)> {
         let mut request = self.inner.agent.get(url);
         if live.is_some() {
             // Asks the station to include "now playing" announcements in the stream.
@@ -1313,6 +1423,45 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design 6.3: a login the music server refuses is sent once, not by every request a
+    /// cold start begins at once (Navidrome shuts a name out after five refusals in twenty
+    /// seconds). Once a login has been answered, requests go side by side.
+    #[test]
+    fn a_refused_login_is_sent_once_whatever_is_begun_at_once() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt", "token");
+        let all: Vec<_> = (0..8).map(|_| { let client = client.clone(); std::thread::spawn(move || client.ping().is_err()) }).collect();
+        assert!(all.into_iter().all(|one| one.join().unwrap()));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the refused login was sent more than once");
+        assert!(client.refused());
+        // Answered: side by side.
+        let answered = Arc::new(AtomicUsize::new(0));
+        let at_once = Arc::new(AtomicUsize::new(0));
+        let (seen, most) = (answered.clone(), at_once.clone());
+        let address = fake::server(move |_, _, stream| {
+            let now = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            seen.fetch_sub(1, Ordering::SeqCst);
+            let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt", "token");
+        assert!(client.ping().is_ok());
+        let all: Vec<_> = (0..4).map(|_| { let client = client.clone(); std::thread::spawn(move || client.ping().is_ok()) }).collect();
+        assert!(all.into_iter().all(|one| one.join().unwrap()));
+        assert!(at_once.load(Ordering::SeqCst) > 1, "answered, requests should go side by side");
+    }
 
     /// Against a Navidrome of its own, never one whose playlists matter: makes a song go
     /// missing from the library while a playlist holds it, and shows that the app's way of

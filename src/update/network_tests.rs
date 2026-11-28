@@ -263,7 +263,7 @@ fn stalled_installer_body_is_cancelled_by_either_limit() {
         });
         let _ = resume.send(());
         assert!(progress > 0.0 && progress < 1.0, "the installer must have stalled mid-body");
-        assert_eq!(result.unwrap_err(), "The download was interrupted.");
+        assert_eq!(result.unwrap_err().to_string(), "The download was interrupted.");
         assert_eq!(repo.count(), 1);
         assert!(!std::env::temp_dir().read_dir().unwrap().flatten()
             .any(|entry| entry.file_name().to_string_lossy().ends_with(&installer.name)));

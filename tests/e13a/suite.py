@@ -1725,7 +1725,8 @@ def scenario_refused(mode="found"):
 
 
 def switch_offline_off(a, copy):
-    settings_tab(a, "Storage", "Offline mode")
+    # (Not "Offline mode": with it on, the title bar says so whatever the tab.)
+    settings_tab(a, "Storage", "Download quality")
     a.click(a.one(label="Offline mode", role="Switch")["handle"])
     until(lambda: json.load(open(copy.path("config", "settings.json"))).get("offline") is False, 5, 0.05, "Offline mode off")
     return time.time()

@@ -1335,7 +1335,9 @@ impl Controller {
     pub fn music_login_renewed(self: &Rc<Self>, music: &config::MusicLogin) {
         let Some(current) = self.client() else { return };
         let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
-        if current.same_pair(&client) && !current.refused() {
+        // The same pair is the same login: kept as it is (refused, it stays set aside, and is
+        // never sent again as it was).
+        if current.same_pair(&client) {
             return;
         }
         if client.server() != current.server() || client.username() != current.username() {
