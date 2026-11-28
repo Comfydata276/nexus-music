@@ -527,28 +527,34 @@ fn arrived(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: 
 }
 
 /// Section 11: the note ends its one session and nothing else, and needs no session (kept's
-/// `sign_out_by_note`). A note for a session that has gone is already done; one whose secret
-/// is not that session's is refused as a session that has ended.
+/// `sign_out_by_note`). **Whatever came of it** (ended now, gone already, the data put back,
+/// or a secret that is not that session's) **the answer is the same "that session has ended",
+/// with no receipt**: a note gives leave to end one session and nothing more, so it is told
+/// nothing of the account (the review of S8, B1; the lead's ruling). The app forgets its note
+/// on that answer (C10's `answered_tell`). Only "busy" and "not dealt with" differ: the note
+/// is then told again.
 fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64) -> Result<Answer, Refusal> {
     if !speaks_with(&head.speaks) {
         return Err(incompatible());
     }
+    let ended_by_note = || refused(ended());
     if head.restore != keeper.restore() {
         // Every session was ended when the data was put back: so was this one.
-        return Err(Refusal::NotSignedIn(NotSignedIn::DataPutBack));
+        return Ok(ended_by_note());
     }
     let Some((number, device, _, _)) = rows::session_by_id(keeper.data().connection(), note.session).map_err(not_dealt_with)? else {
-        return Err(ended());
+        return Ok(ended_by_note());
     };
     let given = Fingerprint::of(note.secret.expose_bytes());
     let mut account = keeper.load(number).map_err(not_dealt_with)?;
-    account
+    let done = account
         .request(head.restore, keeper.clock(now), |turn| turn.sign_out_by_note(SessionTarget { device, session: note.session }, &given))
         .apply(|effects| keeper.persist(effects, &[], now))
-        .map_err(not_dealt_with)?
-        .map_err(said)?;
-    let receipt = receipt(keeper, account.state())?;
-    Ok(answer!(Reply::Done { result: SignedOut {}, receipt }))
+        .map_err(not_dealt_with)?;
+    match done.map_err(said) {
+        Ok(()) | Err(Refusal::NotSignedIn(_) | Refusal::NotAllowed(_)) => Ok(ended_by_note()),
+        Err(other) => Err(other),
+    }
 }
 
 /// The step that writes a sign-in (8.6 step 4, 8.5): the account loaded afresh, a session made
