@@ -80,8 +80,8 @@ struct Writer {
     root: PathBuf,
     state: State,
     sequence: u64,
-    unwritten: u64,
-    persisted_queue_loss: u64,
+    persisted_drops: u64,
+    prior_line_full: u64,
     current: Option<Current>,
     recovered: HashSet<Scope>,
 }
@@ -268,7 +268,7 @@ impl Writer {
             state.reserved = kept_high_water(&root)?;
         }
         let mut writer = Self {
-            root, sequence: state.reserved, state, unwritten: 0, persisted_queue_loss: 0,
+            root, sequence: state.reserved, prior_line_full: state.loss.line_full, state, persisted_drops: 0,
             current: None, recovered: HashSet::new(),
         };
         writer.complete_change()?;
@@ -400,7 +400,10 @@ impl Writer {
         self.prune(&mut current)?;
         for start in open {
             let id = new_id().ok_or_else(|| io::Error::other("journal id unavailable"))?;
-            self.append(&mut current, events::end_open_start(start, position, id, now_ms()).map_err(invalid)?)?;
+            let stop = events::end_open_start(start, position, id, now_ms()).map_err(invalid)?;
+            if !self.append(&mut current, stop)? {
+                return Err(io::Error::other("could not confirm the recovery append"));
+            }
             self.prune(&mut current)?;
         }
         self.recovered.insert(scope);
@@ -408,7 +411,10 @@ impl Writer {
         Ok(())
     }
 
-    fn append(&mut self, current: &mut Current, record: Record) -> io::Result<()> {
+    // An error before a line reaches the file is a loss. If an append reached the
+    // file but could not be confirmed, the next scan counts a torn line or keeps
+    // a whole one. Counting it here as well would double-count a torn write.
+    fn append(&mut self, current: &mut Current, record: Record) -> io::Result<bool> {
         let sequence = self.next_sequence()?;
         let at = record.at_ms();
         let event = record.place(sequence).map_err(invalid)?;
@@ -432,8 +438,16 @@ impl Writer {
             let path = current.directory.journal(number);
             let started = Instant::now();
             let mut output = OpenOptions::new().append(true).open(&path)?;
-            output.write_all(&append.bytes)?;
-            output.sync_data()?;
+            if let Err(error) = output.write_all(&append.bytes) {
+                return if output.metadata().is_ok_and(|metadata| metadata.len() == file.bytes) {
+                    Err(error)
+                } else {
+                    Ok(false)
+                };
+            }
+            if output.sync_data().is_err() {
+                return Ok(false);
+            }
             crate::config::flushed(&path, started);
             if let Some(first) = current.first_waiting.last_mut() {
                 first.get_or_insert(sequence);
@@ -443,7 +457,7 @@ impl Writer {
             file.pending += 1;
             file.final_at_ms = Some(at);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn prune(&mut self, current: &mut Current) -> io::Result<()> {
@@ -481,10 +495,10 @@ impl Writer {
                 let record = Record::new(observation.id, observation.at, observation.kind).map_err(invalid);
                 let result = record.and_then(|record| self.append(&mut current, record));
                 // On an uncertain write, rescan rather than append after a torn line.
-                if result.is_ok() && self.prune(&mut current).is_ok() {
+                if matches!(result, Ok(true)) && self.prune(&mut current).is_ok() {
                     self.current = Some(current);
                 }
-                result
+                result.map(drop)
             }
             Message::Checkpoint(scope, start, position) => {
                 if let Some(current) = self.current.as_ref().filter(|current| current.scope == scope) {
@@ -632,18 +646,23 @@ impl Writer {
 
     fn keep_losses(&mut self, counters: &Counters) -> io::Result<()> {
         let seen = counters.dropped.load(Ordering::Relaxed);
-        let line_full = seen.saturating_sub(self.persisted_queue_loss);
-        if line_full != 0 || self.unwritten != 0 {
+        let lost = seen.saturating_sub(self.persisted_drops);
+        if lost != 0 {
             let mut state = self.state.clone();
-            state.loss.add(Loss::LineFull, line_full);
-            state.unwritten = state.unwritten.saturating_add(self.unwritten);
+            state.loss.add(Loss::LineFull, lost);
             self.save(state)?;
-            self.persisted_queue_loss = seen;
-            self.unwritten = 0;
+            self.persisted_drops = seen;
         }
+        Ok(())
+    }
+
+    fn publish_losses(&self, counters: &Counters) {
+        // dropped already includes losses made during this run, even if they have
+        // since reached disk. Include the historical split-out write failures, too.
+        counters.line_full.store(self.prior_line_full.saturating_add(self.state.unwritten)
+            .saturating_add(self.state.damaged), Ordering::Relaxed);
         counters.files_full.store(self.state.loss.files_full, Ordering::Relaxed);
         counters.refused.store(self.state.loss.refused, Ordering::Relaxed);
-        Ok(())
     }
 }
 
@@ -652,16 +671,14 @@ pub(super) fn run(
     line: Receiver<Message>,
     updates: Receiver<ChangeRequest>,
     current_waiting: Arc<Mutex<Option<Waiting>>>,
-    counters: Arc<Counters>,
+    counters: &Counters,
 ) {
     let mut writer = Writer::open(root.clone()).ok();
-    let mut unavailable = 0u64;
     let mut last_totals = Instant::now();
     let mut last_retention = Instant::now();
     let mut last_notice = None::<Instant>;
     let mut visible = None::<Scope>;
     let mut dirty = false;
-    let mut first_open = true;
     let mut queued_updates = std::collections::VecDeque::new();
     loop {
         let message = line.recv_timeout(POLL);
@@ -672,11 +689,6 @@ pub(super) fn run(
             writer = Writer::open(root.clone()).ok();
         }
         if let Some(writer) = &mut writer {
-            if first_open {
-                counters.line_full.store(writer.state.loss.line_full, Ordering::Relaxed);
-                let _ = writer.keep_losses(&counters);
-                first_open = false;
-            }
             queued_updates.extend(updates.try_iter());
             while let Some(request) = queued_updates.front() {
                 if let Update::ScopeChanged(scope) = &request.update {
@@ -693,7 +705,7 @@ pub(super) fn run(
             if let Ok(message) = message {
                 let event = matches!(message, Message::Event(..));
                 if writer.handle(message).is_err() && event {
-                    writer.unwritten = writer.unwritten.saturating_add(1);
+                    counters.drop_event();
                 }
                 dirty |= event;
             }
@@ -707,8 +719,7 @@ pub(super) fn run(
                 dirty = true;
             }
             if done || last_totals.elapsed() >= POLL {
-                writer.unwritten = writer.unwritten.saturating_add(std::mem::take(&mut unavailable));
-                let _ = writer.keep_losses(&counters);
+                let _ = writer.keep_losses(counters);
                 last_totals = Instant::now();
             }
             if dirty && (done || last_notice.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))) {
@@ -723,8 +734,9 @@ pub(super) fn run(
                 dirty = false;
                 last_notice = Some(Instant::now());
             }
+            writer.publish_losses(counters);
         } else if matches!(message, Ok(Message::Event(..))) {
-            unavailable = unavailable.saturating_add(1);
+            counters.drop_event();
         }
         if done {
             break;
@@ -799,14 +811,72 @@ mod tests {
         assert!(!try_observe(&line, &counters, scope, open(2)));
         assert!(!try_observe(&line, &counters, scope, open(3)));
         assert_eq!(crate::config::window_flushes(), before);
+        assert_eq!(counters.losses().line_full, 2);
         let root = folder.0.clone();
         std::thread::spawn(move || {
             let mut writer = Writer::open(root.clone()).unwrap();
             writer.handle(receive.try_recv().unwrap()).unwrap();
             writer.keep_losses(&counters).unwrap();
             writer.keep_losses(&counters).unwrap();
+            writer.publish_losses(&counters);
+            assert_eq!(counters.losses().line_full, 2);
             assert_eq!(Writer::open(root).unwrap().state.loss.line_full, 2);
         }).join().unwrap();
+    }
+
+    #[test]
+    fn a_dead_writer_counts_each_later_event_once() {
+        let (line, receive) = mpsc::sync_channel(1);
+        let counters = Counters::default();
+        drop(receive);
+        for id in 1..=3 {
+            assert!(!try_observe(&line, &counters, scope(7, 1, 1), open(id)));
+            assert_eq!(counters.losses().line_full, u64::from(id));
+        }
+    }
+
+    fn run_three_events(root: PathBuf) -> LossCounts {
+        let (send, line) = mpsc::sync_channel(3);
+        let (_update, updates) = mpsc::channel();
+        let counters = Counters::default();
+        for id in 1..=3 {
+            assert!(try_observe(&send, &counters, scope(7, 1, 1), open(id)));
+        }
+        drop(send);
+        run(root, line, updates, Arc::default(), &counters);
+        counters.losses()
+    }
+
+    #[test]
+    fn a_journal_that_never_opens_still_counts_losses() {
+        let folder = Folder::new();
+        fs::create_dir_all(&folder.0).unwrap();
+        let root = folder.0.join("this-is-a-file");
+        fs::write(&root, "").unwrap();
+        assert!(Writer::open(root.clone()).is_err());
+        assert_eq!(run_three_events(root), LossCounts { line_full: 3, ..LossCounts::default() });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_profile_counts_each_failed_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = Folder::new();
+        fs::create_dir_all(&folder.0).unwrap();
+        fs::set_permissions(&folder.0, fs::Permissions::from_mode(0o555)).unwrap();
+        // A privileged test runner can bypass the permission bits. In that case
+        // make the account directory impossible to create for the same write path.
+        let probe = folder.0.join("permission-check");
+        if fs::write(&probe, "").is_ok() {
+            fs::remove_file(probe).unwrap();
+            let account = JournalDirectory::new(&folder.0, scope(7, 1, 1).account);
+            fs::create_dir_all(account.0.parent().unwrap()).unwrap();
+            fs::write(account.0, "").unwrap();
+        }
+        assert!(Writer::open(folder.0.clone()).is_ok());
+        let losses = run_three_events(folder.0.clone());
+        fs::set_permissions(&folder.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(losses, LossCounts { line_full: 3, ..LossCounts::default() });
     }
 
     #[test]
@@ -843,10 +913,15 @@ mod tests {
         assert!(matches!(rows[3].record().kind(), Kind::Stop { start, position_ms: Some(42_000), why: Stopped::Unknown, .. } if *start == second_id));
         assert!(rows[2].sequence() > 3);
         assert_eq!(writer.state.damaged, 1);
+        let counters = Counters::default();
+        writer.publish_losses(&counters);
+        assert_eq!(counters.losses().line_full, 1);
         let mut again = Writer::open(folder.0.clone()).unwrap();
         again.activate(scope).unwrap();
         assert_eq!(read(&folder.0, scope, 0, 10, usize::MAX).len(), 4);
         assert_eq!(again.state.damaged, 1);
+        again.publish_losses(&counters);
+        assert_eq!(counters.losses().line_full, 1);
     }
 
     #[test]
@@ -924,7 +999,7 @@ mod tests {
         update.send(ChangeRequest {
             update: Update::ResendAll(scope.account.backend), finished: Some(finished),
         }).unwrap();
-        let thread = std::thread::spawn(move || run(root, line, updates, waiting, worker));
+        let thread = std::thread::spawn(move || run(root, line, updates, waiting, &worker));
         let result = receipt.recv_timeout(Duration::from_secs(5));
         let rows = read(&folder.0, scope, 0, 1, usize::MAX);
         drop(sender);

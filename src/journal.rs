@@ -58,7 +58,6 @@ struct Counters {
 
 struct Service {
     send: SyncSender<Message>,
-    counters: Arc<Counters>,
     finished: Mutex<Receiver<()>>,
     read: SyncSender<reader::Read>,
     update: mpsc::Sender<reader::ChangeRequest>,
@@ -66,6 +65,26 @@ struct Service {
 }
 
 static SERVICE: OnceLock<Service> = OnceLock::new();
+static COUNTERS: Counters = Counters {
+    dropped: AtomicU64::new(0), line_full: AtomicU64::new(0),
+    files_full: AtomicU64::new(0), refused: AtomicU64::new(0),
+    closing: AtomicBool::new(false),
+};
+
+impl Counters {
+    fn drop_event(&self) {
+        let _ = self.dropped.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+    }
+
+    fn losses(&self) -> LossCounts {
+        LossCounts {
+            line_full: self.line_full.load(Ordering::Relaxed)
+                .saturating_add(self.dropped.load(Ordering::Relaxed)),
+            files_full: self.files_full.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+        }
+    }
+}
 
 thread_local! {
     static OPENED: Cell<bool> = const { Cell::new(false) };
@@ -82,8 +101,6 @@ pub(crate) fn install(root: PathBuf) {
     let (update, updates) = mpsc::channel();
     let waiting = Arc::new(Mutex::new(None));
     let writer_waiting = waiting.clone();
-    let counters = Arc::new(Counters::default());
-    let worker = counters.clone();
     let reader_root = root.clone();
     if std::thread::Builder::new().name("listening-reader".into()).spawn(move || {
         while let Ok(read) = reads.recv() {
@@ -93,10 +110,10 @@ pub(crate) fn install(root: PathBuf) {
         return;
     }
     if std::thread::Builder::new().name("listening-journal".into()).spawn(move || {
-        writer::run(root, receive, updates, writer_waiting, worker);
+        writer::run(root, receive, updates, writer_waiting, &COUNTERS);
         let _ = done.send(());
     }).is_ok() {
-        let _ = SERVICE.set(Service { send, counters, finished: Mutex::new(finished), read, update, waiting });
+        let _ = SERVICE.set(Service { send, finished: Mutex::new(finished), read, update, waiting });
     }
 }
 
@@ -218,7 +235,7 @@ pub(crate) fn take_waiting() -> Option<Happened> {
 pub(crate) fn finish() {
     publish(None);
     if let Some(service) = SERVICE.get() {
-        service.counters.closing.store(true, Ordering::Release);
+        COUNTERS.closing.store(true, Ordering::Release);
         if let Ok(finished) = service.finished.lock() {
             let _ = finished.recv_timeout(Duration::from_secs(5));
         }
@@ -226,15 +243,7 @@ pub(crate) fn finish() {
 }
 
 pub(crate) fn losses() -> LossCounts {
-    SERVICE.get().map_or_else(LossCounts::default, |service| {
-        let counters = &service.counters;
-        LossCounts {
-            line_full: counters.line_full.load(Ordering::Relaxed)
-                .saturating_add(counters.dropped.load(Ordering::Relaxed)),
-            files_full: counters.files_full.load(Ordering::Relaxed),
-            refused: counters.refused.load(Ordering::Relaxed),
-        }
-    })
+    COUNTERS.losses()
 }
 
 fn now_ms() -> u64 {
@@ -248,8 +257,11 @@ fn new_id() -> Option<EventId> {
 }
 
 fn enqueue(scope: Scope, observation: Observation) -> bool {
-    let Some(service) = SERVICE.get() else { return false };
-    try_observe(&service.send, &service.counters, scope, observation)
+    let Some(service) = SERVICE.get() else {
+        COUNTERS.drop_event();
+        return false;
+    };
+    try_observe(&service.send, &COUNTERS, scope, observation)
 }
 
 fn try_observe(
@@ -257,18 +269,20 @@ fn try_observe(
 ) -> bool {
     match line.try_send(Message::Event(scope, observation)) {
         Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            let _ = counters.dropped.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            counters.drop_event();
             false
         }
-        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
 fn note(kind: impl FnOnce() -> Option<Kind>) -> Option<EventId> {
     let scope = SCOPE.get()?;
     let kind = kind()?;
-    let id = new_id()?;
+    let Some(id) = new_id() else {
+        COUNTERS.drop_event();
+        return None;
+    };
     enqueue(scope, Observation { id, at: now_ms(), kind }).then_some(id)
 }
 
