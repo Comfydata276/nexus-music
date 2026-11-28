@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexus_core::nexus::account::{AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
-use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
+use nexus_core::nexus::kept::{SessionKind, Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
 use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
@@ -172,6 +172,12 @@ fn failed(why: Denied) -> Failed {
     Failed(format!("{why:?}"))
 }
 
+/// The admin signs in from the admin's page (core-fu3: what an admin does needs the page's
+/// session); everyone else from an app.
+fn kind_of(account: u64) -> SessionKind {
+    if account == ROOT { SessionKind::AdminPage } else { SessionKind::App }
+}
+
 /// A device signs in with a password: C3r's check, its receipt, and the sign-in. Its id.
 fn sign_in(keeper: &mut Keeper, account: u64, secret: u8, pass: u8, session: u8, now: u64) -> Result<u64, Failed> {
     let vacant = keeper.vacant_device();
@@ -181,7 +187,7 @@ fn sign_in(keeper: &mut Keeper, account: u64, secret: u8, pass: u8, session: u8,
     let check = decide(keeper, account, now, &[], |turn| turn.check_sign_in(&self::secret(secret), dev(vacant), expected))?.map_err(failed)?;
     let receipt = check.check(fp(pass), keeper.clock(now)).map_err(failed)?;
     let fresh = fresh(keeper, session);
-    let signed = decide(keeper, account, now, &[], |turn| turn.sign_in(receipt, fresh, None))?.map_err(failed)?;
+    let signed = decide(keeper, account, now, &[], |turn| turn.sign_in_as(kind_of(account), receipt, fresh, None))?.map_err(failed)?;
     Ok(signed.device.get())
 }
 
@@ -207,7 +213,7 @@ fn first_password(keeper: &mut Keeper, account: u64, secret: u8, code: u8, pass:
     let receipt = check.check(code_fp, keeper.clock(now)).map_err(failed)?;
     let chosen = password(pass);
     let fresh = fresh(keeper, session);
-    let signed = decide(keeper, account, now, &[Change::Password { account, password: Some(&chosen) }], |turn| turn.redeem_code(receipt, fp(pass), fresh, None))?.map_err(failed)?;
+    let signed = decide(keeper, account, now, &[Change::Password { account, password: Some(&chosen) }], |turn| turn.redeem_code_as(kind_of(account), receipt, fp(pass), fresh, None))?.map_err(failed)?;
     Ok(signed.device.get())
 }
 
@@ -419,6 +425,8 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
         "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + CODE_LIFETIME_MS }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
+        "requests switched off" => switch_requests(&mut keeper(), &ids, BOB, false, now).map_err(failed),
+        "a Lidarr key set" => set_lidarr_key(&mut keeper(), &ids, LIDARR_KEY, now).map_err(failed),
         "an event kept" => an_event(&mut keeper(), BOB, ids.b1, 3, now).map(|_| ()).map_err(failed),
         "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
@@ -2049,5 +2057,156 @@ fn the_owners_recovery_keeps_only_the_new_code_and_no_password() {
     };
     assert_eq!(kept, vec![(code.number as i64, vec![48; 32])]);
     assert_eq!(readers(&mut keeper, &ids, now).iter().filter(|&&session| session == 1 || session == 3).count(), 0, "her sessions are still kept");
+    keeper.close();
+}
+
+// ---- Requests through the server (S13): the authority the store keeps apart ----
+
+const LIDARR: &str = "http://lidarr.example.test:8686";
+const LIDARR_KEY: &str = "a-made-up-lidarr-key";
+
+fn lidarr_address(text: &str) -> nexus_core::nexus::admin::InternalAddress {
+    nexus_core::nexus::admin::InternalAddress::new(text).unwrap()
+}
+
+/// The admin's grant for a change to the backend or an account, then the change; the grant
+/// was given before (`grant_for`).
+fn grant_for(keeper: &mut Keeper, ids: &Ids, action: AdminAction, target: AdminTarget, now: u64) -> Result<(), Failed> {
+    leave(keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin { action, target }, now)
+}
+
+/// The admin switches `account`'s requests to `enabled`, under the switch's revision now.
+fn switch_requests(keeper: &mut Keeper, ids: &Ids, account: u64, enabled: bool, now: u64) -> Result<(), Failed> {
+    let revision = keeper.requests_switch(account)?.revision;
+    let mut other = keeper.load(account)?;
+    let held = fp(30);
+    let (restore, clock) = (keeper.restore(), keeper.clock(now));
+    let mut root = keeper.load(ROOT)?;
+    root.request(restore, clock, |turn| turn.set_requests_enabled(bearer(ids.root, &held), AccountId::new(account).unwrap(), enabled, revision, Some(&mut other)))
+        .apply(|effects| keeper.persist(effects, &[], now))?
+        .map_err(failed)
+}
+
+/// The admin sets the Lidarr key (`NEXUS_LIDARR` is `LIDARR`), under the binding now.
+fn set_lidarr_key(keeper: &mut Keeper, ids: &Ids, key: &str, now: u64) -> Result<(), Failed> {
+    use nexus_core::nexus::admin::{LidarrKey, LidarrSealingKey};
+    let binding = keeper.lidarr(Some(&lidarr_address(LIDARR)))?.binding.unwrap();
+    let key = LidarrKey::new(key).unwrap();
+    let sealing = LidarrSealingKey::new(keeper.seal_key());
+    let held = fp(30);
+    let (restore, clock) = (keeper.restore(), keeper.clock(now));
+    let mut root = keeper.load(ROOT)?;
+    root.request(restore, clock, |turn| turn.set_lidarr(bearer(ids.root, &held), &binding, &key, &sealing, [9; 24]))
+        .apply(|effects| keeper.persist(effects, &[], now))?
+        .map_err(failed)
+}
+
+/// The key the store opens for `LIDARR` now, if any.
+fn lidarr_key(keeper: &mut Keeper) -> Option<String> {
+    use nexus_core::nexus::admin::LidarrSealingKey;
+    let found = keeper.lidarr(Some(&lidarr_address(LIDARR))).unwrap();
+    let (binding, sealed) = (found.binding?, found.sealed?);
+    LidarrSealingKey::new(keeper.seal_key()).open(&binding, &sealed).map(|key| key.expose().to_string())
+}
+
+#[test]
+fn a_switch_for_requests_cut_at_any_point_holds_once_the_store_has_it_and_a_put_back_never_reverts_it() {
+    let setup = Root::new("requests-switch");
+    let ids = world(&setup);
+    let copy = snapshot(&setup, &["nexus.db"]);
+    {
+        let mut keeper = opened(&setup, T0 + 4 * MINUTE);
+        assert_eq!(keeper.requests_switch(BOB).unwrap(), keeper::RequestsSwitch { enabled: true, revision: 0 });
+        let target = keeper.load(BOB).unwrap().state().admin_target();
+        grant_for(&mut keeper, &ids, AdminAction::SetRequests { enabled: false, revision: 0 }, target, T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    at_every_point("requests switched off", &setup, |root, cut| {
+        let (keeper, _) = settled(root, T0 + 6 * MINUTE);
+        let switch = keeper.requests_switch(BOB).unwrap();
+        let done = cut.took() || cut.whole();
+        assert_eq!(switch, keeper::RequestsSwitch { enabled: !done, revision: u64::from(done) }, "at {}", cut.at);
+        assert_eq!(keeper.requests_switch(ALICE).unwrap().enabled, true, "at {}", cut.at);
+        keeper.close();
+        if cut.whole() {
+            // A copy of the data from before it, put back: the switch stays as the store has it.
+            put_by_hand(root, &copy);
+            let (keeper, started) = settled(root, T0 + 7 * MINUTE);
+            assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+            assert_eq!(keeper.requests_switch(BOB).unwrap(), keeper::RequestsSwitch { enabled: false, revision: 1 });
+        }
+    });
+    // A grant under a revision no longer the switch's is spent on nothing.
+    let mut keeper = opened(&setup, T0 + 8 * MINUTE);
+    switch_requests(&mut keeper, &ids, BOB, false, T0 + 8 * MINUTE).unwrap();
+    assert_eq!(keeper.requests_switch(BOB).unwrap().revision, 1);
+    let target = keeper.load(BOB).unwrap().state().admin_target();
+    grant_for(&mut keeper, &ids, AdminAction::SetRequests { enabled: true, revision: 0 }, target, T0 + 8 * MINUTE).unwrap();
+    assert!(switch_requests(&mut keeper, &ids, BOB, true, T0 + 8 * MINUTE).is_err(), "a grant for an old revision switched requests");
+    keeper.close();
+}
+
+#[test]
+fn the_lidarr_key_cut_at_any_point_is_kept_once_the_store_has_it_survives_a_put_back_and_dies_with_its_address() {
+    use nexus_core::nexus::admin::LidarrKey;
+    let setup = Root::new("lidarr-key");
+    let ids = world(&setup);
+    let copy = snapshot(&setup, &["nexus.db"]);
+    {
+        let mut keeper = opened(&setup, T0 + 4 * MINUTE);
+        let binding = keeper.lidarr(Some(&lidarr_address(LIDARR))).unwrap().binding.unwrap();
+        assert_eq!(binding.revision, 1, "the address first seen moves the revision on");
+        let key = LidarrKey::new(LIDARR_KEY).unwrap();
+        let action = AdminAction::SetLidarr { fingerprint: key.fingerprint().clone(), address: binding.address.clone(), revision: binding.revision };
+        grant_for(&mut keeper, &ids, action, AdminTarget::Backend, T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    at_every_point("a Lidarr key set", &setup, |root, cut| {
+        let (mut keeper, _) = settled(root, T0 + 6 * MINUTE);
+        let done = cut.took() || cut.whole();
+        assert_eq!(lidarr_key(&mut keeper).is_some(), done, "at {}", cut.at);
+        if done {
+            assert_eq!(lidarr_key(&mut keeper).as_deref(), Some(LIDARR_KEY));
+        }
+        keeper.close();
+        if cut.whole() {
+            put_by_hand(root, &copy);
+            let (mut keeper, started) = settled(root, T0 + 7 * MINUTE);
+            assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+            assert_eq!(lidarr_key(&mut keeper).as_deref(), Some(LIDARR_KEY), "a put-back lost the key");
+            // The address changed, then set back: the key it had is not revived.
+            assert!(keeper.lidarr(Some(&lidarr_address("http://other.example.test:8686"))).unwrap().sealed.is_none());
+            assert_eq!(lidarr_key(&mut keeper), None, "an old key came back with its address");
+            assert!(keeper.lidarr(None).unwrap().binding.is_none());
+            keeper.close();
+        }
+    });
+}
+
+#[test]
+fn the_requests_tables_take_s13s_rows_through_the_one_writer() {
+    let root = Root::new("requests-tables");
+    world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper
+        .write_data(T0 + 2 * MINUTE, |tx| {
+            tx.execute("INSERT INTO requests_jobs (id, restore, account, session, request, change, work) VALUES (1, 0, ?1, 5, x'01', x'02', x'03')", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_lines (job, line, progress) VALUES (1, 0, 'asked')", [])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'aa', ?1, 'release-1', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'bb', ?1, 'release-1', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_way_back (binding, artist, artist_key, setting) VALUES (x'aa', 7, 'a-musicbrainz-id', 'monitored')", [])?;
+            Ok(((), true))
+        })
+        .unwrap();
+    let count_all = |keeper: &Keeper, table: &str| -> i64 { keeper.data().connection().query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap() };
+    assert_eq!((count_all(&keeper, "requests_jobs"), count_all(&keeper, "requests_lines"), count_all(&keeper, "requests_owners"), count_all(&keeper, "requests_way_back")), (1, 1, 2, 1));
+    // The same artist at the same Lidarr twice is refused, all of the step with it.
+    let twice = keeper.write_data(T0 + 2 * MINUTE, |tx| {
+        tx.execute("INSERT INTO requests_lines (job, line, progress) VALUES (1, 1, 'asked')", [])?;
+        tx.execute("INSERT INTO requests_way_back (binding, artist, artist_key, setting) VALUES (x'aa', 7, 'another', 'x')", [])?;
+        Ok(((), true))
+    });
+    assert!(twice.is_err());
+    assert_eq!(count_all(&keeper, "requests_lines"), 1);
     keeper.close();
 }

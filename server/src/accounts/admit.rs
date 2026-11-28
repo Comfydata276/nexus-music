@@ -21,12 +21,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
-use nexus_core::nexus::account::{self, Credential, DeviceSecret, Email, OneTimeCode, SignIn, SignOutNote};
-use nexus_core::nexus::kept::Fingerprint;
+use nexus_core::nexus::account::{self, AccountId, Credential, DeviceId, DeviceSecret, Email, NotAllowed, NotSignedIn, OneTimeCode, Refusal, SessionId, SignIn, SignOutNote};
+use nexus_core::nexus::kept::{Fingerprint, SessionKind};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::desk::Admitted;
-use super::session::Clock;
+use super::session::{Answer, Clock, refused};
+use crate::head::Callers;
 use super::setup::CodeKey;
 use crate::store::keeper::Keeper;
 
@@ -97,6 +98,51 @@ pub enum Live {
     Ended,
 }
 
+/// Who is calling, by the session shown in a request's head, as the data has it now: found
+/// before a work slot is taken and before a byte of the body is read. A route takes it as an
+/// `axum::Extension<Caller>`, there only when the route needs a session and the check passed.
+/// kept still judges the session on the thread that writes (its idle time, the restore number
+/// the call names, a grant): this says only whose it is, and of which kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub account: AccountId,
+    pub device: DeviceId,
+    pub session: SessionId,
+    pub kind: SessionKind,
+}
+
+/// What a request's head shows, by the cheap read path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// No session, one not written as a session is, more than one, or one the data does not
+    /// have (or has ended).
+    NoOne,
+    /// The data could not be read now: not "no one" (that would sign a device out), but "not
+    /// dealt with, ask again".
+    NotReadable,
+    Caller(Caller),
+}
+
+/// THE check before a body is read, for every route (`serve::answer` calls it with the route's
+/// [`Callers`] and what the head shows): `Ok(Some(caller))` for a route that needs a session
+/// and was shown one of its kind; `Ok(None)` for one that needs none; otherwise the refusal to
+/// send at once, nothing read or reserved for it. The bytes are the same on every route that
+/// refuses for the same reason, whatever its body would have named.
+pub fn before_body(callers: Callers, shown: Shown) -> Result<Option<Caller>, Answer> {
+    let wanted = match callers {
+        Callers::Anyone => return Ok(None),
+        Callers::EitherOrNone => return Ok(match shown { Shown::Caller(caller) => Some(caller), _ => None }),
+        Callers::App => SessionKind::App,
+        Callers::Page => SessionKind::AdminPage,
+    };
+    match shown {
+        Shown::NoOne => Err(refused(Refusal::NotSignedIn(NotSignedIn::SessionEnded))),
+        Shown::NotReadable => Err(refused(Refusal::NotDealtWith)),
+        Shown::Caller(caller) if caller.kind == wanted => Ok(Some(caller)),
+        Shown::Caller(_) => Err(refused(Refusal::NotAllowed(NotAllowed::Denied))),
+    }
+}
+
 /// The cheap read path, the known devices, and the key codes are fingerprinted with.
 pub struct Admission {
     reader: Mutex<Connection>,
@@ -145,10 +191,49 @@ impl Admission {
         }
     }
 
-    /// Whether the session `hash` is in the data, whatever restore number it is shown under.
-    fn resolves(&self, hash: &Fingerprint) -> bool {
-        self.read(|data| data.query_row("SELECT 1 FROM sessions WHERE hash = ?1 AND kind IS NOT NULL", [hash.as_bytes().as_slice()], |_| Ok(())).optional())
-            .is_some_and(|found| found.is_some())
+    /// Whose the session `hash` is, and its kind, whatever restore number it is shown under.
+    fn caller(&self, hash: &Fingerprint) -> Shown {
+        let found = self.read(|data| {
+            data.query_row(
+                "SELECT devices.account, sessions.device, sessions.id, sessions.kind FROM sessions JOIN devices ON devices.id = sessions.device WHERE sessions.hash = ?1 AND sessions.kind IS NOT NULL",
+                [hash.as_bytes().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?)),
+            )
+            .optional()
+        });
+        let number = |value: i64| u64::try_from(value).ok();
+        match found {
+            None => Shown::NotReadable,
+            Some(None) => Shown::NoOne,
+            Some(Some((account, device, session, kind))) => {
+                let caller = (|| {
+                    Some(Caller {
+                        account: AccountId::new(number(account)?)?,
+                        device: DeviceId::new(number(device)?)?,
+                        session: SessionId::new(number(session)?)?,
+                        kind: match kind.as_str() {
+                            "app" => SessionKind::App,
+                            "page" => SessionKind::AdminPage,
+                            _ => return None,
+                        },
+                    })
+                })();
+                // A row not as the data writes one: not readable, never someone.
+                caller.map_or(Shown::NotReadable, Shown::Caller)
+            }
+        }
+    }
+
+    /// What the `Authorization` header(s) of a request's head show.
+    pub fn shown(&self, authorization: &[&[u8]]) -> Shown {
+        let shown = match authorization {
+            [one] => std::str::from_utf8(one).ok().and_then(account::Session::from_authorization),
+            _ => None,
+        };
+        match shown {
+            Some(session) => self.caller(&Fingerprint::of(session.expose_bytes())),
+            None => Shown::NoOne,
+        }
     }
 
     /// Whether the device with `secret` is one the account named `email` knows now.
@@ -182,17 +267,17 @@ impl Admission {
 
     /// The listener's question (C1), before a work slot is taken: from the request's `target`,
     /// its `Authorization` header(s) and, for a sign-in, its `body`.
-    pub fn listener(&self, target: &str, authorization: &[&[u8]], body: &[u8]) -> Admitted {
+    /// With it, who the head shows ([`Shown`]), for [`before_body`].
+    pub fn listener(&self, target: &str, authorization: &[&[u8]], body: &[u8]) -> (Admitted, Shown) {
         if !authorization.is_empty() {
-            let shown = match authorization {
-                [one] => std::str::from_utf8(one).ok().and_then(account::Session::from_authorization),
-                _ => None,
-            };
-            return match shown {
-                Some(session) if self.resolves(&Fingerprint::of(session.expose_bytes())) => Admitted::Reserved,
-                _ => Admitted::Unresolved,
-            };
+            let shown = self.shown(authorization);
+            let admitted = if matches!(shown, Shown::Caller(_)) { Admitted::Reserved } else { Admitted::Unresolved };
+            return (admitted, shown);
         }
+        (self.unshown(target, body), Shown::NoOne)
+    }
+
+    fn unshown(&self, target: &str, body: &[u8]) -> Admitted {
         if target == account::SIGN_IN
             && let Ok(sign_in) = account::read::<SignIn>(body)
         {
