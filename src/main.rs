@@ -11,6 +11,7 @@ mod controller;
 mod corehttp;
 mod covers;
 mod diagnostics;
+mod journal;
 mod discover;
 mod downloads;
 mod import;
@@ -91,6 +92,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let window = ui::MainWindow::new()?;
     let controller = controller::Controller::install(window);
     diagnostics::install(&controller.ui);
+    journal::install(controller.paths.crash_log.with_file_name("listening-journal"));
+    #[cfg(debug_assertions)]
+    journal::test_account();
     // After the controller is made (and a saved sign-in entered), never by it; and only when
     // it is switched on (NEXUS_MUSIC_NEXUS=1).
     if nexus::switched_on() {
@@ -107,6 +111,7 @@ fn main() -> Result<(), slint::PlatformError> {
     controller.downloads.borrow_mut().save_if_due(true);
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();
+    journal::finish();
     diagnostics::finish();
     // A look of the Nexus server's component still running is ended (at most two seconds).
     if nexus::switched_on() {
