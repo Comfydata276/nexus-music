@@ -1986,8 +1986,13 @@ fn only_an_admin_page_can_remove_another_accounts_placement() {
     let job = begun(server.call(&member, begin(1, Change::Request { offer })));
     assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
     assert!(matches!(server.call(&admin, Call::Pending { after: None }),
-        Answer::Pending { albums, .. } if albums.iter().all(|album| !album.removable)));
-    assert!(matches!(server.call(&admin, begin(1, cancelled())),
+        Answer::Pending { albums, .. } if albums.is_empty()));
+    let offer = server.offer(&admin);
+    let job = begun(server.call(&admin, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&admin, job), Completed::Requested { placed: false });
+    assert!(matches!(server.call(&admin, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.len() == 1 && !albums[0].removable));
+    assert!(matches!(server.call(&admin, begin(2, cancelled())),
         Answer::Refused { reason: Refusal::AskedByOthers }));
     assert!(matches!(server.call(&page, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable));
@@ -1995,10 +2000,10 @@ fn only_an_admin_page_can_remove_another_accounts_placement() {
     assert_eq!(server.done(&page, job), Completed::Cancelled);
 
     let offer = server.offer(&admin);
-    let job = begun(server.call(&admin, begin(2, Change::Request { offer })));
+    let job = begun(server.call(&admin, begin(3, Change::Request { offer })));
     assert_eq!(server.done(&admin, job), Completed::Requested { placed: true });
     assert!(matches!(server.call(&admin, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable));
-    let job = begun(server.call(&admin, begin(3, cancelled())));
+    let job = begun(server.call(&admin, begin(4, cancelled())));
     assert_eq!(server.done(&admin, job), Completed::Cancelled);
 }
