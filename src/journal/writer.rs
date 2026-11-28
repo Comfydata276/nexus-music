@@ -902,6 +902,37 @@ mod tests {
         assert_eq!(rows.iter().map(|row| row.record().id()).collect::<Vec<_>>(), [ids[0], ids[2]]);
     }
 
+    #[test]
+    fn a_mutation_receipt_follows_its_persisted_result() {
+        let folder = Folder::new();
+        let scope = scope(7, 1, 1);
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        let event = open(1);
+        let id = event.id;
+        writer.handle(Message::Event(scope, event)).unwrap();
+        writer.update(&Update::Settle(scope, vec![id], Settlement::Taken(now_ms()))).unwrap();
+        assert!(read(&folder.0, scope, 0, 1, usize::MAX).is_empty());
+        drop(writer);
+
+        let (sender, line) = mpsc::sync_channel(1);
+        let (update, updates) = mpsc::channel();
+        let (finished, receipt) = mpsc::channel();
+        let root = folder.0.clone();
+        let waiting = Arc::new(Mutex::new(None));
+        let counters = Arc::new(Counters::default());
+        let worker = counters.clone();
+        update.send(ChangeRequest {
+            update: Update::ResendAll(scope.account.backend), finished: Some(finished),
+        }).unwrap();
+        let thread = std::thread::spawn(move || run(root, line, updates, waiting, worker));
+        let result = receipt.recv_timeout(Duration::from_secs(5));
+        let rows = read(&folder.0, scope, 0, 1, usize::MAX);
+        drop(sender);
+        thread.join().unwrap();
+        result.unwrap();
+        assert_eq!(rows[0].record().id(), id);
+    }
+
     #[cfg(unix)]
     #[test]
     fn sigkill_keeps_flushed_events_and_discards_a_torn_append() {
