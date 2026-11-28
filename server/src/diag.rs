@@ -2,8 +2,6 @@
 //! round-trips through the core's closed Report. No request or transport data is stored.
 
 use std::fmt::Write as _;
-use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -13,7 +11,7 @@ use nexus_core::nexus::diag::{self, MAX_AGE_MS, MIN_GAP_MS, STORED_REPORTS, Uplo
 use nexus_core::nexus::kept::{Access, SessionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::accounts::session::{Accounts, refused};
+use crate::accounts::session::refused;
 use crate::events::{
     Calls, UploadLimit, admit_upload, answer, arrive, authenticated, bearer, denied, finish,
     inspect_session, list_response, receipt, respond, result, signed_in, sql, unavailable,
@@ -23,7 +21,6 @@ pub const SEND_PATH: &str = diag::SEND_PATH;
 pub const LIST_PATH: &str = "/nexus/api/diag/list";
 pub const ADMIN_PATH: &str = "/nexus/api/admin/diagnostics";
 pub const LIST_PAGE: usize = 50;
-const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     let outcome = async {
@@ -100,23 +97,6 @@ fn keep(tx: &Transaction<'_>, account: u64, device: DeviceId, upload: Upload, no
         }
     }
     Ok((true, true))
-}
-
-// CARRIED until the desk calls Keeper::idle itself (S9). Enqueue one idle turn
-// immediately at startup, then at most once per minute. The store owns the work.
-pub(crate) fn start_expiry(accounts: &Arc<Accounts>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
-    let accounts = Arc::downgrade(accounts);
-    runtime.spawn(async move {
-        let mut interval = tokio::time::interval(EXPIRY_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let Some(accounts) = accounts.upgrade() else { break };
-            let clock = accounts.clock.clone();
-            let _ = accounts.desk.ask(move |keeper| keeper.idle(clock())).await;
-        }
-    });
 }
 
 /// Device numbers and server receipt times for the signed-in account.

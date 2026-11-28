@@ -20,10 +20,12 @@ use nexus_core::nexus::events::{
 };
 use nexus_core::nexus::proto::{SPEAKS, Version};
 use nexus_music_server::accounts::{
-    check::PasswordWorkers, desk::Desk, session::Accounts,
+    check::PasswordWorkers, desk::Desk, music::MusicSide, rows, session::{Accounts, Seen},
     setup::{CodeKey, SetUpCode, dummy_salt_key, make_code},
 };
+use nexus_music_server::music::MusicClient;
 use nexus_music_server::serve::{self, Shell};
+use nexus_music_server::settings::DATA_BUDGET_DEFAULT;
 use nexus_music_server::probe;
 use nexus_music_server::store::keeper::{First, Keeper};
 use rusqlite::{Connection, params, types::FromSql};
@@ -107,16 +109,26 @@ impl Fixture {
             let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), now)
                 .unwrap_or_else(|why| panic!("{why}"));
             let backend = keeper.backend();
+            let clock: nexus_music_server::accounts::session::Clock =
+                Arc::new(move || clock_for_server.load(Ordering::SeqCst));
             let accounts = Arc::new(Accounts {
                 workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
                 set_up_code: SetUpCode::at_start(keeper.set_up(), now).0,
-                desk: Desk::open(keeper).unwrap(),
-                clock: Arc::new(move || clock_for_server.load(Ordering::SeqCst)),
+                seen: Arc::new(Seen::new(rows::device_secrets(keeper.data().connection()).unwrap())),
+                desk: Desk::open(keeper, clock.clone()).unwrap(),
+                clock,
                 backend,
+                music: MusicSide {
+                    client: MusicClient::from_this_machine().0,
+                    internal: "http://navidrome:4533".into(),
+                },
             });
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
                 let listener = serve::listen(addr).unwrap();
-                let shell = Shell::backend(addr.ip(), &nexus_music_server::hello(backend), accounts, Some("https://nexus.example.org"));
+                let shell = Shell::backend(
+                    addr.ip(), &nexus_music_server::hello(backend), accounts,
+                    Some("https://nexus.example.org"), DATA_BUDGET_DEFAULT,
+                );
                 let serving = tokio::spawn(serve::serve(listener, shell, false));
                 let _ = stopped.await;
                 serving.abort();
@@ -613,7 +625,7 @@ fn restart_keeps_acknowledged_events_and_reports() {
 }
 
 #[test]
-fn startup_expiry_removes_diagnostics_even_when_the_device_is_absent() {
+fn the_writer_expires_old_reports_without_another_upload_from_the_device() {
     let mut fixture = Fixture::new("expiry");
     let code = fixture.set_up();
     let clock = fixture.start_with_clock();
@@ -621,22 +633,32 @@ fn startup_expiry_removes_diagnostics_even_when_the_device_is_absent() {
     upload(&fixture, &who, &stamp, 1, &report(1, false));
     clock.fetch_add(diag::MIN_GAP_MS, Ordering::SeqCst);
     upload(&fixture, &who, &stamp, 2, &report(2, false));
-    fixture.stop();
-    // Age only the oldest report, as if a month passed with the server off.
-    fixture.db().execute(
-        "UPDATE diagnostic_reports SET received_ms = received_ms - ?1 WHERE row_id = 1",
-        [diag::MAX_AGE_MS as i64 + 60_000],
-    ).unwrap();
-    fixture.start();
-    let began = Instant::now();
-    while count(&fixture, "diagnostic_reports") != 1 {
-        assert!(began.elapsed() < Duration::from_secs(3), "expired report still on disk");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+
+    // Leave the data mark due for the next idle turn, then advance past the
+    // first report's lifetime. The device never uploads another report.
+    let sent = batch(&stamp, &[start(1, 100, 0)]);
+    assert_outcomes(send(&fixture, &who, &sent), &sent, &[Outcome::Taken]);
+    clock.fetch_add(diag::MAX_AGE_MS - diag::MIN_GAP_MS + 1, Ordering::SeqCst);
     let (status, body) = fixture.post(nexus_music_server::diag::LIST_PATH, Some(&who), page(&stamp, None).bytes());
     assert_eq!(status, 200);
     assert_eq!(json::<i64>(&body, "$.done.result.reports[0].id"), 2);
     assert_eq!(json::<Option<i64>>(&body, "$.done.result.reports[1].id"), None);
+    assert_eq!(count(&fixture, "diagnostic_reports"), 1);
+}
+
+fn fill_test_database(fixture: &Fixture) {
+    fixture.db().execute_batch(
+        "CREATE TABLE budget_fixture(reserved BLOB);
+         INSERT INTO budget_fixture VALUES (zeroblob(1000000));",
+    ).unwrap();
+}
+
+#[test]
+fn invalid_budget_refuses_to_start() {
+    let fixture = Fixture::new("invalid-budget");
+    let output = fixture.program().env("NEXUS_DATA_BUDGET", "four").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("NEXUS_DATA_BUDGET is wrong"));
 }
 
 #[test]
@@ -648,7 +670,8 @@ fn a_full_budget_defers_new_events_without_losing_existing_ones() {
     let kept = batch(&stamp, &[start(1, 100, 0)]);
     assert_outcomes(send(&fixture, &who, &kept), &kept, &[Outcome::Taken]);
     fixture.stop();
-    fixture.budget = Some(1);
+    fill_test_database(&fixture);
+    fixture.budget = Some(1_000_000);
     fixture.start();
     let mixed = batch(&stamp, &[start(1, 100, 0), start(2, 200, 0)]);
     assert_outcomes(send(&fixture, &who, &mixed), &mixed, &[Outcome::Taken, Outcome::NotDealtWith]);
@@ -663,6 +686,7 @@ fn crossing_the_budget_rolls_back_only_the_rows_that_do_not_fit() {
     let (who, stamp) = fixture.sign_in(with_code(code), 1);
     fixture.stats(&who, &stamp, None);
     fixture.stop();
+    fill_test_database(&fixture);
     let cap = nexus_music_server::events::data_bytes(&fixture.db()).unwrap() + 1;
     fixture.budget = Some(cap);
     fixture.start();

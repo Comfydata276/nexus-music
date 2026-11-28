@@ -28,7 +28,6 @@ use crate::store::keeper::Keeper;
 
 pub const STATS_PATH: &str = "/nexus/api/events/stats";
 pub const STATS_PAGE: usize = 50;
-const DEFAULT_DATA_BUDGET: u64 = 4_000_000_000;
 
 #[derive(Clone)]
 pub(crate) struct Calls {
@@ -39,14 +38,7 @@ pub(crate) struct Calls {
     budget: u64,
 }
 
-pub(crate) fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<str>>) -> Router {
-    // CARRIED until settings validates this value at startup. A malformed configured cap
-    // closes the event intake to new rows while still allowing retries of kept events.
-    let budget = match std::env::var("NEXUS_DATA_BUDGET") {
-        Ok(value) => value.parse().unwrap_or(0),
-        Err(std::env::VarError::NotPresent) => DEFAULT_DATA_BUDGET,
-        Err(std::env::VarError::NotUnicode(_)) => 0,
-    };
+pub(crate) fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<str>>, budget: u64) -> Router {
     let calls = Calls {
         accounts,
         public_origin,
@@ -54,7 +46,6 @@ pub(crate) fn router(base: Router, accounts: Arc<Accounts>, public_origin: Optio
         report_slots: Arc::default(),
         budget,
     };
-    crate::diag::start_expiry(&calls.accounts);
     base.merge(
         Router::new()
             .route(events::SEND_PATH, post(send))
