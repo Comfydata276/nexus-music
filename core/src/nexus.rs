@@ -9,4 +9,5 @@
 //! randomness, and nothing here panics, whatever it is given. The backend links this, as
 //! the apps do, so both sides read the same words the same way.
 
+pub mod kept;
 pub mod proto;
