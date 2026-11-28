@@ -116,6 +116,12 @@ impl SetUpCode {
         matches
     }
 
+    /// Whether `typed` is the code and it is still good at `now`, leaving it as it is (the page's
+    /// set-up looks before its slow work, and takes it after).
+    pub fn matches(&self, typed: &OneTimeCode, now: u64) -> bool {
+        self.live.lock().is_ok_and(|live| live.as_ref().is_some_and(|live| live.print == Fingerprint::of(&padded(typed)) && now < live.until))
+    }
+
     /// Whether a set-up code is still to be had at `now`.
     pub fn open(&self, now: u64) -> bool {
         self.live.lock().is_ok_and(|live| live.as_ref().is_some_and(|live| now < live.until))

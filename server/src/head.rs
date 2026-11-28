@@ -163,6 +163,7 @@ pub const ROUTES: &[Route] = &[
     Route::new(proto::HELLO, "GET", BODY_MAX_BYTES),
     Route::new(crate::admin::PAGE, "GET", BODY_MAX_BYTES),
     Route::new(account::SIGN_IN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(account::SET_UP, "POST", account::SET_UP_MAX_BYTES),
     Route::new(account::CHANGE_PASSWORD, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(account::SIGN_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(account::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
