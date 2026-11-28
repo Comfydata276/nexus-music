@@ -376,26 +376,69 @@ def sign_in_form(a):
     return a.find(label="Connect") or a.find(label="Sign in", role="Button")
 
 
+VAULT_MARK = b"nexus-kept-1\n"
+BLOB_MAX = 2560
+
+
+def keep_secret(config, name, text):
+    """Writes a record as `src/nexus/vault.rs` does (W7c item 12): its mark, then the record
+    whole if it fits one credential, else in parts under a head naming them (a number, the
+    count, the length and a SHA-256), each file only this user's."""
+    data = text.encode()
+    def put(file, body):
+        path = os.path.join(config, f"secret-{file}")
+        open(path, "wb").write(body)
+        os.chmod(path, 0o600)
+    if len(VAULT_MARK) + 2 + len(data) <= BLOB_MAX:
+        put(name, VAULT_MARK + b"W\n" + data)
+        return
+    generation = os.urandom(8).hex()
+    chunks = [data[i:i + BLOB_MAX] for i in range(0, len(data), BLOB_MAX)]
+    for index, chunk in enumerate(chunks):
+        put(f"{name}~{generation}~{index}", chunk)
+    put(name, VAULT_MARK + b"P\n" + f"{generation}\n{len(chunks)}\n{len(data)}\n{hashlib.sha256(data).hexdigest()}".encode())
+
+
+def read_secret(config, name):
+    """What `keep_secret` (and the app) wrote, read back as the app reads it; `None` if absent
+    or not a record of the vault's."""
+    def get(file):
+        try:
+            return open(os.path.join(config, f"secret-{file}"), "rb").read()
+        except OSError:
+            return None
+    head = get(name)
+    if head is None or not head.startswith(VAULT_MARK):
+        return None
+    rest = head[len(VAULT_MARK):]
+    if rest.startswith(b"W\n"):
+        return rest[2:].decode()
+    if not rest.startswith(b"P\n"):
+        return None
+    generation, count, length, sha = rest[2:].decode().split("\n")
+    data = b"".join(get(f"{name}~{generation}~{index}") or b"" for index in range(int(count)))
+    if len(data) != int(length) or hashlib.sha256(data).hexdigest() != sha:
+        return None
+    return data.decode()
+
+
 def to_signed_in(home, token_of="tester-pass-1", count=1):
-    """Slice W7: the profile at `home` as a sign-in to the Nexus server would have left it.
-    The released app's saved music password is removed (nothing may read it); in its place,
-    one kept item (as `config::SignedIn`, in the file the development build keeps secrets in):
-    the session the stand-in was seeded with, a music login (a salt, and the token for it made
-    from `token_of`, which a test may make wrong), the account, and the folder carried over."""
+    """Slice W7: the profile at `home` as a sign-in to the Nexus server would have left it, in
+    the format the app's store keeps now (W7c item 12): one kept record (`config::SignedIn`,
+    marked, as `src/nexus/vault.rs` writes it) holding the session the stand-in was seeded
+    with, a music login (a salt, and the token for it made from `token_of`, which a test may
+    make wrong), the request that handed it (`handed_at`, the sign-in's), the account, and the
+    folder carried over. **The released app's saved music password is left where it is: the
+    app itself must delete it, unread** (`no_password_anywhere` checks it did)."""
     config = os.path.join(A.HOMES, home, "config")
-    if os.path.exists(os.path.join(config, "credential")):
-        os.remove(os.path.join(config, "credential"))
     salt = SALT
     music = {"address": front.SERVER, "name": "tester", "salt": salt, "token": hashlib.md5((token_of + salt).encode()).hexdigest(), "count": count}
     saved = {"nexus": front.SERVER, "backend_id": front.BACKEND_A, "account": 7, "email": "tester@example.org", "name": "Tester", "device": 1,
              "restore": 1, "life": 1, "change": 1, "notice": None, "session": front.SEED_SESSION,
              "sign_out": {"session": 99, "secret": "5f" * 32}, "music": music}
     folder = ACCOUNT_STEM["tester"]
-    plain = {"server": front.SERVER, "username": "tester", "salt": salt, "token": music["token"], "count": count}
-    record = {"saved": saved, "music": plain, "folder": folder}
-    path = os.path.join(config, "secret-nexus-sign-in")
-    open(path, "w").write(json.dumps(record))
-    os.chmod(path, 0o600)
+    record = {"saved": saved, "folder": folder, "handed_at": front.SERVER + "/nexus/api/signin"}
+    keep_secret(config, "nexus-sign-in", json.dumps(record))
     settings = os.path.join(config, "settings.json")
     s = json.load(open(settings))
     s["carried_over"] = [f"{front.BACKEND_A}\n7", folder]
@@ -1646,10 +1689,12 @@ def w7_home(name, token_of="tester-pass-1", count=1, offline=False):
 
 
 def kept_record(copy):
-    """What the app keeps of the sign-in, read from its file (the development build's)."""
+    """What the app keeps of the sign-in, read from its file (the development build's) as the
+    app reads it: the machine's `Saved` (its session, its music login) inside the record."""
     try:
-        return json.load(open(copy.path("config", "secret-nexus-sign-in")))
-    except (OSError, ValueError):
+        text = read_secret(copy.path("config"), "nexus-sign-in")
+        return (json.loads(text) or {}).get("saved") if text is not None else None
+    except ValueError:
         return None
 
 
@@ -1719,6 +1764,9 @@ def scenario_refused(mode="found"):
     renewed = [r for r in rows if f"t={bad}" not in r[3] and "t=" in r[3] and r[2] == "200"]
     if not refused:
         failures.append("the music server never saw the refused login: nothing was tested")
+    elif len(refused) != 1:
+        # A cold start with a stale login: exactly one request goes with it (W7c item 12).
+        failures.append(f"{len(refused)} requests with the refused login reached the music server, not exactly one")
     else:
         first_back = min(r[1] for r in refused)
         late = [r for r in refused if r[0] > first_back + 0.05]

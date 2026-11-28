@@ -11,7 +11,6 @@ export struct RecentListen {
 
 export global Listening {
     in-out property <string> page;
-    in property <bool> initial-notice;
     in property <bool> busy;
     in property <bool> can-delete;
     in property <string> summary;
@@ -163,7 +162,7 @@ export component ListeningOverlay inherits Rectangle {
                 }
 
                 if Listening.page != "delete": TextButton {
-                    text: Listening.initial-notice ? "Continue" : "Done";
+                    text: "Done";
                     primary: true;
                     clicked => { Listening.dismiss(); }
                 }

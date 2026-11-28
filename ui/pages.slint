@@ -3032,6 +3032,14 @@ export component LoginPage inherits Rectangle {
     property <string> code-in;
     property <string> again-in;
 
+    // The window went (to the tray too): what was typed and not sent goes.
+    property <int> wipe: App.form-wipe;
+    changed wipe => {
+        root.password-in = "";
+        root.code-in = "";
+        root.again-in = "";
+    }
+
     // A try answered: what was typed as a password goes.
     property <bool> busy: App.login-busy;
     changed busy => {
@@ -3097,13 +3105,12 @@ export component LoginPage inherits Rectangle {
                         wrap: word-wrap;
                     }
 
+                    // The words are the ones both apps use, at every size (the lead's ruling: one
+                    // set of words for signing in); in a small window the form scrolls.
                     Text {
-                        // (Shorter in a small window, so that the form and its button fit.)
                         text: root.code
-                            ? (root.short ? "Your one-time code, and the password you'll use from now on: at least 15 characters."
-                                : "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on: at least 15 characters.")
-                            : (root.short ? "Your Nexus server's address, and your account's email and password."
-                                : "Type your Nexus server's address, and the email and password of your account there.");
+                            ? "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on."
+                            : "Type your Nexus server's address, and the email and password of your account there.";
                         color: Theme.muted;
                         font-size: 14px;
                         wrap: word-wrap;
@@ -3162,6 +3169,13 @@ export component LoginPage inherits Rectangle {
                         input-type: InputType.password;
                         label: root.code ? "Choose a password" : "Password";
                         accepted => { root.go(); }
+                    }
+
+                    if root.code: Text {
+                        text: "At least 15 characters, and not your email.";
+                        color: Theme.muted;
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
 
                     if root.code: Text {
@@ -3241,8 +3255,7 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Text {
-                        text: root.short ? "Your password goes only to your Nexus server, and is never kept on this PC."
-                            : "Your password goes only to your Nexus server, and is never kept on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
+                        text: "Your password goes only to your Nexus server, and is never kept on this PC.";
                         color: Theme.faint;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -3310,7 +3323,7 @@ export component NoMusicPage inherits Rectangle {
                     }
 
                     Text {
-                        text: "Your admin hasn't set your music sign-in yet. Ask whoever runs your Nexus server to set it for you. Once they have, your music appears the next time Nexus Music starts or talks to your server: press Check now. You don't need to sign in again.";
+                        text: "Your admin hasn't set your music sign-in yet. Ask them to set it on the Nexus server's admin page.";
                         color: Theme.muted;
                         font-size: 14px;
                         wrap: word-wrap;
@@ -3331,7 +3344,7 @@ export component NoMusicPage inherits Rectangle {
                         spacing: 10px;
                         alignment: space-between;
                         Text {
-                            text: "Offline mode is on: your Nexus server isn't being asked.";
+                            text: "Offline mode is on.";
                             color: Theme.text;
                             font-size: 13px;
                             vertical-alignment: center;

@@ -156,6 +156,9 @@ export global App {
     in property <int> login-wait;
     // The sign-in form was closed with nothing sent.
     callback form-closed();
+    // Moved each time the window goes (to the tray too): what was typed into the sign-in
+    // form and not sent goes with it (W7c item 13).
+    in property <int> form-wipe;
     callback sign-out();
     // Signed out of the Nexus server with the music still playing (its data was put back):
     // the Account tab offers the sign-in screen, which is then shown over the app.
@@ -169,6 +172,10 @@ export global App {
     in property <bool> nexus-signed-in;
     // A music login is held.
     in property <bool> nexus-plays;
+    // What the Nexus server records, as it asks the person to be told (design 13.6): shown
+    // whole, over the window, until the person presses OK (W7c item 10). Empty: none.
+    in-out property <string> nexus-notice;
+    callback notice-seen();
     // The music server refused the music sign-in (src/subsonic.rs): the component asks the
     // Nexus server for the current one.
     callback music-login-refused();

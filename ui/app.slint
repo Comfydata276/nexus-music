@@ -12,7 +12,7 @@ import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers,
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, NoticeOverlay } from "overlays.slint";
 import { Listening, ListeningOverlay, RecentListen } from "listening.slint";
 
 export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow, BatchRequestLine, Listening, RecentListen }
@@ -301,7 +301,7 @@ export component MainWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
-            if Listening.page != "" || Prompt.open || !App.signed-in || App.show-sign-in {
+            if Listening.page != "" || App.nexus-notice != "" || Prompt.open || !App.signed-in || App.show-sign-in {
                 return reject;
             }
             // A menu that's open takes the arrow keys and Enter.
@@ -622,5 +622,6 @@ export component MainWindow inherits Window {
         }
 
         if Listening.page != "": ListeningOverlay { }
+        if App.nexus-notice != "": NoticeOverlay { }
     }
 }

@@ -229,14 +229,15 @@ fn save_choice(path: &Path, choice: Option<bool>) -> io::Result<()> {
 
 /// Forget an unreadable choice, unless a newer button press has already replaced it.
 #[allow(dead_code)] // W7 owns the live client.
-pub(crate) fn forget_choice() {
-    if let Some(path) = with(|ctl| choice_path(&ctl.paths)) {
-        on_worker(move || {
-            if read_profile::<bool>(&path, 8).is_err() {
-                let _ = save_choice(&path, None);
-            }
-        });
-    }
+/// Says when it is done, and whether it held (W7c item 11: the sign-in's driver waits for it).
+pub(crate) fn forget_choice() -> Option<std::sync::mpsc::Receiver<bool>> {
+    let path = with(|ctl| choice_path(&ctl.paths))?;
+    let (done, receipt) = std::sync::mpsc::channel();
+    on_worker(move || {
+        let held = read_profile::<bool>(&path, 8).is_ok() || save_choice(&path, None).is_ok();
+        let _ = done.send(held);
+    });
+    Some(receipt)
 }
 
 fn save_schedule(path: &Path, schedule: Option<&DiagSchedule>) -> io::Result<()> {
@@ -245,18 +246,22 @@ fn save_schedule(path: &Path, schedule: Option<&DiagSchedule>) -> io::Result<()>
 
 /// Queue this in the order core issued it. The subsequent read cannot start ahead of it.
 #[allow(dead_code)] // W7 owns the live client.
-pub(crate) fn keep_schedule_for_window(schedule: Option<DiagSchedule>) {
-    if let Some(paths) = with(|ctl| ctl.paths.clone()) {
-        keep_schedule(&paths, schedule);
-    }
+/// Says when it is done, and whether it was written (W7c item 11: the sign-in's driver waits
+/// for it).
+pub(crate) fn keep_schedule_for_window(schedule: Option<DiagSchedule>) -> Option<std::sync::mpsc::Receiver<bool>> {
+    let paths = with(|ctl| ctl.paths.clone())?;
+    Some(keep_schedule(&paths, schedule))
 }
 
-fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) {
+fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) -> std::sync::mpsc::Receiver<bool> {
     let path = schedule_path(paths);
+    let (done, receipt) = std::sync::mpsc::channel();
     on_worker(move || {
         let written = save_schedule(&path, schedule.as_ref()).is_ok();
         SCHEDULE_KEPT.set(written && schedule.is_some());
+        let _ = done.send(written);
     });
+    receipt
 }
 
 /// Queue the matching reply for W7 to feed back into the same live client.

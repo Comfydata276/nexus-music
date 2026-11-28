@@ -97,10 +97,6 @@ pub(crate) fn install(window: &ui::MainWindow) {
     }).unwrap_or(()));
     pane.on_dismiss(|| crate::controller::with(|ctl| {
         let pane = ctl.ui.global::<ui::Listening>();
-        if pane.get_initial_notice() {
-            pane.set_initial_notice(false);
-            calls::notice_seen();
-        }
         new_turn();
         pane.set_page("".into());
         pane.set_busy(false);
@@ -114,13 +110,6 @@ pub(crate) fn install(window: &ui::MainWindow) {
             ctl.ui.global::<ui::Listening>().set_result("Enter your current Nexus password.".into());
         }
     }).unwrap_or(()));
-}
-
-/// Invoked by W7 once the machine exposes its pending first-sign-in notice.
-pub(crate) fn show_recording_notice(window: &ui::MainWindow) {
-    let pane = window.global::<ui::Listening>();
-    pane.set_initial_notice(true);
-    pane.set_page("recording".into());
 }
 
 pub(crate) fn session_changed() {
@@ -137,9 +126,6 @@ pub(crate) fn session_changed() {
         } else if pane.get_page() == "delete" && !pane.get_busy() {
             pane.set_page("stats".into());
             refresh(&ctl.ui);
-        } else if context.is_none() && pane.get_initial_notice() {
-            pane.set_page("".into());
-            pane.set_initial_notice(false);
         }
     });
 }

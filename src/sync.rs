@@ -816,7 +816,9 @@ impl Controller {
     fn take_history(self: &Rc<Self>, take: &Take, songs: &HashMap<String, Song>) {
         let merged = merged_history(&self.history.borrow(), take, songs);
         if let Some(history) = merged {
-            crate::config::save_history(&self.queue_files().2, &history);
+            if let Some((_, _, path)) = self.queue_files() {
+                crate::config::save_history(&path, &history);
+            }
             *self.history.borrow_mut() = history;
             self.sync_history();
         }

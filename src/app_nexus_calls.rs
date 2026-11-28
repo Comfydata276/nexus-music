@@ -41,7 +41,6 @@ impl Context {
 pub(crate) struct Driver {
     pub context: fn() -> Option<Context>,
     pub post: fn(Context, &str, &[u8], usize, Duration) -> Result<TransportReply, TransportError>,
-    pub notice_seen: fn(),
 }
 
 static DRIVER: OnceLock<Driver> = OnceLock::new();
@@ -70,12 +69,6 @@ pub(crate) fn post(
         return Err(TransportError::Stopped);
     }
     (driver.post)(context, path, body, limit, timeout)
-}
-
-pub(crate) fn notice_seen() {
-    if let Some(driver) = DRIVER.get() {
-        (driver.notice_seen)();
-    }
 }
 
 pub(crate) fn new_id() -> Result<RequestId, TransportError> {

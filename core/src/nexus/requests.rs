@@ -944,6 +944,8 @@ pub struct AttributionRow {
     pub account: AccountId,
     pub name: account::Name,
     pub asked: AskedRelease,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrived: Option<bool>,
 }
 
 impl Value for AttributionRow {
@@ -953,6 +955,7 @@ impl Value for AttributionRow {
             account: fields.get("account")?,
             name: fields.get("name")?,
             asked: object_json(raw_member(&fields, "asked")?)?,
+            arrived: fields.0.get("arrived").map(|raw| bool::read(raw)).transpose()?,
         })
     }
 }
@@ -2134,13 +2137,18 @@ mod tests {
         assert_eq!(read_attribution(body.bytes()), Ok(read));
         assert!(read_call(body.bytes()).is_err());
 
-        let page = admin::Reply::Done(AttributionPage {
-            rows: vec![AttributionRow { account: AccountId::new(7).unwrap(), name: account::Name::new("Avery").unwrap(), asked }],
-            next: None,
-        });
-        let body = write_attribution_reply(&page).unwrap();
-        assert_eq!(read_attribution_reply(200, body.bytes()), Ok(page));
-        assert!(read_reply(200, body.bytes()).is_err());
+        for arrived in [None, Some(false), Some(true)] {
+            let page = admin::Reply::Done(AttributionPage {
+                rows: vec![AttributionRow {
+                    account: AccountId::new(7).unwrap(), name: account::Name::new("Avery").unwrap(),
+                    asked: asked.clone(), arrived,
+                }],
+                next: None,
+            });
+            let body = write_attribution_reply(&page).unwrap();
+            assert_eq!(read_attribution_reply(200, body.bytes()), Ok(page));
+            assert!(read_reply(200, body.bytes()).is_err());
+        }
     }
 
     fn artist_target() -> ArtistTarget { ArtistTarget { id: one(), artist: id(1) } }

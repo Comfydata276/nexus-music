@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use slint::ComponentHandle;
@@ -40,6 +40,9 @@ struct Job {
     progress: Arc<AtomicU32>,
     /// Set to abandon the fetch.
     cancel: Arc<AtomicBool>,
+    /// The music login it was asked for under (number, generation): held under an older one
+    /// than the login in use when it reports, it is asked for again at once (W7c item 4).
+    login: (u64, u64),
 }
 
 pub struct Downloads {
@@ -99,6 +102,20 @@ fn partial_download(name: &str, entries: &[Entry]) -> bool {
     let (Some(attempt), Some(extension), Some(stem)) = (parts.next(), parts.next(), parts.next()) else { return false };
     let word = |part: &str, more: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c));
     attempt.chars().all(|c| c.is_ascii_digit()) && !attempt.is_empty() && word(extension, "") && word(stem, "-_")
+}
+
+/// Where an account's downloads are (W7c item 5): the place chosen for that account under
+/// Settings (`downloads_dirs`), else the one chosen for this PC (`downloads_dir`), else the
+/// app's own; and inside it **always a folder of the account's own**, so that two accounts
+/// with the same place never share a file name. The folder this PC had before (`legacy`,
+/// carried over to one person) is that place itself, as 0.40 kept it; nobody signed in, too.
+pub fn account_dir(settings: &crate::config::Settings, default: &Path, folder: &str, legacy: bool) -> PathBuf {
+    let base = match settings.downloads_dirs.get(folder) {
+        Some(chosen) => PathBuf::from(chosen),
+        None if settings.downloads_dir.is_empty() => default.to_path_buf(),
+        None => PathBuf::from(&settings.downloads_dir),
+    };
+    if folder.is_empty() || legacy { base } else { base.join(folder) }
 }
 
 /// Which songs an account has downloaded here, and which lists it keeps downloaded.
@@ -265,6 +282,24 @@ impl Downloads {
         }
         self.under_way.clear();
         self.held.clear();
+    }
+
+    /// A song whose download a refusal stopped, under the login `login`: kept to be asked for
+    /// again once under a renewed login; or, if the login in use (`current`) is already
+    /// another one that may send (the download missed the renewal's edge), handed back to be
+    /// asked for again at once (W7c item 4).
+    fn hold(&mut self, song: Song, login: (u64, u64), current: Option<&Client>) -> Option<Song> {
+        self.held.retain(|held| held.id != song.id);
+        if current.is_some_and(|client| client.handed() != login && !client.refused() && !client.retired()) {
+            return Some(song);
+        }
+        self.held.push(song);
+        None
+    }
+
+    /// Cancelled: no longer asked for again under a renewed login either.
+    fn forget_held(&mut self, ids: &[String]) {
+        self.held.retain(|held| !ids.contains(&held.id));
     }
 
     /// What a refused login held, to be asked for again (once) under a renewed one.
@@ -435,10 +470,18 @@ pub fn plan_for(dir: &Path, account: &str) -> Result<Plan, String> {
         Ok(bytes) if serde_json::from_slice::<Vec<Entry>>(&bytes).is_ok() => {}
         _ => return Err(format!("The list of downloads in {} couldn't be read, so nothing was moved.", dir.display())),
     }
-    Ok(plan(dir))
+    Ok(plan_of(dir, Some(account)))
 }
 
+/// Everything of the app's in `dir`, every account's (the move's own tests).
+#[cfg(test)]
 pub fn plan(dir: &Path) -> Plan {
+    plan_of(dir, None)
+}
+
+/// `plan`, of `only` that account's list, its playlists kept downloaded and the files its
+/// list names, when given (W7c item 5: a move acts on the signed-in account's alone).
+fn plan_of(dir: &Path, only: Option<&str>) -> Plan {
     let plain = |name: &str| !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']) && Path::new(name).file_name().is_some_and(|only| only == name);
     let mut names: Vec<std::ffi::OsString> = Vec::new();
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -449,6 +492,9 @@ pub fn plan(dir: &Path) -> Plan {
             name.strip_prefix("index-").and_then(|rest| rest.strip_suffix(".json")).map(str::to_string)
         };
         let Some(account) = account else { continue };
+        if only.is_some_and(|only| only != account) {
+            continue;
+        }
         let Ok(entries) = fs::read(entry.path()).map(|bytes| serde_json::from_slice::<Vec<Entry>>(&bytes)) else { continue };
         let Ok(entries) = entries else { continue };
         names.push(entry.file_name());
@@ -608,7 +654,7 @@ fn fetch(
     attempt: u64,
     progress: &AtomicU32,
     cancel: &AtomicBool,
-) -> Result<Entry, FetchFailure> {
+) -> Result<Fetched, FetchFailure> {
     let suffix = song.suffix.to_lowercase();
     let playable = NATIVE_SUFFIXES.contains(&suffix.as_str());
     // The original is kept when lossless is asked for, or when it's already an MP3 within the
@@ -626,10 +672,12 @@ fn fetch(
         return Err(FetchFailure::failed(FaultShape::UnexpectedAnswer, "unexpected song id"));
     }
     let file = format!("{stem}.{extension}");
-    // Each go has a file of its own to arrive in, so two goes at one song can't trip over
-    // each other.
-    let temp = dir.join(format!("{file}.{attempt}.part"));
-    let (mut body, length) = client.open_stream(&url, None).map_err(|e| if client.refused() { FetchFailure::Held } else { FetchFailure::failed(diagnostics::connection_shape(&e), e) })?;
+    // Each go has a file of its own to arrive in, never another's, whatever account or turn
+    // it was asked for in (W7c item 5): numbered by this process, not by the list.
+    static STAGED: AtomicU64 = AtomicU64::new(1);
+    let _ = attempt;
+    let temp = dir.join(format!("{file}.{}.part", STAGED.fetch_add(1, Ordering::Relaxed)));
+    let (mut body, length) = client.open_stream(&url, None).map_err(|e| if client.refused() || client.retired() { FetchFailure::Held } else { FetchFailure::failed(diagnostics::connection_shape(&e), e) })?;
     let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
     let mut out = fs::File::create(&temp).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
     let mut buf = vec![0u8; 128 * 1024];
@@ -662,8 +710,36 @@ fn fetch(
         let _ = fs::remove_file(&temp);
         return Err(reason);
     }
-    fs::rename(&temp, dir.join(&file)).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
-    Ok(Entry { song: song.clone(), file, bytes, at: chrono::Utc::now().timestamp() })
+    let created = publish(&temp, &dir.join(&file)).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
+    Ok(Fetched { entry: Entry { song: song.clone(), file, bytes, at: chrono::Utc::now().timestamp() }, created })
+}
+
+/// What a fetch left in the account's folder: the entry, and whether this go made its file
+/// (`false`: a file of that name was there already, and was left as it was).
+struct Fetched {
+    entry: Entry,
+    created: bool,
+}
+
+/// Gives the staged file its name, **never over a file that has it** (W7c item 5). Says
+/// whether it did; if the name was taken, the staged file goes and the one there stays.
+fn publish(staged: &Path, name: &Path) -> std::io::Result<bool> {
+    match crate::config::place_new(staged, name) {
+        Ok(()) => Ok(true),
+        Err(_) if name.exists() => {
+            let _ = fs::remove_file(staged);
+            Ok(false)
+        }
+        // A drive that can't make a second name for a file: moved, unless the name is taken.
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            fs::rename(staged, name)?;
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(staged);
+            Err(error)
+        }
+    }
 }
 
 impl Controller {
@@ -761,6 +837,7 @@ impl Controller {
                         attempt: downloads.next_attempt,
                         progress: Arc::new(AtomicU32::new(0)),
                         cancel: Arc::new(AtomicBool::new(false)),
+                        login: client.handed(),
                     };
                     // Asked for again: it's no longer among the ones that failed.
                     downloads.failed.retain(|(failed, _)| failed.id != song.id);
@@ -806,10 +883,10 @@ impl Controller {
                 post(move |ctl| {
                     if ctl.turn.get() == turn {
                         ctl.download_finished(&id, attempt, result);
-                    } else if let Ok(entry) = result {
-                        // Arrived for an account that is no longer in: the file is nobody's
-                        // list's, and goes.
-                        let _ = fs::remove_file(dir.join(entry.file));
+                    } else if let Ok(fetched) = result {
+                        // Arrived for an account's turn that is over: the file goes, if this go
+                        // made it and no list of that folder's has or wants it now.
+                        ctl.drop_unwanted(&dir, fetched);
                     }
                 });
             });
@@ -817,7 +894,9 @@ impl Controller {
         self.sync_downloads();
     }
 
-    fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Entry, FetchFailure>) {
+    fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Fetched, FetchFailure>) {
+        let mut again = None;
+        let mut unwanted = None;
         let finished = {
             let mut downloads = self.downloads.borrow_mut();
             // No longer listed means this go was cancelled while it was fetching. (The song
@@ -827,22 +906,18 @@ impl Controller {
                 downloads.under_way.remove(id);
             }
             match (result, wanted) {
-                (Ok(entry), Some(_)) => {
+                (Ok(fetched), Some(_)) => {
                     downloads.batch_done += 1;
-                    downloads.add(entry);
+                    downloads.add(fetched.entry);
                 }
-                // A go that was cancelled finished anyway. Its file goes, unless the song has
-                // been asked for again or downloaded since, when the file is that one's.
-                (Ok(entry), None) => {
-                    if !downloads.has(id) && !downloads.queued(id) {
-                        let _ = fs::remove_file(downloads.dir.join(entry.file));
-                    }
-                }
+                // A go that was cancelled finished anyway. Its file goes, if this go made it
+                // and the song has not been asked for again or downloaded since.
+                (Ok(fetched), None) => unwanted = Some(fetched),
                 (Err(FetchFailure::Held), Some(job)) => {
-                    // Not failed: asked for again, once, when the login is renewed.
+                    // Not failed: asked for again, once, when the login is renewed; at once if
+                    // it already has been (it missed the renewal's edge: W7c item 4).
                     downloads.batch_total = downloads.batch_total.saturating_sub(1);
-                    downloads.held.retain(|held| held.id != job.song.id);
-                    downloads.held.push(job.song);
+                    again = downloads.hold(job.song, job.login, self.client().as_ref());
                 }
                 (Err(failure), Some(job)) => {
                     let reason = match failure {
@@ -864,7 +939,14 @@ impl Controller {
             downloads.save_if_due(over);
             (over && downloads.batch_total > 0).then_some((downloads.batch_done, downloads.batch_failed))
         };
+        if let Some(fetched) = unwanted {
+            let dir = self.downloads.borrow().dir.clone();
+            self.drop_unwanted(&dir, fetched);
+        }
         self.mark_download(id);
+        if let Some(song) = again {
+            self.download_songs_with(vec![song], true);
+        }
         if let Some((done, failed)) = finished {
             self.downloads.borrow_mut().batch_total = 0;
             match (done, failed) {
@@ -876,6 +958,26 @@ impl Controller {
             }
         }
         self.sync_downloads();
+    }
+
+    /// A download that came back and is not taken: its file goes **only if this go made it**
+    /// and the list of that folder in use now neither has the song nor is fetching it (W7c
+    /// item 5). Removed off the window's thread.
+    fn drop_unwanted(&self, dir: &Path, fetched: Fetched) {
+        if !fetched.created {
+            return;
+        }
+        let id = &fetched.entry.song.id;
+        let theirs = {
+            let downloads = self.downloads.borrow();
+            downloads.dir == dir && (downloads.has(id) || downloads.queued(id))
+        };
+        if !theirs {
+            let path = dir.join(&fetched.entry.file);
+            self.download_pool.spawn(move || {
+                let _ = fs::remove_file(path);
+            });
+        }
     }
 
     /// Stops these songs' downloads, whether waiting or part-way through.
@@ -893,6 +995,7 @@ impl Controller {
             for id in ids {
                 downloads.under_way.remove(id);
             }
+            downloads.forget_held(ids);
             let over = downloads.jobs.is_empty();
             downloads.save_if_due(over);
             let cancelled = before - downloads.jobs.len();
@@ -913,10 +1016,24 @@ impl Controller {
         self.cancel_downloads(ids);
     }
 
-    /// Moves the downloads into another folder and keeps them there from now on.
-    pub fn move_downloads(self: &Rc<Self>, folder: PathBuf) {
+    /// Moves the signed-in person's downloads into `chosen` (a folder of their own inside it:
+    /// `account_dir`) and keeps them there from now on. **Only theirs** (W7c item 5): their
+    /// list, their playlists kept downloaded and the files their list names; every other
+    /// account's stay where they are. What it comes to is kept for the account it was begun
+    /// for, whoever is signed in when it ends; it is shown only if that account is still in.
+    pub fn move_downloads(self: &Rc<Self>, chosen: PathBuf) {
+        let owner = self.account();
+        if owner.is_empty() {
+            return;
+        }
+        let legacy = self.legacy_folder();
         let from = self.downloads.borrow().dir.clone();
-        if folder == from {
+        let folder = {
+            let mut settings = self.settings.borrow().clone();
+            settings.downloads_dirs.insert(owner.clone(), chosen.display().to_string());
+            account_dir(&settings, &self.paths.downloads, &owner, legacy)
+        };
+        if folder == from || chosen == from {
             return;
         }
         if !self.downloads.borrow().jobs.is_empty() || self.moving_downloads.get() {
@@ -924,15 +1041,14 @@ impl Controller {
         }
         if fs::create_dir_all(&folder).is_err() || !folder.is_dir() {
             diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
-            return self.toast(format!("{} can't be used as a folder.", folder.display()));
+            return self.toast(format!("{} can't be used as a folder.", chosen.display()));
         }
         // The list as it stands, on the disk, before anything is decided from it.
         if let Err(said) = self.downloads.borrow_mut().ready_to_move() {
             diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
             return self.toast(said);
         }
-        let account = self.downloads.borrow().account.clone();
-        let plan = match plan_for(&from, &account) {
+        let plan = match plan_for(&from, &owner) {
             Ok(plan) => plan,
             Err(said) => {
                 diagnostics::fault(FaultPlace::Downloads, FaultShape::Read);
@@ -950,26 +1066,24 @@ impl Controller {
         }
         self.moving_downloads.set(true);
         self.toast(format!("Moving your downloads to {}…", folder.display()));
+        let turn = self.turn.get();
         std::thread::spawn(move || {
             let moved = move_folder_by(&from, &folder, &plan, &MOVING);
             post(move |ctl| {
                 ctl.moving_downloads.set(false);
-                let account = ctl.account();
+                // Still the turn the move was begun in: what it comes to is shown.
+                let shown = ctl.turn.get() == turn && ctl.account() == owner;
                 match moved {
                     Moved::All(_) => {
                         diagnostics::observe(Line::Note(Note::DownloadsFolderChanged));
-                        // This person's folder alone: everyone else's downloads stay where they
-                        // are, and are never taken for theirs.
-                        {
-                            let mut settings = ctl.settings.borrow_mut();
-                            if account.is_empty() {
-                                settings.downloads_dir = if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
-                            } else {
-                                settings.downloads_dirs.insert(account.clone(), folder.display().to_string());
-                            }
+                        // For the account it was begun for alone, whoever is in now.
+                        ctl.settings.borrow_mut().downloads_dirs.insert(owner.clone(), chosen.display().to_string());
+                        let saved = ctl.settings.borrow().save_surely(&ctl.paths.settings);
+                        if !shown {
+                            return;
                         }
-                        *ctl.downloads.borrow_mut() = Downloads::load_for(folder.clone(), &account, ctl.legacy_folder());
-                        if ctl.settings.borrow().save_surely(&ctl.paths.settings) {
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(folder.clone(), &owner, legacy);
+                        if saved {
                             ctl.toast(format!("Your downloads are now in {}", folder.display()));
                         } else {
                             diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
@@ -979,6 +1093,7 @@ impl Controller {
                             ));
                         }
                     }
+                    _ if !shown => return,
                     Moved::Taken(taken) => {
                         diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
                         ctl.toast(if taken == 1 {
@@ -989,12 +1104,12 @@ impl Controller {
                     }
                     Moved::Back { stuck, of } => {
                         diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
-                        *ctl.downloads.borrow_mut() = Downloads::load_for(from, &account, ctl.legacy_folder());
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(from, &owner, legacy);
                         ctl.toast(format!("{stuck} of {of} files couldn't be moved, so the downloads are staying where they were."));
                     }
                     Moved::Split { left } => {
                         diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
-                        *ctl.downloads.borrow_mut() = Downloads::load_for(from.clone(), &account, ctl.legacy_folder());
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(from.clone(), &owner, legacy);
                         ctl.toast(format!(
                             "Some files couldn't be moved, and {left} of those that had been couldn't be brought back: they are in {}. The rest are still in {}, where the app goes on keeping your downloads.",
                             folder.display(),
@@ -1080,7 +1195,7 @@ impl Controller {
         let settings = self.ui.global::<ui::Settings>();
         settings.set_downloads_summary(downloads.summary().into());
         settings.set_downloads_folder(downloads.dir.display().to_string().into());
-        settings.set_downloads_folder_custom(downloads.dir != self.paths.downloads);
+        settings.set_downloads_folder_custom(downloads.dir != account_dir(&crate::config::Settings::default(), &self.paths.downloads, &downloads.account, self.legacy_folder()));
         drop(downloads);
         self.sync_download_progress();
         if matches!(self.current_route(), Some(Route::Downloads)) {
@@ -1214,6 +1329,65 @@ mod tests {
 
     fn entry(id: &str, file: &str, bytes: u64) -> Entry {
         Entry { song: Song { id: id.into(), title: id.to_uppercase(), suffix: "flac".into(), duration: 100, ..Default::default() }, file: file.into(), bytes, at: 5 }
+    }
+
+    /// W7c item 5: two accounts given the same place never share a file name (each has a
+    /// folder of its own in it); the carried-over folder keeps 0.40's place. A file is never
+    /// put over one that has its name. A move plans the signed-in account's files alone.
+    #[test]
+    fn downloads_are_each_accounts_own_whatever_place_is_chosen() {
+        let place = folder("place");
+        let default = folder("default");
+        let mut settings = crate::config::Settings::default();
+        for who in ["nexus-7-aa", "nexus-8-bb"] {
+            settings.downloads_dirs.insert(who.into(), place.display().to_string());
+        }
+        let (a, b) = (account_dir(&settings, &default, "nexus-7-aa", false), account_dir(&settings, &default, "nexus-8-bb", false));
+        assert_ne!(a, b);
+        assert!(a.starts_with(&place) && b.starts_with(&place) && a != place && b != place);
+        assert_eq!(account_dir(&settings, &default, "legacy-stem", true), default);
+        assert_eq!(account_dir(&crate::config::Settings::default(), &default, "nexus-9-cc", false), default.join("nexus-9-cc"));
+        // Published, never over what has the name: a late go leaves the file there as it was.
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("1.flac"), b"theirs").unwrap();
+        fs::write(a.join("1.flac.5.part"), b"late").unwrap();
+        assert!(!publish(&a.join("1.flac.5.part"), &a.join("1.flac")).unwrap());
+        assert_eq!(fs::read(a.join("1.flac")).unwrap(), b"theirs");
+        assert!(!a.join("1.flac.5.part").exists());
+        fs::write(a.join("2.flac.6.part"), b"mine").unwrap();
+        assert!(publish(&a.join("2.flac.6.part"), &a.join("2.flac")).unwrap());
+        // A move of one account's: its list and files only.
+        let shared = folder("shared");
+        fs::write(index_file(&shared, "x"), list(&[entry("1", "1.flac", 6)])).unwrap();
+        fs::write(index_file(&shared, "y"), list(&[entry("2", "2.flac", 4)])).unwrap();
+        fs::write(shared.join("1.flac"), b"xxxxxx").unwrap();
+        fs::write(shared.join("2.flac"), b"yyyy").unwrap();
+        let plan = plan_for(&shared, "x").unwrap();
+        let names: Vec<String> = plan.names.iter().map(|name| name.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["1.flac".to_string(), "index-x.json".to_string()]);
+        for dir in [place, default, shared] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// W7c item 4: a download held under an older login than the one in use is handed back
+    /// to be asked for at once; under the current one (or with nothing newer that may send)
+    /// it waits for the renewal; cancelled, it is not asked for again.
+    #[test]
+    fn a_download_held_under_an_older_login_is_asked_for_again_at_once() {
+        let dir = folder("held");
+        let mut downloads = Downloads::load(dir.clone(), "a");
+        let song = |id: &str| Song { id: id.into(), ..Song::default() };
+        let current = Client::new("http://127.0.0.1:9", "a", "p");
+        current.handed_as((2, 1));
+        assert_eq!(downloads.hold(song("old"), (1, 1), Some(&current)).map(|song| song.id), Some("old".into()));
+        assert!(downloads.hold(song("now"), (2, 1), Some(&current)).is_none());
+        current.set_aside();
+        assert!(downloads.hold(song("aside"), (1, 1), Some(&current)).is_none(), "nothing newer that may send: it waits");
+        downloads.forget_held(&["now".to_string()]);
+        let held: Vec<String> = downloads.take_held().into_iter().map(|song| song.id).collect();
+        assert_eq!(held, vec!["aside".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
