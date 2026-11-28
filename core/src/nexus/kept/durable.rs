@@ -3,6 +3,9 @@
 
 use super::receipt::Purpose;
 use super::*;
+use crate::nexus::admin::{
+    InternalAddress, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey, SealedLidarrKey,
+};
 use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
@@ -124,6 +127,14 @@ pub enum DataChange {
         target: AdminTarget,
     },
     InstallMusicLogin(MusicInstallation),
+    /// The target account's switch and its successor revision for the data write.
+    SetRequestsEnabled { enabled: bool, revision: u64 },
+    /// Write the new revision and seal to the apart store with the spent grant.
+    /// The data transaction must never store the seal.
+    InstallLidarrKey {
+        binding: LidarrBinding,
+        sealed: SealedLidarrKey,
+    },
 }
 
 impl fmt::Debug for DataChange {
@@ -139,6 +150,8 @@ impl fmt::Debug for DataChange {
             Self::DeleteAccount => "DeleteAccount",
             Self::ApplyAdmin { .. } => "ApplyAdmin",
             Self::InstallMusicLogin(_) => "InstallMusicLogin",
+            Self::SetRequestsEnabled { .. } => "SetRequestsEnabled",
+            Self::InstallLidarrKey { .. } => "InstallLidarrKey",
         })
     }
 }
@@ -1038,18 +1051,16 @@ impl Turn<'_> {
     }
 
     pub fn check_leave(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         intent: GrantIntent,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = if matches!(&intent.change, LeaveFor::Admin { .. }) {
+            self.admin_session(&bearer)?
+        } else {
+            self.account.session(bearer.device, bearer.hash, self.now)?.id
+        };
         Ok(PasswordCheck::new(
             self.account.scope(bearer.device)?,
             Purpose::Leave { session, intent },
@@ -1082,7 +1093,9 @@ impl Turn<'_> {
             .as_mut()
             .filter(|s| s.id == session)
             .ok_or(Denied::NotSignedIn)?;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. })
+            && (!self.account.state.admin || row.kind != SessionKind::AdminPage)
+        {
             return Err(Denied::AdminRequired);
         }
         device.last_leave = next(device.last_leave)?;
@@ -1243,9 +1256,7 @@ impl Turn<'_> {
         bearer: Bearer<'_>,
         target: Option<&Account>,
     ) -> Result<MusicAuthorization, Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = self.admin_session(&bearer)?;
         let target_state = &target.unwrap_or(self.account).state;
         if target_state.backend != self.account.state.backend
             || target_state.restore != self.account.state.restore
@@ -1258,7 +1269,6 @@ impl Turn<'_> {
         let target_revision = target_state.revision;
         let next_count = next(target_state.music_login)?;
         let device = bearer.device;
-        let hash = bearer.hash;
         let grant = self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1266,7 +1276,6 @@ impl Turn<'_> {
                 target: named,
             },
         )?;
-        let session = self.account.session(device, hash, self.now)?.id;
         Ok(MusicAuthorization {
             actor: self.account.scope(device)?,
             session,
@@ -1281,19 +1290,15 @@ impl Turn<'_> {
     /// Install the verified login only while the same authorization and internal
     /// address are current. S3 commits the count and sealed bytes under the same lock.
     pub fn install_music(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         verified: VerifiedLogin,
         internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
+        let session = self.admin_session(&bearer)?;
         let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if !self.account.state.admin
-            || self.account.scope(bearer.device)? != auth.actor
+        if self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
             || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
             || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
@@ -1319,13 +1324,68 @@ impl Turn<'_> {
         Ok(auth.next_count)
     }
 
-    pub fn admin_read(self, bearer: Bearer<'_>) -> Result<(), Denied> {
-        self.account.session(bearer.device, bearer.hash, self.now)?;
-        if self.account.state.admin {
-            Ok(())
+    /// Require a live admin page session for an admin route. The server also
+    /// checks the page marker and browser Origin before calling this.
+    pub fn admin_read(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
+        self.admin_session(&bearer).map(|_| ())
+    }
+
+    fn admin_session(&mut self, bearer: &Bearer<'_>) -> Result<SessionId, Denied> {
+        let admin = self.account.state.admin;
+        let session = self.account.session(bearer.device, bearer.hash, self.now)?;
+        if admin && session.kind == SessionKind::AdminPage {
+            Ok(session.id)
         } else {
             Err(Denied::AdminRequired)
         }
+    }
+
+    /// Under the writer lock, use the current container address and apart-store
+    /// revision. Persist the sealed key and successor revision apart first.
+    pub fn set_lidarr(
+        mut self,
+        bearer: Bearer<'_>,
+        current: &LidarrBinding,
+        key: &LidarrKey,
+        sealing: &LidarrSealingKey,
+        nonce: [u8; LIDARR_NONCE_BYTES],
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        if current.backend != self.account.state.backend {
+            return Err(Denied::WrongPurpose);
+        }
+        self.consume_leave(
+            bearer,
+            LeaveFor::Admin {
+                action: AdminAction::lidarr(key, current),
+                target: AdminTarget::Backend,
+            },
+        )?;
+        let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
+        let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
+        *self.change = DataChange::InstallLidarrKey { binding, sealed };
+        Ok(())
+    }
+
+    /// Load the target and its current switch revision under the same writer
+    /// lock used to apply the effects. A stale switch grant cannot be spent.
+    pub fn set_requests_enabled(
+        mut self,
+        bearer: Bearer<'_>,
+        account: AccountId,
+        enabled: bool,
+        switch_revision: u64,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        let selected = &target.as_deref().unwrap_or(self.account).state;
+        if selected.id != account {
+            return Err(Denied::WrongPurpose);
+        }
+        let named = selected.admin_target();
+        self.administer_to(
+            bearer, AdminAction::SetRequests { enabled, revision: switch_revision }, named, target,
+        )
     }
 
     /// Other account, or None for a change to the actor's own account or a global
@@ -1338,12 +1398,23 @@ impl Turn<'_> {
         named: AdminTarget,
         target: Option<&mut Account>,
     ) -> Result<(), Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
-        if action == AdminAction::MusicLoginChanged {
+        self.admin_session(&bearer)?;
+        if matches!(
+            action,
+            AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } | AdminAction::SetRequests { .. }
+        ) {
             return Err(Denied::WrongPurpose);
         }
+        self.administer_to(bearer, action, named, target)
+    }
+
+    fn administer_to(
+        mut self,
+        bearer: Bearer<'_>,
+        action: AdminAction,
+        named: AdminTarget,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
         self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1432,15 +1503,27 @@ pub enum AdminAction {
     CreateAccount,
     SetMusicAddress(MusicAddress),
     SetDiagnosticsDefault(bool),
-    SetRequests(bool),
-    SetLidarr,
+    SetRequests { enabled: bool, revision: u64 },
+    SetLidarr {
+        fingerprint: Fingerprint,
+        address: InternalAddress,
+        revision: u64,
+    },
 }
 
 impl AdminAction {
+    pub(in crate::nexus) fn lidarr(key: &LidarrKey, current: &LidarrBinding) -> Self {
+        Self::SetLidarr {
+            fingerprint: key.fingerprint().clone(),
+            address: current.address.clone(),
+            revision: current.revision,
+        }
+    }
+
     fn matches_target(&self, target: &AdminTarget, selected: &AccountState, other: bool) -> bool {
         match self {
             Self::CreateAccount => matches!(target, AdminTarget::NewAccount(_)) && !other,
-            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr => {
+            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr { .. } => {
                 *target == AdminTarget::Backend && !other
             }
             _ => *target == selected.admin_target(),
@@ -1516,12 +1599,17 @@ fn admin_change(
             }
         }
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
-        AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
+        AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } => {
+            return Err(Denied::WrongPurpose);
+        }
+        AdminAction::SetRequests { enabled, revision } => {
+            // The design does not say whether setting the existing value advances
+            // the revision. Advance it on every accepted write to fence other grants.
+            *change = DataChange::SetRequestsEnabled { enabled, revision: next(revision)? };
+        }
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress(_)
-        | AdminAction::SetDiagnosticsDefault(_)
-        | AdminAction::SetRequests(_)
-        | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin { action, target },
+        | AdminAction::SetDiagnosticsDefault(_) => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())
 }

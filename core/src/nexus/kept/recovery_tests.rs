@@ -8,7 +8,7 @@ impl Stored {
         let mut account = state("admin@example.test");
         account.admin = true;
         let mut admin = Self::new(account);
-        admin.sign_in(7, 1, 7, 0)?;
+        admin.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 0)?;
         Ok(admin)
     }
 
@@ -129,7 +129,7 @@ fn account_off_and_delete_win_both_orders_with_sign_in_and_survive_an_older_copy
                 // Ordinary startup would restore the admin too. Use a newly signed-in
                 // administrator under the new restore number here.
                 let mut admin = Stored::new(admin.data.account.clone());
-                admin.sign_in(7, 1, 7, 3)?;
+                admin.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 3)?;
                 admin.admin_change(&mut person, AdminAction::SetOn(true), 4)?;
                 assert_eq!(person.read(1, 1, 4).err(), Some(Denied::NotSignedIn));
                 person.sign_in(8, 1, 4, 4)?;
@@ -262,10 +262,19 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     );
     bob.read(1, 2, 1)?;
     admin.admin_change(&mut alice, AdminAction::SetAdmin(true), 2)?;
-    alice.step(2, |turn| turn.admin_read(bearer(1, &hash(1))))?;
+    assert_eq!(
+        alice.step(2, |turn| turn.admin_read(bearer(1, &hash(1)))),
+        Err(Denied::AdminRequired)
+    );
+    assert_eq!(
+        alice.leave(1, 1, LeaveFor::Admin { action: reset.clone(), target: b.clone() }, 2),
+        Err(Denied::AdminRequired)
+    );
+    alice.sign_in_as(SessionKind::AdminPage, 8, 1, 3, 2)?;
+    alice.step(2, |turn| turn.admin_read(bearer(1, &hash(3))))?;
     alice.leave(
         1,
-        1,
+        3,
         LeaveFor::Admin {
             action: reset.clone(),
             target: b.clone(),
@@ -277,14 +286,14 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     let mut reverted = Account::load(&alice.apart, Some(&old));
     assert_eq!(
         reverted
-            .request(1, clock(3, 3), |turn| turn.admin_read(bearer(1, &hash(1))))
+            .request(1, clock(3, 3), |turn| turn.admin_read(bearer(1, &hash(3))))
             .apply(|_| Ok::<_, Denied>(()))?,
         Err(Denied::AdminRequired)
     );
     admin.admin_change(&mut alice, AdminAction::SetAdmin(true), 3)?;
     assert_eq!(
         alice.step(3, |turn| turn.administer(
-            bearer(1, &hash(1)),
+            bearer(1, &hash(3)),
             reset.clone(),
             b.clone(),
             Some(&mut bob.account)
@@ -586,7 +595,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             1,
             7,
             LeaveFor::Admin {
-                action: AdminAction::SetLidarr,
+                action: AdminAction::SetDiagnosticsDefault(false),
                 target: AdminTarget::Backend,
             },
             2,
@@ -597,7 +606,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             .request(1, clock(2, admin.mark), |turn| {
                 turn.administer(
                     bearer(1, &hash(7)),
-                    AdminAction::SetLidarr,
+                    AdminAction::SetDiagnosticsDefault(false),
                     AdminTarget::Backend,
                     target,
                 )
@@ -610,7 +619,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
                         DataChange::Keep
                     } else {
                         DataChange::ApplyAdmin {
-                            action: AdminAction::SetLidarr,
+                            action: AdminAction::SetDiagnosticsDefault(false),
                             target: AdminTarget::Backend,
                         }
                     }
@@ -938,7 +947,7 @@ fn a_create_grant_binds_the_actor_request_action_and_exact_email() -> Result<(),
     let mut second = state("other-admin@example.test");
     second.admin = true;
     let mut second = Stored::new(second);
-    second.sign_in(6, 1, 6, 0)?;
+    second.sign_in_as(SessionKind::AdminPage, 6, 1, 6, 0)?;
     let alice = AdminTarget::NewAccount(Email::new("alice@example.test").unwrap());
     let bob = AdminTarget::NewAccount(Email::new("bob@example.test").unwrap());
     let issuer_hash = hash(7);
@@ -1030,7 +1039,7 @@ fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -
     let mut other = state("other-admin@example.test");
     other.admin = true;
     let mut other = Stored::new(other);
-    other.sign_in(7, 1, 7, 0)?;
+    other.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 0)?;
     let mut person = Stored::new(state("alice@example.test"));
     let target = person.apart.account.admin_target();
     let action = AdminAction::ResetPassword;
