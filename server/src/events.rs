@@ -483,7 +483,10 @@ async fn stats(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> R
         let request = account::read::<ListDevices>(&body).map_err(|_| Refusal::Malformed)?;
         let clock = calls.accounts.clock.clone();
         let (page, stamp) = answer(calls.accounts.desk.ask(move |keeper| {
-            let (number, _, account, _) = authenticated(keeper, &request.head, &hash, Access::ReadHistory, clock())?;
+            let (number, _, account, kind) = authenticated(keeper, &request.head, &hash, Access::ReadHistory, clock())?;
+            if kind != SessionKind::App {
+                return Err(denied());
+            }
             let db = keeper.data().connection();
             let page = stats_page(db, number, request.after).map_err(unavailable)?;
             Ok((page, receipt(keeper, account.state())?))

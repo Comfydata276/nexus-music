@@ -603,7 +603,11 @@ fn diagnostics_keep_the_newest_per_device_and_require_a_page_session_for_text() 
     assert_eq!(json::<i64>(&body, "$.done.result.reports[0].account"), other.person.id.get() as i64);
     let event = batch(&other_stamp, &[start(1, 100, 0)]);
     assert_outcomes(send(&fixture, &other, &event), &event, &[Outcome::Taken]);
-    let stats = fixture.stats(&admin, &admin_stamp, DeviceId::new(1));
+    let stats_path = nexus_music_server::events::STATS_PATH;
+    assert_eq!(fixture.post_with(
+        stats_path, Some(&admin), BROWSER, page(&admin_stamp, DeviceId::new(1)).bytes(),
+    ).0, 403);
+    let stats = fixture.stats(&who, &stamp, DeviceId::new(1));
     assert_eq!(json::<i64>(&stats, "$.done.result.starts"), 0);
     assert_eq!(json::<Option<String>>(&stats, "$.done.result.recent[0].event"), None);
 }
