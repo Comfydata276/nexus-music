@@ -627,6 +627,7 @@ dependencies = [
  "argon2",
  "axum",
  "getrandom",
+ "hmac",
  "http-body-util",
  "httparse",
  "hyper",
