@@ -174,12 +174,70 @@ pub struct Route {
     pub path: &'static str,
     pub method: &'static str,
     pub body_max: usize,
+    /// Whose session may call it, judged before its body is read
+    /// ([`crate::accounts::admit::before_body`]): by its path, [`Callers::of`].
+    pub callers: Callers,
 }
 
 impl Route {
     pub const fn new(path: &'static str, method: &'static str, body_max: usize) -> Self {
-        Route { path, method, body_max }
+        Route { path, method, body_max, callers: Callers::of(path) }
     }
+}
+
+/// Who may call a route (the lead's ruling: the admin's page has its own session kind, and an
+/// app's session can do nothing the page does, nor the reverse).
+///
+/// | Route | Callers |
+/// |---|---|
+/// | `hello`, the page's document, `signin`, `set-up` | anyone (no session) |
+/// | `signout` | a session of either kind, or none (a note alone can end its session) |
+/// | every `/nexus/api/admin/…` (the grant included) | the admin's page's session only |
+/// | every other `/nexus/api/…` (devices, force-out, change-password, music-login, grant, delete-listening-data, events, Diagnostics, and requests) | an app's session only |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Callers {
+    Anyone,
+    EitherOrNone,
+    Page,
+    App,
+}
+
+impl Callers {
+    /// By the path alone, so that a route added later is the page's if it is under
+    /// `/nexus/api/admin/` and an app's otherwise, unless it is one of the few without a session.
+    pub const fn of(path: &str) -> Callers {
+        if same(path, proto::HELLO) || same(path, crate::admin::PAGE) || same(path, account::SIGN_IN) || same(path, account::SET_UP) {
+            Callers::Anyone
+        } else if same(path, account::SIGN_OUT) {
+            Callers::EitherOrNone
+        } else if starts(path, ADMIN_CALLS) {
+            Callers::Page
+        } else {
+            Callers::App
+        }
+    }
+}
+
+/// Every call of the admin's page that needs its session is under this.
+pub const ADMIN_CALLS: &str = "/nexus/api/admin/";
+
+const fn same(one: &str, other: &str) -> bool {
+    one.len() == other.len() && starts(one, other)
+}
+
+const fn starts(text: &str, prefix: &str) -> bool {
+    let (text, prefix) = (text.as_bytes(), prefix.as_bytes());
+    if text.len() < prefix.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < prefix.len() {
+        if text[at] != prefix[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
 }
 
 /// A path and its method, with a body of up to the backend's largest.

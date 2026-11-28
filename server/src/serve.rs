@@ -70,10 +70,10 @@ use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tower::ServiceExt;
 
-use crate::accounts::admit::Admission;
+use crate::accounts::admit::{Admission, Shown};
 use crate::accounts::desk::{ADMITTED, Admitted};
 use crate::bounds::*;
-use crate::head::{self, NoHead, Route, Verdict};
+use crate::head::{self, Callers, NoHead, Route, Verdict};
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,8 +391,8 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
             // C1: who it is, before a work slot. A sign-in's body is read first, by the head's
             // deadline (the proxy sends it with the head), as only it can say whether this is
             // a known device or a live code.
-            let admitted = match &shell.admit {
-                None => Admitted::Plain,
+            let (admitted, shown) = match &shell.admit {
+                None => (Admitted::Plain, None),
                 Some(admit) => {
                     if head.target == nexus_core::nexus::account::SIGN_IN && length > 0 {
                         match head::read_body_by(deadline, &mut stream, &mut head, length).await {
@@ -406,9 +406,12 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
                         }
                     }
                     let authorization: Vec<&[u8]> = head.all("authorization").collect();
-                    admit.listener(&head.target, &authorization, head.body())
+                    let (admitted, shown) = admit.listener(&head.target, &authorization, head.body());
+                    (admitted, Some(shown))
                 }
             };
+            // Whose session the route takes, for the check before its body ([`answer`]).
+            let check = shown.and_then(|shown| shell.routes.iter().find(|route| route.path == head.target).map(|route| (route.callers, shown)));
             let Some(_slot) = slots.take(admitted) else {
                 // The proxy is told so, by the gate's one answer; no one else is told anything.
                 if refused(Refusal::Full) {
@@ -423,7 +426,7 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
                 hyper::service::service_fn(move |request| {
                     let shell = shell.clone();
                     async move {
-                        let mut response = answer(request, length, admitted, shell).await?;
+                        let mut response = answer(request, length, admitted, check, shell).await?;
                         if admin_path {
                             for (name, value) in crate::admin::PAGE_HEADERS {
                                 response.headers_mut().insert(name, HeaderValue::from_static(value));
@@ -537,8 +540,26 @@ where
     Ok(bytes)
 }
 
-async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
-    let (parts, body) = request.into_parts();
+async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, check: Option<(Callers, Shown)>, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
+    let (mut parts, body) = request.into_parts();
+    // The session, before a byte of the body is read (one check for every route, the
+    // backend's): a route that needs one is refused at once without it, or with one of the
+    // other kind; one that has it is handed who is calling.
+    if let Some((callers, shown)) = check {
+        match crate::accounts::admit::before_body(callers, shown) {
+            Ok(Some(caller)) => {
+                parts.extensions.insert(caller);
+            }
+            Ok(None) => {}
+            Err(refused) => {
+                let mut response = Response::new(Body::from(refused.body.bytes().to_vec()));
+                *response.status_mut() = StatusCode::from_u16(refused.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                finish(&mut response);
+                return Ok(response);
+            }
+        }
+    }
     let bytes = match tokio::time::timeout(BODY_DEADLINE, take_body(body, length)).await {
         Err(_) => {
             shell.count(Refusal::SlowBody);
