@@ -166,22 +166,44 @@ fn it_serves_its_id_kept_across_starts_and_says_it_is_healthy() {
 }
 
 #[test]
-fn two_started_at_once_serve_the_one_id_there_is() {
+fn two_started_at_once_on_one_backends_folders_one_serves_and_the_other_says_so_and_stops() {
+    // Design 13.4: one thread writes. A second program on the same folders (from the first
+    // slice on, two served one id; from S3, the data must have one writer) is refused before
+    // it reads anything, whichever of the two folders it shares.
     for round in 0..5 {
         let folders = Folders::new(&format!("twice-{round}"));
         let first = settings_for(&folders, free_port());
         let second = settings_for(&folders, free_port());
         let children = [serve(&first), serve(&second)];
-        healthy(&first);
-        healthy(&second);
-        let names: Vec<_> = std::fs::read_dir(folders.state()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-        assert_eq!(names, ["id"], "round {round}");
+        let start = Instant::now();
+        let (mut serving, mut stopped) = (Vec::new(), Vec::new());
+        for (child, settings) in children.into_iter().zip([&first, &second]) {
+            let mut child = child;
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let mut written = String::new();
+                    child.stderr.take().unwrap().read_to_string(&mut written).unwrap();
+                    stopped.push((status.code(), written));
+                    break;
+                }
+                if health(settings).status.success() {
+                    serving.push(child);
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(10), "round {round}: neither served nor stopped");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert_eq!((serving.len(), stopped.len()), (1, 1), "round {round}: {stopped:?}");
+        let (code, written) = &stopped[0];
+        assert_eq!(*code, Some(1), "round {round}: {written}");
+        assert!(written.contains("is in use by another Nexus server"), "round {round}: {written}");
+        let mut names: Vec<_> = std::fs::read_dir(folders.state()).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["id", "kept", "lock"], "round {round}");
         let id = kept_id(&folders.state());
-        let [one, other] = children.map(stop);
-        // One made it, the other kept it; both name the one on the disk.
-        let made = [&one, &other].iter().filter(|written| written.contains(&format!("with id {id} (made now)"))).count();
-        let kept = [&one, &other].iter().filter(|written| written.contains(&format!("with id {id} (kept)"))).count();
-        assert_eq!((made, kept), (1, 1), "round {round}: {one} / {other}");
+        let written = stop(serving.pop().unwrap());
+        assert!(written.contains(&format!("with id {id} (made now)")), "round {round}: {written}");
     }
 }
 

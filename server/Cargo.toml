@@ -30,6 +30,14 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 http-body-util = "0.1"
 # The backend's id, made at random when its store is first made. The version the relay uses.
 getrandom = "0.3"
+# The data (design 13.1): SQLite, through rusqlite, with SQLite built into the program
+# (`bundled`), so that the SQLite the data is written by is the one tested, whatever the
+# container has. `backup`: SQLite's own way of copying a database in use, for the nightly copy
+# and for putting a copy back (13.4). Nothing else: no cache of statements, no extensions.
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "backup"] }
+# The store kept apart's check sum, and the fingerprint it keeps of an account's name. The
+# version the shared library uses (already in the lock).
+sha2 = "0.11"
 
 [dev-dependencies]
 # Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a

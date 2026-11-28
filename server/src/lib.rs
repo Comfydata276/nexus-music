@@ -7,10 +7,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apart;
 pub mod bounds;
+pub mod copies;
+pub mod crash;
+pub mod data;
 pub mod head;
 pub mod health;
 pub mod identity;
+pub mod keeper;
+pub mod lock;
 pub mod probe;
 pub mod serve;
 pub mod settings;
