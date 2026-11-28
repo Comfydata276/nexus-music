@@ -224,14 +224,24 @@ impl Parts {
 }
 
 /// What 0.40.13 and every version before it kept: the music server's password, as the
-/// credential store's password, named `user@server` under the app's service. **Each such
+/// credential store's password, named `user@server` under the app's service (0.40.13's
+/// `config::account`: the name, `@`, the server's address as the app tidied it). **Each such
 /// entry is deleted at every start, by its name alone, whatever music server and user it is
-/// for** (earlier accounts and servers too, and one a failed delete left last time); its
-/// password is never read. What this module and `keep` keep (named `secret:…`) and every
-/// other program's credentials are left alone. Says how many were deleted, and how many
-/// could not be.
+/// for, whatever the user's name begins with** (earlier accounts and servers too, and one a
+/// failed delete left last time); its password is never read. What this module and `keep`
+/// keep (named `secret:<name>`, none of them an address) and every other program's
+/// credentials are left alone. Says how many were deleted, and how many could not be.
 pub fn forget_legacy_passwords(paths: &Paths) -> (usize, usize) {
     raw::forget_legacy(paths)
+}
+
+/// Whether a credential's user name under the app's service is one 0.40.13 and before gave
+/// a music server's password (W7c item 8): `<name>@<server>`, the server an address over
+/// HTTP or HTTPS. Never one of this version's own names (no address in any).
+pub fn released_password(user: &str) -> bool {
+    let Some((name, server)) = user.rsplit_once('@') else { return false };
+    let host = server.strip_prefix("https://").or_else(|| server.strip_prefix("http://")).unwrap_or_default();
+    !name.is_empty() && !host.is_empty() && !server.contains(char::is_whitespace)
 }
 
 #[cfg(windows)]
@@ -315,17 +325,25 @@ mod raw {
     }
 
     pub fn forget_legacy(_paths: &Paths) -> (usize, usize) {
+        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+        use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
         let Ok(targets) = targets() else { return (0, 1) };
         let (mut gone, mut left) = (0, 0);
         for target in targets {
             let Some(user) = target.strip_suffix(SUFFIX) else { continue };
-            // 0.40 and before: `user@server`. Everything named `secret:` is this version's.
-            if user.starts_with(OURS) || !user.contains('@') {
+            // 0.40 and before: `user@server`, whatever the user's name begins with.
+            if !super::released_password(user) {
                 continue;
             }
-            match keyring::Entry::new(SERVICE, user).map(|entry| entry.delete_credential()) {
-                Ok(Ok(()) | Err(keyring::Error::NoEntry)) => gone += 1,
-                _ => left += 1,
+            // Deleted by the target the listing named, as the generic credential it is.
+            let wide: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: a NUL-terminated wide string that lives across the call.
+            let deleted = unsafe { CredDeleteW(wide.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0;
+            // SAFETY: plain call.
+            if deleted || unsafe { GetLastError() } == ERROR_NOT_FOUND {
+                gone += 1;
+            } else {
+                left += 1;
             }
         }
         (gone, left)
@@ -506,6 +524,43 @@ mod tests {
         assert_eq!(read(&paths, "t2-sign-in"), Err(Trouble::Garbled));
         assert!(raw::delete(&paths, &part));
         assert_eq!(read(&paths, "t2-sign-in"), Err(Trouble::Garbled));
+    }
+
+    /// W7c item 8: a released password's name is told by its shape, whatever its user's name
+    /// begins with; this version's names and an unrelated name are not.
+    #[test]
+    fn a_released_password_is_told_by_its_shape() {
+        for user in ["ada@https://music.example.org", "bob@http://192.168.1.4:4533", "secret:odd@https://music.example.org", "a@b@https://x.org"] {
+            assert!(released_password(user), "{user}");
+        }
+        for user in ["secret:nexus-sign-in", "secret:nexus-note-3", "secret:nexus-sign-in~00aa~0", "secret:lidarr-key", "ada", "ada@", "@https://x.org", "ada@ftp://x.org", "ada@https://"] {
+            assert!(!released_password(user), "{user}");
+        }
+    }
+
+    /// W7c item 8, on the Windows build (run under Wine): released passwords seeded under
+    /// the app's service (two accounts, one whose user name begins with `secret:`) are all
+    /// deleted, unread; this version's own credentials and another program's stay.
+    #[cfg(windows)]
+    #[test]
+    fn every_released_password_is_deleted_and_nothing_else() {
+        let (_dir, paths) = paths();
+        let released = ["ada@https://music.example.org", "bob@http://192.168.1.4:4533", "secret:odd@https://music.example.org"];
+        for user in released {
+            keyring::Entry::new("Nexus Music", user).unwrap().set_password("a released password").unwrap();
+        }
+        assert!(write(&paths, "t8-nexus-sign-in", "ours"));
+        keyring::Entry::new("Some Other App", "carol@https://music.example.org").unwrap().set_password("theirs").unwrap();
+        let (gone, left) = forget_legacy_passwords(&paths);
+        assert!(gone >= released.len() && left == 0, "{gone} {left}");
+        for user in released {
+            assert!(matches!(keyring::Entry::new("Nexus Music", user).unwrap().get_password(), Err(keyring::Error::NoEntry)), "{user} left");
+        }
+        assert_eq!(read(&paths, "t8-nexus-sign-in").unwrap().as_deref().map(String::as_str), Some("ours"));
+        let other = keyring::Entry::new("Some Other App", "carol@https://music.example.org").unwrap();
+        assert_eq!(other.get_password().unwrap(), "theirs");
+        let _ = other.delete_credential();
+        assert!(forget(&paths, "t8-nexus-sign-in"));
     }
 
     /// A write cut short leaves the record before, whole; its stray parts go at the sweep.
