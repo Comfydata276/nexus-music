@@ -763,6 +763,7 @@ fn attribution_page(rows: &[AttributionRow], id: NonZeroU64, from: usize) -> Res
         account: row.account,
         name: row.name.clone(),
         asked: row.asked.clone(),
+        arrived: row.arrived,
     }).collect();
     Ok(AttributionPage { rows, next })
 }
@@ -1220,7 +1221,7 @@ fn attributed_requests(db: &Connection, binding: &[u8; 32]) -> Result<Vec<Attrib
         let (id, name, payload) = row.map_err(sql_error)?;
         let account = AccountId::new(unsigned(id)?).ok_or(Refusal::NotDealtWith)?;
         let name = account::Name::new(&name).ok_or(Refusal::NotDealtWith)?;
-        found.push(AttributionRow { account, name, asked: decode(&payload)? });
+        found.push(AttributionRow { account, name, asked: decode(&payload)?, arrived: None });
     }
     Ok(lidarr_items(found))
 }
@@ -2909,32 +2910,69 @@ async fn set_lidarr(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let (request, ingress) = match admin_input(&service, caller, &headers, body, admin::read::<admin::SetLidarr>, |ask| &ask.head) {
-        Ok(input) => input,
-        Err(why) => return admin_reply::<admin::Applied>(Err(why)),
-    };
-    let address = service.accounts.lidarr.clone();
-    let clock = service.accounts.clock.clone();
-    let finished = service.accounts.desk.ask(move |keeper| {
-        let now = clock();
-        let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
-        let binding = current_lidarr(keeper, address.as_ref())?;
-        let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
-        let nonce = random::<{ admin::LIDARR_NONCE_BYTES }>()
-            .ok_or(admin::Refusal::NotDealtWith)?;
-        let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
-        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
-        actor.request(request.head.restore, keeper.clock(now), |turn| {
-            turn.set_lidarr(bearer, &binding, &request.change.key, &sealing, *nonce)
-        }).apply(|effects| keeper.persist(effects, &[], now))
-            .map_err(|_| admin::Refusal::NotDealtWith)?
-            .map_err(admin_said)?;
-        Ok(admin::Applied {})
-    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    let finished = async {
+        let (request, ingress) = admin_input(&service, caller, &headers, body, admin::read::<admin::SetLidarr>, |ask| &ask.head)?;
+        save_lidarr_key(&service, request, ingress).await
+    }.await;
     if finished.is_ok() {
         service.wake.notify_one();
     }
     admin_reply(finished)
+}
+
+async fn save_lidarr_key(
+    service: &Requests, request: admin::SetLidarr, ingress: Ingress,
+) -> Result<admin::LidarrKeySaved, admin::Refusal> {
+    let endpoint = service.endpoint.as_ref().ok_or(admin::Refusal::NotAllowed(admin::Denial::Conflict))?;
+    let place = Place::upstream(service.rooms.clone(), ingress.caller.account.get()).ok_or_else(admin_busy)?;
+    let address = endpoint.address.clone();
+    let clock = service.accounts.clock.clone();
+    let (authorized, request, ingress) = service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
+        let binding = current_lidarr(keeper, Some(&address))?;
+        let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
+        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
+        let authorized = actor.request(request.head.restore, keeper.clock(now), |mut turn| {
+            turn.authorize_lidarr(bearer, &binding, &request.change.key)
+        }).apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| admin::Refusal::NotDealtWith)?
+            .map_err(admin_said)?;
+        Ok((authorized, request, ingress))
+    }).await.map_err(|_| admin_busy())??;
+
+    let lidarr = endpoint.lidarr(Handle::current(), request.change.key.expose(), None);
+    let checked = tokio::task::spawn_blocking(move || {
+        let _place = place;
+        lidarr_result(lidarr.version(), None)
+    }).await.map_err(|_| admin::Refusal::NotDealtWith)?;
+    let check = match checked {
+        Ok(_) => admin::LidarrKeyCheck::Works,
+        Err(Refusal::LidarrKeyRefused) => return Err(admin::Refusal::NotAllowed(admin::Denial::LidarrLoginRefused)),
+        Err(_) => admin::LidarrKeyCheck::Unreachable,
+    };
+
+    let clock = service.accounts.clock.clone();
+    let address = endpoint.address.clone();
+    service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
+        let binding = current_lidarr(keeper, Some(&address))?;
+        let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
+        let nonce = random::<{ admin::LIDARR_NONCE_BYTES }>().ok_or(admin::Refusal::NotDealtWith)?;
+        let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
+        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
+        actor.request(request.head.restore, keeper.clock(now), |turn| {
+            turn.install_lidarr(bearer, authorized, &binding, &request.change.key, &sealing, *nonce)
+        }).apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| admin::Refusal::NotDealtWith)?
+            .map_err(admin_said)?;
+        Ok(admin::LidarrKeySaved { check })
+    }).await.map_err(|_| admin_busy())?
+}
+
+fn admin_busy() -> admin::Refusal {
+    admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }
 }
 
 async fn attribution(
@@ -2943,27 +2981,10 @@ async fn attribution(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let (request, ingress) = match admin_input(&service, caller, &headers, body, wire::read_attribution, |ask| &ask.head) {
-        Ok(input) => input,
-        Err(why) => return admin_reply::<AttributionPage>(Err(why)),
-    };
-    let clock = service.accounts.clock.clone();
-    let state = service.clone();
-    let finished = service.accounts.desk.ask(move |keeper| {
-        admin_actor(keeper, &request.head, &ingress, clock())?;
-        let answer = if let Some(after) = request.after {
-            lock(&state.books).attribution_next(ingress.caller.session, after)
-        } else {
-            let rows = state.endpoint.as_ref().map(|endpoint| {
-                attributed_requests(keeper.data().connection(), &binding(endpoint))
-            }).transpose().map_err(|_| admin::Refusal::NotDealtWith)?.unwrap_or_default();
-            lock(&state.books).attribution_first(ingress.caller.account, ingress.caller.session, rows)
-        };
-        answer.map_err(|why| match why {
-            Refusal::SearchAgain => admin::Refusal::NotAllowed(admin::Denial::Conflict),
-            _ => admin::Refusal::NotDealtWith,
-        })
-    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    let finished = async {
+        let (request, ingress) = admin_input(&service, caller, &headers, body, wire::read_attribution, |ask| &ask.head)?;
+        read_attributed(&service, request, ingress).await
+    }.await;
     let reply = match finished {
         Ok(page) => admin::Reply::Done(page),
         Err(why) => admin::Reply::Refused(why),
@@ -2971,5 +2992,64 @@ async fn attribution(
     match wire::write_attribution_reply(&reply) {
         Ok(body) => events::respond(crate::accounts::session::Answer { status: reply.status(), body }),
         Err(_) => admin_reply::<AttributionPage>(Err(admin::Refusal::NotDealtWith)),
+    }
+}
+
+async fn read_attributed(
+    service: &Arc<Requests>, request: wire::AttributionRead, ingress: Ingress,
+) -> Result<AttributionPage, admin::Refusal> {
+    let account = ingress.caller.account;
+    let session = ingress.caller.session;
+    let clock = service.accounts.clock.clone();
+    let state = service.clone();
+    if let Some(after) = request.after {
+        return service.accounts.desk.ask(move |keeper| {
+            admin_actor(keeper, &request.head, &ingress, clock())?;
+            lock(&state.books).attribution_next(session, after).map_err(|why| match why {
+                Refusal::SearchAgain => admin::Refusal::NotAllowed(admin::Denial::Conflict),
+                _ => admin::Refusal::NotDealtWith,
+            })
+        }).await.map_err(|_| admin_busy())?;
+    }
+
+    let (mut rows, key, request, ingress) = service.accounts.desk.ask(move |keeper| {
+        admin_actor(keeper, &request.head, &ingress, clock())?;
+        let (rows, key) = if let Some(endpoint) = &state.endpoint {
+            let rows = attributed_requests(keeper.data().connection(), &binding(endpoint))
+                .map_err(|_| admin::Refusal::NotDealtWith)?;
+            let key = credential(keeper, endpoint).map_err(|_| admin::Refusal::NotDealtWith)?;
+            (rows, key)
+        } else {
+            (Vec::new(), None)
+        };
+        Ok((rows, key, request, ingress))
+    }).await.map_err(|_| admin_busy())??;
+
+    if !rows.is_empty()
+        && let (Some(endpoint), Some(key)) = (&service.endpoint, key)
+        && let Some(place) = Place::upstream(service.rooms.clone(), account.get())
+    {
+        let lidarr = endpoint.lidarr(Handle::current(), key.key.expose(), Some(Instant::now() + UPSTREAM_TIMEOUT));
+        rows = tokio::task::spawn_blocking(move || {
+            let _place = place;
+            mark_arrived(&lidarr, &mut rows);
+            rows
+        }).await.map_err(|_| admin::Refusal::NotDealtWith)?;
+    }
+
+    let clock = service.accounts.clock.clone();
+    let state = service.clone();
+    service.accounts.desk.ask(move |keeper| {
+        admin_actor(keeper, &request.head, &ingress, clock())?;
+        lock(&state.books).attribution_first(account, session, rows).map_err(|_| admin::Refusal::NotDealtWith)
+    }).await.map_err(|_| admin_busy())?
+}
+
+fn mark_arrived(lidarr: &Lidarr, rows: &mut [AttributionRow]) {
+    let Ok(arrived) = lidarr.arrived_releases() else { return };
+    for row in rows {
+        if arrived.get(row.asked.artist_id.as_str()).is_some_and(|releases| releases.contains(row.asked.release.as_str())) {
+            row.arrived = Some(true);
+        }
     }
 }
