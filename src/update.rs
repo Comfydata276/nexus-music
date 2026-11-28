@@ -3,12 +3,13 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use nexus_core::update::{DETAILS, INSTALLER, REPO, Source};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-
-const REPO: &str = "Comfydata276/nexus-music";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
@@ -44,17 +45,21 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
-fn user_agent() -> String {
-    format!("NexusMusic/{}", env!("CARGO_PKG_VERSION"))
+/// The updater always sees redirects itself. Its agent carries no account credentials.
+fn agent_config(roots: RootCerts) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    let tls = TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(roots).build();
+    ureq::Agent::config_builder()
+        .tls_config(tls)
+        .https_only(true)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(8)))
+        .user_agent(concat!("NexusMusic/", env!("CARGO_PKG_VERSION")))
 }
 
-fn latest_url() -> String {
-    // Test builds can point at a stand-in server.
-    #[cfg(debug_assertions)]
-    if let Ok(url) = std::env::var("NEXUS_UPDATE_URL") {
-        return url;
-    }
-    format!("https://api.github.com/repos/{REPO}/releases/latest")
+fn agent() -> ureq::Agent {
+    agent_config(RootCerts::PlatformVerifier).build().into()
 }
 
 /// Splits "v1.2.3" into its numbers.
@@ -88,37 +93,102 @@ fn release_from(api: ApiRelease) -> Release {
     Release { version: api.tag_name.trim_start_matches('v').to_string(), page: api.html_url, installer }
 }
 
-/// The newest published release, if it is newer than this copy.
-pub fn check() -> Result<Option<Release>, String> {
-    let agent = crate::subsonic::make_agent();
-    let response = agent
-        .get(&latest_url())
-        .header("User-Agent", user_agent())
-        .header("Accept", "application/vnd.github+json")
-        .config()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .build()
-        .call()
-        .map_err(|e| e.to_string())?;
-    let status = response.status().as_u16();
-    if status == 404 {
-        // Nothing has been published yet.
-        return Ok(None);
-    }
-    if status != 200 {
-        return Err(format!("GitHub answered with status {status}."));
-    }
-    let api: ApiRelease =
-        serde_json::from_reader(response.into_body().into_reader()).map_err(|e| e.to_string())?;
-    let release = release_from(api);
-    Ok(is_newer(&release.version, env!("CARGO_PKG_VERSION")).then_some(release))
+#[derive(Debug, PartialEq)]
+pub enum CheckError {
+    Refused,
+    TimedOut,
+    Request,
+    Status(u16),
+    InvalidRelease,
 }
 
-fn trusted(url: &str) -> bool {
-    if cfg!(debug_assertions) && std::env::var_os("NEXUS_UPDATE_URL").is_some() {
-        return true;
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => f.write_str("GitHub supplied an update address the app couldn't use."),
+            Self::TimedOut => f.write_str("The request to GitHub timed out."),
+            Self::Request => f.write_str("The request to GitHub failed."),
+            Self::Status(status) => write!(f, "GitHub answered with status {status}."),
+            Self::InvalidRelease => f.write_str("The release details couldn't be read."),
+        }
     }
-    url.starts_with(&format!("https://github.com/{REPO}/releases/download/"))
+}
+
+/// A manual GET chain. Only the checked, resolved URL reaches the wire. For metadata the
+/// remaining wall-clock budget also applies to the final body. Large installers can stream
+/// past their existing per-hop response-header timeout.
+fn get(
+    agent: &ureq::Agent,
+    source: Source<'_>,
+    start: &str,
+    deadline: Option<Instant>,
+) -> Result<ureq::http::Response<ureq::Body>, CheckError> {
+    let mut address = source.start(start).ok_or(CheckError::Refused)?;
+    let trace = matches!(source, Source::Installer { .. }) && std::env::var_os("NEXUS_TRACE").is_some();
+    let mut followed = 0;
+    loop {
+        let started = Instant::now();
+        let mut request = agent.get(address.as_str());
+        if matches!(source, Source::Metadata { .. }) {
+            request = request.header("Accept", "application/vnd.github+json");
+        }
+        let mut config = request.config();
+        if let Some(deadline) = deadline {
+            let remaining = deadline.checked_duration_since(Instant::now())
+                .filter(|time| !time.is_zero()).ok_or(CheckError::TimedOut)?;
+            config = config.timeout_global(Some(remaining));
+        }
+        let response = config.build().call().map_err(|err| {
+            let reason = match err {
+                ureq::Error::Timeout(_) => CheckError::TimedOut,
+                _ => CheckError::Request,
+            };
+            if trace {
+                eprintln!("[trace] update download: hop {followed} failed after {:?}: {reason}", started.elapsed());
+            }
+            reason
+        })?;
+        if trace {
+            eprintln!("[trace] update download: hop {followed} answered {} in {:?}", response.status(), started.elapsed());
+        }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Err(CheckError::TimedOut);
+        }
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Err(CheckError::Refused);
+        }
+        let mut locations = response.headers().get_all("location").iter();
+        let location = locations.next().and_then(|value| value.to_str().ok()).ok_or(CheckError::Refused)?;
+        if locations.next().is_some() {
+            return Err(CheckError::Refused);
+        }
+        address = source.redirect(&address, location, followed).ok_or(CheckError::Refused)?;
+        followed += 1;
+    }
+}
+
+/// The newest published release, if it is newer than this copy.
+pub fn check() -> Result<Option<Release>, CheckError> {
+    check_at(&agent(), DETAILS, &format!("https://api.github.com/repos/{REPO}/releases/latest"), Duration::from_secs(20))
+}
+
+fn check_at(agent: &ureq::Agent, source: Source<'_>, start: &str, budget: Duration) -> Result<Option<Release>, CheckError> {
+    let deadline = Instant::now() + budget;
+    let response = get(agent, source, start, Some(deadline))?;
+    match response.status().as_u16() {
+        404 => return Ok(None), // Nothing has been published yet.
+        200 => {}
+        status => return Err(CheckError::Status(status)),
+    }
+    let api = serde_json::from_reader(response.into_body().into_reader());
+    if Instant::now() >= deadline {
+        return Err(CheckError::TimedOut);
+    }
+    let release = release_from(api.map_err(|_| CheckError::InvalidRelease)?);
+    Ok(is_newer(&release.version, env!("CARGO_PKG_VERSION")).then_some(release))
 }
 
 const NO_CHECKSUM: &str =
@@ -126,102 +196,55 @@ const NO_CHECKSUM: &str =
 
 /// Downloads the installer to the temporary folder, checking it against the size and
 /// checksum GitHub published. `progress` is called with the fraction done.
-pub fn download(installer: &Installer, mut progress: impl FnMut(f32)) -> Result<PathBuf, String> {
-    if !trusted(&installer.url) {
-        return Err("The download address isn't on the project's release page.".into());
-    }
+pub fn download(installer: &Installer, progress: impl FnMut(f32)) -> Result<PathBuf, String> {
+    let agent = agent_config(RootCerts::PlatformVerifier)
+        .timeout_recv_response(Some(Duration::from_secs(12))).build().into();
+    download_with(installer, progress, || get(&agent, INSTALLER, &installer.url, None))
+}
+
+/// A single fetch supplies the body. Only a verified file can be handed to the install action.
+fn download_with(
+    installer: &Installer,
+    progress: impl FnMut(f32),
+    fetch: impl FnOnce() -> Result<ureq::http::Response<ureq::Body>, CheckError>,
+) -> Result<PathBuf, String> {
     if installer.sha256.is_none() {
         return Err(NO_CHECKSUM.into());
     }
+    let response = fetch().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("The download failed with status {}.", response.status().as_u16()));
+    }
     let name: String =
         installer.name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
-    let path = std::env::temp_dir().join(if name.is_empty() { "NexusMusic-Setup.exe".into() } else { name });
-    let fetched = fetch(installer, &path, &mut progress);
-    // If the app's own connection to GitHub fails, let Windows fetch the file instead. Either
-    // way the result is only trusted once it matches the published checksum.
-    #[cfg(windows)]
-    let fetched = fetched.or_else(|reason| {
-        if std::env::var_os("NEXUS_TRACE").is_some() {
-            eprintln!("[trace] update download: trying Windows' downloader after: {reason}");
-        }
-        fetch_with_windows(&installer.url, &path).map_err(|second| format!("{reason} {second}"))
-    });
-    let verified = fetched.and_then(|()| verify(installer, &path));
+    let name = if name.is_empty() { "NexusMusic-Setup.exe" } else { &name };
+    // Another attempt cannot truncate this one's verified file or delete it on failure.
+    let path = std::env::temp_dir().join(format!("{:016x}-{name}", fastrand::u64(..)));
+    let file = File::create_new(&path).map_err(|e| e.to_string())?;
+    let verified = write_installer(file, response.into_body(), installer.size, progress)
+        .and_then(|()| verify(installer, &path));
     if verified.is_err() {
         let _ = std::fs::remove_file(&path);
     }
     verified.map(|()| path)
 }
 
-/// Fetches the file over the app's own HTTP client.
-fn fetch(installer: &Installer, path: &std::path::Path, progress: &mut impl FnMut(f32)) -> Result<(), String> {
-    let trace = std::env::var_os("NEXUS_TRACE").is_some();
-    // GitHub answers with a redirect to its file store. Each hop is requested separately, so a
-    // slow or failed one can be told apart.
-    let mut address = installer.url.clone();
-    let mut hops = 0;
-    let response = loop {
-        let started = std::time::Instant::now();
-        let agent = crate::subsonic::make_agent();
-        let response = agent
-            .get(&address)
-            .header("User-Agent", user_agent())
-            .config()
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .timeout_recv_response(Some(Duration::from_secs(12)))
-            .build()
-            .call()
-            .map_err(|e| {
-                if trace {
-                    eprintln!("[trace] update download: hop {hops} failed after {:?}: {e:?}", started.elapsed());
-                }
-                format!("The download didn't start ({e}).")
-            })?;
-        if trace {
-            eprintln!("[trace] update download: hop {hops} answered {} in {:?}", response.status(), started.elapsed());
-        }
-        let next = response
-            .status()
-            .is_redirection()
-            .then(|| response.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string))
-            .flatten();
-        match next {
-            Some(next) if hops < 5 && next.starts_with("https://") => {
-                address = next;
-                hops += 1;
-            }
-            _ => break response,
-        }
-    };
-    if !response.status().is_success() {
-        return Err(format!("The download failed with status {}.", response.status().as_u16()));
-    }
-    let mut file = File::create(path).map_err(|e| e.to_string())?;
-    let mut body = response.into_body().into_reader();
+fn write_installer(mut file: File, body: ureq::Body, size: u64, mut progress: impl FnMut(f32)) -> Result<(), String> {
+    let mut body = body.into_reader();
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = 0;
     loop {
-        let n = body.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = body.read(&mut buf).map_err(|_| "The download was interrupted.")?;
         if n == 0 {
             return Ok(());
         }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        done += n as u64;
-        if done > installer.size.max(1) * 2 + (1 << 20) {
+        if n as u64 > size - done {
             return Err("The download is larger than the release says it should be.".into());
         }
-        progress((done as f32 / installer.size.max(1) as f32).min(1.0));
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        done += n as u64;
+        progress(done as f32 / size as f32);
     }
-}
-
-/// Has Windows download the file with its own networking, the way a browser would.
-#[cfg(windows)]
-fn fetch_with_windows(url: &str, path: &std::path::Path) -> Result<(), String> {
-    use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;
-    use windows::core::HSTRING;
-    unsafe { URLDownloadToFileW(None, &HSTRING::from(url), &HSTRING::from(path.as_os_str()), 0, None) }
-        .map_err(|e| format!("Windows' own downloader failed too (error {:#010X}).", e.code().0))
 }
 
 /// Checks a downloaded file against the size and checksum the release published.
@@ -331,22 +354,4 @@ mod checksum_tests {
 }
 
 #[cfg(test)]
-mod network_tests {
-    use super::*;
-
-    /// Downloads a real release from GitHub. Run with `cargo test -- --ignored`.
-    #[test]
-    #[ignore = "needs the network"]
-    fn downloads_a_published_installer() {
-        let installer = Installer {
-            url: format!("https://github.com/{REPO}/releases/download/v0.4.0/NexusMusic-Setup-0.4.0.exe"),
-            name: "NexusMusic-Setup-0.4.0.exe".into(),
-            size: 10_071_802,
-            sha256: Some("6369d91186f1bb57b8d77b6b05d6b9da2403511f2e285851cc5bc9671425fbc0".into()),
-        };
-        let started = std::time::Instant::now();
-        let path = download(&installer, |_| {}).expect("download failed");
-        eprintln!("downloaded in {:?} to {}", started.elapsed(), path.display());
-        let _ = std::fs::remove_file(path);
-    }
-}
+mod network_tests;

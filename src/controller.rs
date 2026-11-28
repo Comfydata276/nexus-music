@@ -1198,6 +1198,7 @@ impl Controller {
                 let page = ctl.ui.global::<ui::Settings>();
                 match result {
                     Ok(Some(release)) => {
+                        page.set_update_download_failed(false);
                         page.set_update_version(release.version.as_str().into());
                         page.set_update_status(
                             format!("Version {} is available.", release.version).into(),
@@ -1220,7 +1221,7 @@ impl Controller {
                         page.set_update_status("You have the latest version.".into());
                         ctl.ui.global::<ui::App>().set_update_available(false);
                     }
-                    Err(reason) if manual => {
+                    Err(reason) if manual || reason == crate::update::CheckError::Refused => {
                         page.set_update_status(format!("Couldn't check for updates. {reason}").into());
                     }
                     Err(_) => {}
@@ -1232,6 +1233,10 @@ impl Controller {
     /// Downloads the new version's installer and hands over to it.
     fn install_update(self: &Rc<Self>) {
         let Some(release) = self.update.borrow().clone() else { return };
+        let page = self.ui.global::<ui::Settings>();
+        if page.get_update_download_failed() {
+            return crate::update::open_in_browser(&release.page);
+        }
         let installer = match (&release.installer, crate::update::installed_copy()) {
             (Some(installer), true) => installer.clone(),
             // A portable copy, or a release without an installer: show where to get it.
@@ -1240,7 +1245,6 @@ impl Controller {
         if self.update_busy.replace(true) {
             return;
         }
-        let page = self.ui.global::<ui::Settings>();
         page.set_update_busy(true);
         page.set_update_status("Downloading the update…".into());
         std::thread::spawn(move || {
@@ -1257,20 +1261,24 @@ impl Controller {
             });
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
-                let launched = result.and_then(|path| {
-                    // The installer closes the app as it starts, maybe before the save at the
-                    // end of `main`: the settings are on the disk first, as 0.40.10 had them.
-                    ctl.save_settings();
-                    crate::update::run_installer(&path).map_err(|e| format!("Couldn't start the installer: {e}"))
-                });
-                match launched {
+                let Ok(path) = result else {
+                    ctl.update_busy.set(false);
+                    page.set_update_busy(false);
+                    page.set_update_download_failed(true);
+                    page.set_update_status("The update couldn't be downloaded. Get it from the release page.".into());
+                    return;
+                };
+                // The installer closes the app as it starts, maybe before the save at the
+                // end of `main`: the settings are on the disk first, as 0.40.10 had them.
+                ctl.save_settings();
+                match crate::update::run_installer(&path) {
                     // The installer replaces the program and opens the new version.
                     Ok(()) => ctl.quit(),
                     Err(reason) => {
                         ctl.update_busy.set(false);
                         page.set_update_busy(false);
                         // Don't leave the user stuck: the same file is one click away in a browser.
-                        page.set_update_status(format!("{reason} The download page has been opened instead.").into());
+                        page.set_update_status(format!("Couldn't start the installer: {reason} The download page has been opened instead.").into());
                         if let Some(release) = ctl.update.borrow().as_ref() {
                             crate::update::open_in_browser(&release.page);
                         }
