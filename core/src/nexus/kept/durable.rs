@@ -56,11 +56,14 @@ pub struct Apart {
     pub devices: BTreeMap<DeviceId, ApartDevice>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum DataChange {
     Keep,
     ChangePassword,
     ResetPassword,
+    OwnerRecovery {
+        code_verifier: Fingerprint,
+    },
     RedeemCode {
         code: u64,
         verifier: Fingerprint,
@@ -72,6 +75,22 @@ pub enum DataChange {
         target: AdminTarget,
     },
     InstallMusicLogin(MusicInstallation),
+}
+
+impl fmt::Debug for DataChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Keep => "Keep",
+            Self::ChangePassword => "ChangePassword",
+            Self::ResetPassword => "ResetPassword",
+            Self::OwnerRecovery { .. } => "OwnerRecovery",
+            Self::RedeemCode { .. } => "RedeemCode",
+            Self::EraseHistory => "EraseHistory",
+            Self::DeleteAccount => "DeleteAccount",
+            Self::ApplyAdmin { .. } => "ApplyAdmin",
+            Self::InstallMusicLogin(_) => "InstallMusicLogin",
+        })
+    }
 }
 
 /// When credentials must be renewed, S3/S9 apply this alongside the data changes.
@@ -268,6 +287,29 @@ impl Account {
         self.request(self.state.restore, clock, operation)
     }
 
+    /// Only the owner's container command calls this, under the store's write
+    /// lock. The code is offered to the owner only after its effects are applied.
+    pub fn owner_recover(
+        &mut self,
+        clock: Clock,
+        code_verifier: Fingerprint,
+    ) -> Decision<Result<LiveCode, Denied>> {
+        self.sign_in_turn(clock, |turn| {
+            let account = turn.account;
+            if account.state.status == Status::Deleted {
+                return Err(Denied::NotSignedIn);
+            }
+            let code = account.reset_password(turn.now)?;
+            account.state.status = Status::On;
+            account.state.admin = true;
+            *turn.change = DataChange::OwnerRecovery { code_verifier };
+            if account.state.music_managed {
+                require_music_rotation(account, turn.music);
+            }
+            Ok(code)
+        })
+    }
+
     pub fn request<T>(
         &mut self,
         restore: u64,
@@ -338,7 +380,10 @@ impl Account {
         }
         // Changing the live identity retires the previous code at the first cut.
         // A newly issued code still requires its own matching data verifier.
-        if change != DataChange::ResetPassword {
+        if !matches!(
+            change,
+            DataChange::ResetPassword | DataChange::OwnerRecovery { .. }
+        ) {
             first.code = first.code.map(|code| LiveCode {
                 used: code.used || old.code != Some(code),
                 ..code
@@ -402,19 +447,27 @@ impl Account {
         Ok(())
     }
 
-    fn change_password(
+    fn change_password(&mut self, keep: Option<DeviceId>) -> Result<(), Denied> {
+        let changes = next(self.state.password_changes)?;
+        let code = self.state.code.map(|code| LiveCode { used: true, ..code });
+        self.password_transition(keep, changes, code, false)
+    }
+
+    fn reset_password(&mut self, now: u64) -> Result<LiveCode, Denied> {
+        let changes = next(self.state.password_changes)?;
+        let code = LiveCode::new(changes, now)?;
+        self.password_transition(None, changes, Some(code), true)?;
+        Ok(code)
+    }
+
+    fn password_transition(
         &mut self,
         keep: Option<DeviceId>,
+        changes: u64,
+        code: Option<LiveCode>,
         reset: bool,
-        now: u64,
     ) -> Result<(), Denied> {
-        let changes = next(self.state.password_changes)?;
         let revision = next(self.state.revision)?;
-        let code = if reset {
-            Some(LiveCode::new(changes, now)?)
-        } else {
-            self.state.code.map(|code| LiveCode { used: true, ..code })
-        };
         self.end_others(keep)?;
         self.state.password_changes = changes;
         self.state.revision = revision;
@@ -759,7 +812,7 @@ impl Turn<'_> {
 
         let redeemed = if let Some((code, verifier)) = code {
             let mut account = self.account.clone();
-            account.change_password(Some(id), false, self.now)?;
+            account.change_password(Some(id))?;
             Some((account, DataChange::RedeemCode { code, verifier }))
         } else {
             None
@@ -970,7 +1023,7 @@ impl Turn<'_> {
     pub fn change_password(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
         let keep = bearer.device;
         self.consume_leave(bearer, LeaveFor::ChangePassword)?;
-        self.account.change_password(Some(keep), false, self.now)?;
+        self.account.change_password(Some(keep))?;
         *self.change = DataChange::ChangePassword;
         Ok(())
     }
@@ -1258,7 +1311,7 @@ fn admin_change(
             *change = DataChange::DeleteAccount;
         }
         AdminAction::ResetPassword => {
-            account.change_password(None, true, now)?;
+            account.reset_password(now)?;
             *change = DataChange::ResetPassword;
             if account.state.music_managed {
                 require_music_rotation(account, music);

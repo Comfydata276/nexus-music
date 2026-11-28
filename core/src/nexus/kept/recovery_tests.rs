@@ -1113,3 +1113,115 @@ fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -
     }
     Ok(())
 }
+
+#[test]
+fn owner_recovery_ends_sessions_and_fences_the_old_password_before_data() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 0)?;
+    let old = s.data.clone();
+    let verifier = hash(59);
+    s.account
+        .owner_recover(clock(1, 0), verifier.clone())
+        .apply(|e| {
+            let u = e.updates.first().unwrap();
+            assert_eq!(
+                u.change,
+                DataChange::OwnerRecovery {
+                    code_verifier: verifier.clone()
+                }
+            );
+            assert!(u.apart_first.account.password_reset_required);
+            assert_eq!(u.apart_first.account.password_changes, 1);
+            assert_eq!(u.apart_first.account.code, Some(LiveCode::new(1, 1)?));
+            assert!(
+                u.apart_first
+                    .devices
+                    .values()
+                    .all(|d| d.permit.is_none() && d.number == 1)
+            );
+            for data in [&old, &u.data] {
+                let mut cut = Account::load(&u.apart_first, Some(data));
+                for (device, bearer_byte) in [(1, 1), (2, 2)] {
+                    assert_eq!(
+                        cut.request(1, clock(1, 1), |t| t
+                            .arrive(bearer(device, &hash(bearer_byte)), Access::Read))
+                            .apply(|_| Ok::<_, Denied>(()))?
+                            .err(),
+                        Some(Denied::NotSignedIn)
+                    );
+                }
+                assert!(cut.state().password_reset_required);
+            }
+            assert!(!Account::load(&u.apart_first, Some(&u.data)).state().admin);
+            assert!(Account::load(&u.apart_last, Some(&u.data)).state().admin);
+            assert_eq!(u.data.account.code, u.apart_last.account.code);
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn owner_recovery_grants_on_and_admin_only_at_the_last_cut_and_refuses_tombstones()
+-> Result<(), Denied> {
+    let mut off = state("alice@example.test");
+    off.status = Status::Off;
+    let mut s = Stored::new(off);
+    let old = s.data.clone();
+    let issued = s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+        let u = e.updates.first().unwrap();
+        assert_eq!(u.apart_first.account.status, Status::Off);
+        assert!(!u.apart_first.account.admin);
+        for data in [&old, &u.data] {
+            let cut = Account::load(&u.apart_first, Some(data));
+            assert!(!cut.state().admin);
+            assert_eq!(cut.state().status, Status::Off);
+        }
+        let final_state = Account::load(&u.apart_last, Some(&u.data));
+        assert!(final_state.state().admin);
+        assert_eq!(final_state.state().status, Status::On);
+        assert!(final_state.state().password_reset_required);
+        Ok::<_, Denied>(())
+    })??;
+    assert_eq!(issued, LiveCode::new(1, 3)?);
+    let mut deleted = state("bob@example.test");
+    deleted.status = Status::Deleted;
+    let mut s = Stored::new(deleted);
+    assert_eq!(
+        s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::NotSignedIn)
+    );
+    Ok(())
+}
+
+#[test]
+fn persisted_effects_debug_omits_identity_text_and_verifier_bytes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.account
+        .owner_recover(clock(1, 1), Fingerprint::from_bytes([42; 32]))
+        .apply(|effects| {
+            let printed = format!("{effects:?}");
+            assert!(printed.contains("AccountId(1)"));
+            assert!(printed.contains("OwnerRecovery"));
+            assert!(!printed.contains("alice@example.test"));
+            assert!(!printed.contains("42, 42"));
+            Ok::<_, Denied>(())
+        })??;
+    let change = DataChange::ApplyAdmin {
+        action: AdminAction::CreateAccount,
+        target: AdminTarget::NewAccount(Email::new("private@example.test").unwrap()),
+    };
+    assert_eq!(format!("{change:?}"), "ApplyAdmin");
+    assert_eq!(
+        format!(
+            "{:?}",
+            AdminTarget::NewAccount(Email::new("private@example.test").unwrap())
+        ),
+        "NewAccount(..)"
+    );
+    Ok(())
+}

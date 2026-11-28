@@ -55,7 +55,7 @@ pub enum Status {
     Deleted,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AccountState {
     pub backend: BackendId,
     pub restore: u64,
@@ -85,6 +85,16 @@ struct Scope {
     revision: u64,
     device: DeviceId,
     number: u64,
+}
+
+impl fmt::Debug for AccountState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccountState")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AccountState {
@@ -189,11 +199,25 @@ pub struct SessionTarget {
     pub session: SessionId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum AdminTarget {
     Account { id: AccountId, revision: u64 },
     NewAccount(Email),
     Backend,
+}
+
+impl fmt::Debug for AdminTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Account { id, revision } => f
+                .debug_struct("Account")
+                .field("id", id)
+                .field("revision", revision)
+                .finish(),
+            Self::NewAccount(_) => f.write_str("NewAccount(..)"),
+            Self::Backend => f.write_str("Backend"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
