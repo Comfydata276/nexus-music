@@ -76,6 +76,8 @@ use super::account::{
     GetMusicLogin, ListDevices, MusicLogin, MusicLoginResult, Name, NexusOrigin, NotAllowed, NotSignedIn, OneTimeCode, Password,
     PasswordChanged, Receipt, Refusal, Reply, RequestHead, Session, SessionId, SignIn, SignInAnswer, SignOut, SignOutNote, SignedOut,
 };
+use super::diag;
+use super::events::{self, EventId, Placed};
 use super::proto::{self, BackendId, Found, SPEAKS, Speaks, Version};
 use serde::Serialize;
 use std::fmt;
@@ -83,6 +85,7 @@ use zeroize::Zeroizing;
 
 mod json;
 mod machine;
+mod sending;
 mod words;
 
 #[cfg(test)]
@@ -198,6 +201,51 @@ pub struct Kept {
     /// What was kept but did not read (an unknown member, a wrong or older form): treated as
     /// absent, and forgotten where it is kept (as ruled). What is kept can never stop a start.
     pub unreadable: Vec<Forget>,
+    /// The person's own choice for sending Diagnostics from this device (14.3): `None` until
+    /// they choose, and then the server's default no longer counts.
+    pub diagnostics: Option<bool>,
+    /// When Diagnostics were last sent from this device (14.4), as [`Keep::DiagSchedule`]
+    /// gave it: per device, not per account.
+    pub diag_schedule: Option<DiagSchedule>,
+}
+
+/// C6's [`diag::Schedule`] as data, to keep across restarts: when the device started being
+/// used, the first fault not yet sent for, and the attempts of the last day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagSchedule {
+    pub started_ms: u64,
+    #[serde(default)]
+    pub fault_ms: Option<u64>,
+    #[serde(default)]
+    pub attempts: Vec<u64>,
+}
+
+impl DiagSchedule {
+    fn of(schedule: &diag::Schedule) -> DiagSchedule {
+        DiagSchedule { started_ms: schedule.started_ms(), fault_ms: schedule.fault_ms(), attempts: schedule.attempts().collect() }
+    }
+
+    fn schedule(&self) -> Option<diag::Schedule> {
+        diag::Schedule::restore(self.started_ms, self.fault_ms, &self.attempts)
+    }
+}
+
+/// Whose journal: the backend and the account a journal's folder is kept under (11, 13.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalAccount {
+    pub backend_id: BackendId,
+    pub account: AccountId,
+}
+
+impl Serialize for JournalAccount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("JournalAccount", 2)?;
+        out.serialize_field("backend_id", &self.backend_id.to_hex())?;
+        out.serialize_field("account", &self.account)?;
+        out.end()
+    }
 }
 
 /// What signing in leaves on a device: **one thing, put in place in one step** (11). A
@@ -295,6 +343,26 @@ pub enum Happened {
     /// generation, leads on this network, and whether the permission is held (6.4; P7's
     /// note: judged apart from the backend's address). A look at another login is dropped.
     MusicLooked { look: Look, count: u64, generation: u64 },
+    /// The journal's summary for one account (13.2): after a flush (at most once a second),
+    /// at start, after doing a [`JournalDo`] that changes what waits, and when the journal's
+    /// account changes at a sign-in. `pending`: the events waiting in that life (not taken,
+    /// not refused); `from_sequence`: the lowest of their sequence numbers. Only these
+    /// numbers reach the machine. One for an account not signed in is not acted on.
+    EventsWaiting { account: JournalAccount, life: u64, pending: u64, from_sequence: u64 },
+    /// The answer to [`JournalDo::ReadEvents`] of this `read`: the waiting events read, in
+    /// sequence order (none: nothing more to send). Dropped unless it is the read waited for
+    /// and its account and life are the signed-in account's now.
+    EventsRead { read: u64, account: JournalAccount, life: u64, events: Vec<Placed> },
+    /// The answer to [`JournalDo::ReadDiagnostics`] of this `read`: the report's text as
+    /// "What is sent" shows it, or `None` if it could not be read.
+    DiagnosticsRead { read: u64, text: Option<String> },
+    /// The person's own choice for sending Diagnostics from this device changed (`None`:
+    /// back to the server's default). The app keeps it itself, and hands it in at start.
+    DiagnosticsSwitch(Option<bool>),
+    /// The app noted something going wrong, at this time (14.4: a few minutes after).
+    DiagnosticsFault { at_ms: u64 },
+    /// The app is in use, or no longer (14.4: daily "while in use"). `false` at each start.
+    InUse(bool),
 }
 
 /// On the phone, where an address leads on this network and whether the local-network
@@ -436,6 +504,47 @@ pub enum Do {
     Show(Shown),
     /// Hand the player this.
     Hand(Hand),
+    /// Read this from the journal or the Diagnostics record, or change this in the journal
+    /// (13, 14). **Never on a path that plays, and never by the journal's writer waiting.**
+    Journal(JournalDo),
+}
+
+/// What the journal's reader reads, and what the journal changes, for the sending half.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalDo {
+    /// Read the events of this account and life that are still waiting (not taken, not
+    /// refused) with a sequence of at least `from_sequence`, in sequence order, at most
+    /// `max_events` of them and `max_bytes` of their lines; answer with
+    /// [`Happened::EventsRead`] under this `read`. **The reader, never the writer, and every
+    /// read is answered**, with no events when there are none.
+    ReadEvents { read: u64, account: JournalAccount, life: u64, from_sequence: u64, max_events: usize, max_bytes: usize },
+    /// Make the Diagnostics report's text ([`diag::Report::text`], exactly what "What is
+    /// sent" shows) from the record's own file, taking no lock the player takes (14.4);
+    /// answer with [`Happened::DiagnosticsRead`] under this `read`.
+    ReadDiagnostics { read: u64 },
+    /// The backend has these: mark them taken. The file is kept [`events::KEEP_MS`] after
+    /// its last is taken, then removed ([`events::remove_files`]).
+    Taken { account: JournalAccount, life: u64, ids: Vec<EventId>, at_ms: u64 },
+    /// The backend refused these for good: never send them again, and count them in
+    /// [`events::LossCounts::refused`].
+    Refused { account: JournalAccount, life: u64, ids: Vec<EventId> },
+    /// The account's life is now `life` (its person deleted their listening data, 12.5):
+    /// write under it from now, and remove unsent what was written under an earlier life,
+    /// counting none of it as lost. Always after the [`Keep::Saved`] that carries `life`.
+    LifeMoved { account: JournalAccount, life: u64 },
+    /// The backend's data was put back from a copy (13.3): every event still held for this
+    /// backend, every account's, taken ones too, waits to be sent again (a refused one
+    /// stays refused). Each goes under its own account, when that account is signed in.
+    ResendAll {
+        #[serde(serialize_with = "hex_id")]
+        backend_id: BackendId,
+    },
+}
+
+/// A backend id as its 32 lower-case hex digits.
+fn hex_id<S: serde::Serializer>(id: &BackendId, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&id.to_hex())
 }
 
 /// One request to the backend.
@@ -508,6 +617,8 @@ pub enum Keep {
     /// Where secrets are kept, by its backend and the session it ends ([`Note::key`]),
     /// beside any other.
     Note(Note),
+    /// Beside the device's settings, per device: when Diagnostics were sent (14.4).
+    DiagSchedule(DiagSchedule),
 }
 
 /// What to forget: from where it was kept, and from memory.
@@ -525,6 +636,8 @@ pub enum Forget {
     DeviceSecret,
     /// A note that did not read, by its place in the `notes` handed to `start`.
     UnreadableNote { index: usize },
+    /// The Diagnostics schedule, when what was kept of it did not read: a new one is kept.
+    DiagSchedule,
 }
 
 /// What the player is handed.
@@ -708,6 +821,11 @@ pub struct Client {
     /// device secret or a note goes to an origin unless it names the backend expected; a
     /// sign-out's ask is no longer waited for once its origin names another.
     seen_at: Vec<(String, BackendId)>,
+    /// What each origin's `hello` said Diagnostics start as (14.3), this run: read at a
+    /// start's `hello` and a sign-in's, and lasting across `stop` as `seen_at` does.
+    defaults_at: Vec<(String, Option<bool>)>,
+    /// The number of the last read asked of the journal or the Diagnostics record.
+    next_read: u64,
 }
 
 /// A sign-out told across the fence, with where it goes and for which backend.
@@ -762,6 +880,10 @@ struct Live {
     /// Once signed in, a backend of another id answered at the Nexus origin: nothing more is
     /// sent to it (7.1), and the person is asked to sign in again.
     stranger: bool,
+    /// The sending half's events (13.3).
+    sending: sending::Sending,
+    /// Diagnostics (14).
+    diagnostics: sending::Diagnostics,
 }
 
 struct Flight {
@@ -789,6 +911,10 @@ enum Purpose {
     ChangePassword,
     /// Telling a backend of a sign-out, from the note for its session, with no session (11).
     Tell { backend: BackendId, session: u64, origin: String },
+    /// A batch of the journal's events, for this account (13.3).
+    Events { account: JournalAccount, batch: events::Batch },
+    /// The Diagnostics report (14.4).
+    Diagnostics,
 }
 
 impl Purpose {
@@ -1083,7 +1209,7 @@ impl Client {
         self.stop();
         self.generation = self.generation.wrapping_add(1);
         let mut out = Vec::new();
-        let Kept { device_secret, mut saved, mut notes, offline, unreadable } = kept;
+        let Kept { device_secret, mut saved, mut notes, offline, unreadable, diagnostics, diag_schedule } = kept;
         // Every address in its one spelling from here on (as ruled).
         if let Some(found) = saved.as_mut() {
             found.nexus = canonical(&found.nexus);
@@ -1143,6 +1269,7 @@ impl Client {
             }
         }
         let music_seen = saved.as_ref().and_then(|saved| saved.music.as_ref()).map_or(0, |login| login.count);
+        let diagnostics = sending::Diagnostics::from_kept(diagnostics, diag_schedule, given.now_ms, &mut out);
         let mut live = Live {
             app,
             offline,
@@ -1165,6 +1292,8 @@ impl Client {
             music_seen,
             too_old: None,
             stranger: false,
+            sending: sending::Sending::default(),
+            diagnostics,
         };
         if live.form.state != SignInState::Idle {
             live.form.words = words::sign_in(live.form.state, live.app.kind, 0);
@@ -1235,6 +1364,12 @@ impl Client {
                     live.music_blocked = look.blocked() && live.app.kind == DeviceKind::Phone;
                 }
             }
+            Happened::EventsWaiting { account, life, pending, from_sequence } => self.events_waiting(account, life, pending, from_sequence, given, &mut out),
+            Happened::EventsRead { read, account, life, events } => self.events_read(read, account, life, events, &mut out),
+            Happened::DiagnosticsRead { read, text } => self.diagnostics_read(read, text, given, &mut out),
+            Happened::DiagnosticsSwitch(choice) => self.diagnostics_switch(choice),
+            Happened::DiagnosticsFault { at_ms } => self.diagnostics_fault(at_ms, &mut out),
+            Happened::InUse(on) => self.in_use(on),
         }
         self.show(given, &mut out);
         out
