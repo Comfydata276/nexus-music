@@ -194,14 +194,24 @@ fn a_redemption_is_fenced_by_a_change_made_during_its_slow_work_and_a_code_is_re
     assert_eq!([a, b].iter().filter(|status| **status == 200).count(), 1, "{a} {b}");
 }
 
-/// C5 (the review of S8): an account that is not an admin's, with its right password, is
-/// refused at the admin's page (the page's own origin and marker are the door's, `routes`).
+/// C5 (the review of S8) and M2 (the lead's ruling of 14:41): an account that is not an
+/// admin's, with its right password, at the admin's page (whose own origin and marker are the
+/// door's, `routes`), gets exactly the answer of a wrong password, and the try is recorded as a
+/// wrong one: the next, at once, is told to come back.
 #[test]
-fn a_correct_password_of_an_account_not_an_admin_s_does_not_sign_in_at_the_page() {
-    let (bench, made) = Bench::new("page-not-admin", &[("member@example.test", false)]);
+fn a_correct_password_of_an_account_not_an_admin_s_at_the_page_is_a_wrong_password() {
+    let (bench, made) = Bench::new("page-not-admin", &[("member@example.test", false), ("other@example.test", false)]);
     bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 3));
     bench.advance(2_000);
-    let page = bench.runtime.block_on(bench.accounts.sign_in(bench::sign_in(bench::with_password(made[0].email, PASSWORD), 2), true));
-    assert_ne!(page.status, 200);
-    assert!(account::read_reply::<account::SignedIn>(page.status, page.body.bytes()).is_ok_and(|reply| matches!(reply, account::Reply::Refused(_))));
+    let page = |email: &str, password: &str| bench.runtime.block_on(bench.accounts.sign_in(bench::sign_in(bench::with_password(email, password), 2), true));
+    // The same answer, byte for byte, as a wrong password at the page (another account's, so
+    // that the two waits are apart).
+    let wrong = page(made[1].email, "not the password at all, a guess");
+    let right = page(made[0].email, PASSWORD);
+    assert_eq!(right.status, 403);
+    assert_eq!((right.status, right.body.bytes()), (wrong.status, wrong.body.bytes()));
+    // Recorded as a wrong try: the next is told to come back, even with the right password.
+    let next = page(made[0].email, PASSWORD);
+    assert_eq!(next.status, 429, "the page's refusal of a non-admin was not recorded as a wrong try");
 }

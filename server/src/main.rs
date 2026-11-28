@@ -171,6 +171,7 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let diagnostics_default = rows::diagnostics_default(keeper.data().connection()).ok().flatten();
     let seen = match rows::device_secrets(keeper.data().connection()) {
         Ok(prints) => Arc::new(Seen::new(prints)),
         Err(_) => {
@@ -222,7 +223,12 @@ fn run(settings: Settings) -> ExitCode {
             settings.data,
             settings.state,
         );
-        let shell = serve::Shell::backend(settings.proxy, &nexus_music_server::hello(id), accounts.clone(), settings.public_origin.as_deref());
+        // `hello` says the admin's Diagnostics default when one is set (14.3; C10s's shape).
+        let hello = match diagnostics_default {
+            Some(on) => nexus_music_server::hello(id).with_diagnostics_default(on),
+            None => nexus_music_server::hello(id),
+        };
+        let shell = serve::Shell::backend(settings.proxy, &hello, accounts.clone(), settings.public_origin.as_deref());
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });
