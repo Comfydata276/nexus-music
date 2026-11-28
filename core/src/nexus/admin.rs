@@ -383,8 +383,7 @@ impl Action {
                 device: change.device, session: change.session,
             }),
             Self::SetDiagnosticsDefault(change) => AdminAction::SetDiagnosticsDefault(change.enabled),
-            Self::SetRequestsEnabled(change) => AdminAction::SetRequests(change.enabled),
-            Self::SetLidarr(_) => return None,
+            Self::SetRequestsEnabled(_) | Self::SetLidarr(_) => return None,
         })
     }
 }
@@ -436,6 +435,28 @@ impl NamedChange {
         Some(GrantIntent {
             request_id: self.request_id,
             change: LeaveFor::Admin { action: self.action.kept_action()?, target },
+        })
+    }
+
+    /// For this switch, the store supplies its own revision alongside the
+    /// account's revision. The browser offers only the account and desired value.
+    pub fn requests_grant_intent(
+        &self,
+        selected: &AccountState,
+        switch_revision: u64,
+    ) -> Option<GrantIntent> {
+        let Action::SetRequestsEnabled(change) = &self.action else {
+            return None;
+        };
+        if change.account != selected.id {
+            return None;
+        }
+        Some(GrantIntent {
+            request_id: self.request_id,
+            change: LeaveFor::Admin {
+                action: AdminAction::SetRequests { enabled: change.enabled, revision: switch_revision },
+                target: selected.admin_target(),
+            },
         })
     }
 
@@ -951,7 +972,11 @@ mod tests {
     }
 
     fn signed_in_admin() -> (kept::Account, DeviceId, kept::Fingerprint) {
-        let mut actor = stored_account(AccountId::new(1).unwrap(), true);
+        signed_in_admin_as(AccountId::new(1).unwrap())
+    }
+
+    fn signed_in_admin_as(id: AccountId) -> (kept::Account, DeviceId, kept::Fingerprint) {
+        let mut actor = stored_account(id, true);
         let device = DeviceId::new(1).unwrap();
         let secret = account::DeviceSecret::from_bytes([0x61; account::SECRET_BYTES]);
         let verifier = kept::Fingerprint::of(&[0x62; account::SECRET_BYTES]);
@@ -1098,6 +1123,91 @@ mod tests {
     }
 
     #[test]
+    fn requests_switch_grants_from_two_admins_cannot_both_spend_the_same_revision() {
+        use kept::{Bearer, DataChange, Denied, GrantUse};
+        let (mut first, first_device, first_hash) = signed_in_admin();
+        let (mut second, second_device, second_hash) = signed_in_admin_as(AccountId::new(2).unwrap());
+        let id = account_id();
+        let mut target = stored_account(id, false);
+        let request_id = RequestId::new(8).unwrap();
+        let initial_revision = 4;
+        let named = NamedChange {
+            request_id,
+            action: Action::SetRequestsEnabled(RequestsEnabled { account: id, enabled: false }),
+        };
+        let opposite = NamedChange {
+            request_id,
+            action: Action::SetRequestsEnabled(RequestsEnabled { account: id, enabled: true }),
+        };
+        assert!(named.grant_intent(Some(target.state())).is_none());
+        assert!(named.requests_grant_intent(second.state(), initial_revision).is_none());
+
+        let first_secret = GrantSecret::from_bytes([0x65; account::SECRET_BYTES]);
+        let second_secret = GrantSecret::from_bytes([0x66; account::SECRET_BYTES]);
+        authorize(
+            &mut first, first_device, &first_hash,
+            named.requests_grant_intent(target.state(), initial_revision).unwrap(), &first_secret,
+        );
+        authorize(
+            &mut second, second_device, &second_hash,
+            opposite.requests_grant_intent(target.state(), initial_revision).unwrap(), &second_secret,
+        );
+        let first_bearer = |request_id| Bearer {
+            device: first_device, hash: &first_hash,
+            grant: Some(GrantUse { request_id, secret: &first_secret }),
+        };
+        let second_bearer = || Bearer {
+            device: second_device, hash: &second_hash,
+            grant: Some(GrantUse { request_id, secret: &second_secret }),
+        };
+        assert_eq!(
+            step(&mut first, 3, |turn| turn.set_requests_enabled(
+                first_bearer(RequestId::new(9).unwrap()), id, false, initial_revision, Some(&mut target),
+            )),
+            Err(Denied::LeaveRequired)
+        );
+        assert_eq!(
+            step(&mut first, 3, |turn| turn.set_requests_enabled(
+                first_bearer(request_id), id, true, initial_revision, Some(&mut target),
+            )),
+            Err(Denied::LeaveRequired)
+        );
+        assert_eq!(
+            step(&mut first, 3, |turn| turn.set_requests_enabled(
+                first_bearer(request_id), AccountId::new(9).unwrap(), false, initial_revision, Some(&mut target),
+            )),
+            Err(Denied::WrongPurpose)
+        );
+        assert_eq!(
+            step(&mut second, 3, |turn| turn.set_requests_enabled(
+                first_bearer(request_id), id, false, initial_revision, Some(&mut target),
+            )),
+            Err(Denied::LeaveRequired)
+        );
+
+        let mut kept_revision = None;
+        first.request(1, kept::Clock::new(3, 3), |turn| {
+            turn.set_requests_enabled(first_bearer(request_id), id, false, initial_revision, Some(&mut target))
+        }).apply(|effects| {
+            let update = effects.updates.iter().find(|row| row.data.account.id == id).unwrap();
+            let DataChange::SetRequestsEnabled { enabled, revision } = update.change else {
+                panic!("expected the switch write");
+            };
+            assert!(!enabled);
+            kept_revision = Some(revision);
+            Ok::<_, std::convert::Infallible>(())
+        }).unwrap().unwrap();
+        let revision = kept_revision.unwrap();
+        assert_eq!(revision, initial_revision + 1);
+        second.request(1, kept::Clock::new(3, 3), |turn| {
+            turn.set_requests_enabled(second_bearer(), id, true, revision, Some(&mut target))
+        }).apply(|effects| {
+            assert!(effects.updates.iter().all(|update| update.change == DataChange::Keep));
+            Ok::<_, std::convert::Infallible>(())
+        }).map(|answer| assert_eq!(answer, Err(Denied::LeaveRequired))).unwrap();
+    }
+
+    #[test]
     fn every_admin_mutation_only_spends_its_numbered_kept_grant() {
         let id = account_id();
         let cases = [
@@ -1110,7 +1220,6 @@ mod tests {
             Action::SetMusicLogin(id),
             session_target().action(),
             DiagnosticsDefault { enabled: true }.action(),
-            RequestsEnabled { account: id, enabled: true }.action(),
         ];
         for action in cases {
             let (mut actor, device, hash) = signed_in_admin();

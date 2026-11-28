@@ -127,6 +127,8 @@ pub enum DataChange {
         target: AdminTarget,
     },
     InstallMusicLogin(MusicInstallation),
+    /// The target account's switch and its successor revision for the data write.
+    SetRequestsEnabled { enabled: bool, revision: u64 },
     /// Write the new revision and seal to the apart store with the spent grant.
     /// The data transaction must never store the seal.
     InstallLidarrKey {
@@ -148,6 +150,7 @@ impl fmt::Debug for DataChange {
             Self::DeleteAccount => "DeleteAccount",
             Self::ApplyAdmin { .. } => "ApplyAdmin",
             Self::InstallMusicLogin(_) => "InstallMusicLogin",
+            Self::SetRequestsEnabled { .. } => "SetRequestsEnabled",
             Self::InstallLidarrKey { .. } => "InstallLidarrKey",
         })
     }
@@ -1293,8 +1296,8 @@ impl Turn<'_> {
         internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
-        let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
         let session = self.admin_session(&bearer)?;
+        let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
         if self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
             || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
@@ -1364,6 +1367,27 @@ impl Turn<'_> {
         Ok(())
     }
 
+    /// Load the target and its current switch revision under the same writer
+    /// lock used to apply the effects. A stale switch grant cannot be spent.
+    pub fn set_requests_enabled(
+        mut self,
+        bearer: Bearer<'_>,
+        account: AccountId,
+        enabled: bool,
+        switch_revision: u64,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        let selected = &target.as_deref().unwrap_or(self.account).state;
+        if selected.id != account {
+            return Err(Denied::WrongPurpose);
+        }
+        let named = selected.admin_target();
+        self.administer_to(
+            bearer, AdminAction::SetRequests { enabled, revision: switch_revision }, named, target,
+        )
+    }
+
     /// Other account, or None for a change to the actor's own account or a global
     /// setting. ApplyAdmin/InstallMusicLogin tell S3 to include the action's
     /// payload in the data write. A denied change may still consume leave.
@@ -1375,9 +1399,22 @@ impl Turn<'_> {
         target: Option<&mut Account>,
     ) -> Result<(), Denied> {
         self.admin_session(&bearer)?;
-        if matches!(action, AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. }) {
+        if matches!(
+            action,
+            AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } | AdminAction::SetRequests { .. }
+        ) {
             return Err(Denied::WrongPurpose);
         }
+        self.administer_to(bearer, action, named, target)
+    }
+
+    fn administer_to(
+        mut self,
+        bearer: Bearer<'_>,
+        action: AdminAction,
+        named: AdminTarget,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
         self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1466,7 +1503,7 @@ pub enum AdminAction {
     CreateAccount,
     SetMusicAddress(MusicAddress),
     SetDiagnosticsDefault(bool),
-    SetRequests(bool),
+    SetRequests { enabled: bool, revision: u64 },
     SetLidarr {
         fingerprint: Fingerprint,
         address: InternalAddress,
@@ -1565,10 +1602,14 @@ fn admin_change(
         AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } => {
             return Err(Denied::WrongPurpose);
         }
+        AdminAction::SetRequests { enabled, revision } => {
+            // The design does not say whether setting the existing value advances
+            // the revision. Advance it on every accepted write to fence other grants.
+            *change = DataChange::SetRequestsEnabled { enabled, revision: next(revision)? };
+        }
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress(_)
-        | AdminAction::SetDiagnosticsDefault(_)
-        | AdminAction::SetRequests(_) => *change = DataChange::ApplyAdmin { action, target },
+        | AdminAction::SetDiagnosticsDefault(_) => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())
 }
