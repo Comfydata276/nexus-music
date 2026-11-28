@@ -155,8 +155,17 @@ fn saved(count: u64) -> Saved {
     }
 }
 
+/// This device's secret, for the backend `saved` names.
+fn our_key() -> DeviceKey {
+    DeviceKey { secret: DeviceSecret::from_bytes([0xd5; 32]), backend_id: Some(backend().to_hex()) }
+}
+
+fn note_forget(session: u64) -> Forget {
+    Forget::Note { backend_id: backend().to_hex(), session }
+}
+
 fn kept_signed_in(count: u64) -> Kept {
-    Kept { device_secret: Some(DeviceSecret::from_bytes([0xd5; 32])), saved: Some(saved(count)), notes: Vec::new(), offline: false }
+    Kept { device_secret: Some(our_key()), saved: Some(saved(count)), notes: Vec::new(), offline: false, unreadable: Vec::new() }
 }
 
 /// A device under test: the machine, the clock, and every thing it was told to do.
@@ -248,12 +257,9 @@ impl Rig {
 }
 
 fn sign_in(address: &str, email: &str) -> Press {
-    Press::SignIn { address: address.to_owned(), email: email.to_owned(), password: Typed::new(PASSWORD), look: Look::default(), retry: false }
+    Press::SignIn { address: address.to_owned(), email: email.to_owned(), password: Typed::new(PASSWORD), look: Look::default() }
 }
 
-fn retry_press() -> Press {
-    Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default(), retry: true }
-}
 
 fn asks(out: &[Do]) -> Vec<&Ask> {
     out.iter()
@@ -290,7 +296,7 @@ fn handed(out: &[Do]) -> Vec<&Hand> {
 fn forgets(out: &[Do]) -> Vec<Forget> {
     out.iter()
         .filter_map(|thing| match thing {
-            Do::Forget(forget) => Some(*forget),
+            Do::Forget(forget) => Some(forget.clone()),
             _ => None,
         })
         .collect()
@@ -429,7 +435,7 @@ fn a_cold_start_with_offline_on_hands_the_login_and_asks_nothing() {
 fn a_device_secret_is_made_once_from_the_random_bytes_handed_in() {
     let mut rig = Rig::new(DeviceKind::Phone);
     let out = rig.start(Kept::default());
-    assert!(out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DeviceSecret(secret)) if secret.expose_bytes() == &[0x42; 32])));
+    assert!(out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DeviceSecret(key)) if key.secret.expose_bytes() == &[0x42; 32] && key.backend_id.is_none())));
     let mut rig = Rig::new(DeviceKind::Phone);
     let out = rig.start(kept_signed_in(1));
     assert!(!out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DeviceSecret(_)))));
@@ -547,12 +553,15 @@ fn an_email_and_a_password_are_held_to_account_rules_before_anything_is_sent() {
     rig.start(Kept::default());
     assert!(asks(&rig.press(sign_in(NEXUS, "not an email"))).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::BadEmail);
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(""), look: Look::default(), retry: false });
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(""), look: Look::default() });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::NoPassword);
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("short"), look: Look::default(), retry: false });
-    assert!(asks(&out).is_empty());
-    assert_eq!(rig.shown().sign_in.state, SignInState::WrongLogin);
+    // A password typed to sign in is presented as it is, of any length: the backend judges it.
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("short"), look: Look::default() });
+    assert_eq!(asks_to(&out, proto::HELLO), 1);
+    rig.press(Press::FormClosed);
+    let mut rig = Rig::new(DeviceKind::Pc);
+    rig.start(Kept::default());
     let long = "a".repeat(TYPED_MAX_BYTES + 1);
     assert!(asks(&rig.press(sign_in(&long, EMAIL))).is_empty());
     assert!(rig.shown().sign_in.address.len() <= TYPED_MAX_BYTES);
@@ -616,79 +625,74 @@ fn a_sign_in_that_waits_its_turn_says_so() {
 }
 
 #[test]
-fn come_back_in_n_seconds_is_one_retry_by_the_form_and_no_more() {
+fn come_back_in_n_seconds_is_shown_exactly_every_time_and_nothing_tries_again() {
     let mut rig = Rig::new(DeviceKind::Phone);
     rig.start(Kept::default());
-    let hello_ask = only_ask(&rig.sign_in_press()).id;
-    let first = only_ask(&rig.reply(hello_ask, hello())).id;
-    rig.reply(first, refused(Refusal::Busy { retry_after_seconds: Wait::new(5) }));
-    assert_eq!(rig.shown().sign_in.wait_s, Some(5));
-    assert!(!rig.shown().sign_in.send_again);
-    // Too soon: nothing. A retry press before it is allowed: nothing.
-    rig.now += 4_000;
-    rig.happen(Happened::WaitPassed);
-    assert!(!rig.shown().sign_in.send_again);
-    assert!(asks(&rig.press(retry_press())).is_empty());
-    // The wait passed: the form may send once more, and does.
-    rig.now += 1_000;
-    rig.happen(Happened::WaitPassed);
-    assert!(rig.shown().sign_in.send_again);
-    let hello_ask = only_ask(&rig.press(retry_press())).id;
-    let second = only_ask(&rig.reply(hello_ask, hello())).id;
-    // A second wait is the person's: shown, with no retry armed.
-    rig.reply(second, refused(Refusal::Busy { retry_after_seconds: Wait::new(5) }));
+    for seconds in [5, 12] {
+        let hello_ask = only_ask(&rig.sign_in_press()).id;
+        let sign_in = only_ask(&rig.reply(hello_ask, hello())).id;
+        let out = rig.reply(sign_in, refused(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
+        assert!(asks(&out).is_empty());
+        assert_eq!(rig.shown().sign_in.wait_s, Some(seconds), "the exact seconds, the second time too");
+        assert!(rig.shown().sign_in.words.contains(&format!("in {seconds} seconds")));
+        rig.now += 60_000;
+        for _ in 0..3 {
+            assert!(asks(&rig.happen(Happened::Tick)).is_empty(), "nothing tries again by itself");
+        }
+    }
+    // Another state clears it.
+    rig.press(sign_in(NEXUS, "not an email"));
     assert_eq!(rig.shown().sign_in.wait_s, None);
-    assert!(rig.shown().sign_in.words.contains("in 5 seconds"));
-    rig.now += 10_000;
-    rig.happen(Happened::WaitPassed);
-    assert!(!rig.shown().sign_in.send_again);
-    assert!(asks(&rig.press(retry_press())).is_empty());
 }
 
 #[test]
-fn a_waiting_retry_is_cancelled_by_closing_the_form_offline_stop_or_a_new_press() {
-    fn busy(rig: &mut Rig) {
+fn what_was_typed_lives_only_in_its_hello_flight_and_goes_with_it() {
+    // FormClosed, a new press, Offline and stop each drop the try: it is no longer waited
+    // for, and its hello's late answer makes no sign-in request.
+    let cases: [fn(&mut Rig); 4] = [
+        |rig| {
+            rig.press(Press::FormClosed);
+        },
+        |rig| {
+            rig.press(sign_in("other.example.net", EMAIL));
+        },
+        |rig| {
+            rig.happen(Happened::Offline(true));
+        },
+        |rig| {
+            rig.client.stop();
+            rig.start(Kept::default());
+        },
+    ];
+    for (index, drop_it) in cases.into_iter().enumerate() {
+        let mut rig = Rig::new(DeviceKind::Phone);
         rig.start(Kept::default());
         let hello_ask = only_ask(&rig.sign_in_press()).id;
-        let sign_in = only_ask(&rig.reply(hello_ask, hello())).id;
-        rig.reply(sign_in, refused(Refusal::Busy { retry_after_seconds: Wait::new(2) }));
-        assert_eq!(rig.shown().sign_in.wait_s, Some(2));
-        rig.now += 2_000;
+        drop_it(&mut rig);
+        assert!(!rig.client.waits_for(hello_ask), "case {index}");
+        let out = rig.reply(hello_ask, hello());
+        assert_eq!(asks_to(&out, account::SIGN_IN), 0, "case {index}: no password goes out");
     }
-    fn retried(rig: &mut Rig) -> bool {
-        rig.happen(Happened::WaitPassed);
-        rig.shown.as_ref().is_some_and(|shown| shown.sign_in.send_again) || !asks(&rig.press(retry_press())).is_empty()
-    }
+    // And an answer that ends the try (no backend there) leaves nothing either.
     let mut rig = Rig::new(DeviceKind::Phone);
-    busy(&mut rig);
-    rig.press(Press::FormClosed);
-    assert!(!retried(&mut rig));
-    let mut rig = Rig::new(DeviceKind::Phone);
-    busy(&mut rig);
-    rig.happen(Happened::Offline(true));
-    rig.happen(Happened::Offline(false));
-    assert!(!retried(&mut rig));
-    let mut rig = Rig::new(DeviceKind::Phone);
-    busy(&mut rig);
-    rig.client.stop();
     rig.start(Kept::default());
-    assert!(!retried(&mut rig));
-    let mut rig = Rig::new(DeviceKind::Phone);
-    busy(&mut rig);
-    rig.press(sign_in(NEXUS, "not an email"));
-    assert!(!retried(&mut rig));
+    let hello_ask = only_ask(&rig.sign_in_press()).id;
+    rig.reply(hello_ask, (404, Vec::new()));
+    assert!(!rig.client.waits_for(hello_ask));
 }
 
 #[test]
 fn two_sign_ins_pressed_quickly_are_one_try() {
     let mut rig = Rig::new(DeviceKind::Phone);
     rig.start(Kept::default());
-    let first = rig.sign_in_press();
-    assert_eq!(asks(&first).len(), 1);
-    assert!(asks(&rig.sign_in_press()).is_empty());
-    let hello_ask = only_ask(&first).id;
-    let out = rig.reply(hello_ask, hello());
-    assert_eq!(asks(&out).len(), 1);
+    let first = only_ask(&rig.sign_in_press()).id;
+    // A second press while the first is at its hello replaces it: one sign-in still goes.
+    let second = only_ask(&rig.sign_in_press()).id;
+    assert!(!rig.client.waits_for(first));
+    assert_eq!(asks(&rig.reply(first, hello())).len(), 0);
+    let out = rig.reply(second, hello());
+    assert_eq!(asks_to(&out, account::SIGN_IN), 1);
+    // A press while the sign-in itself is out asks nothing.
     assert!(asks(&rig.sign_in_press()).is_empty());
 }
 
@@ -705,7 +709,6 @@ fn a_code_press_while_a_try_is_under_way_changes_nothing() {
         password: Typed::new("one long new password"),
         again: Typed::new("another long new password"),
         look: Look::default(),
-        retry: false,
     });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::Working, "the try under way is still shown");
@@ -794,7 +797,6 @@ fn a_code_is_redeemed_with_its_new_password_in_one_request() {
         password: Typed::new("my new long password"),
         again: Typed::new("my new long passw0rd"),
         look: Look::default(),
-        retry: false,
     });
     assert!(asks(&differ).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::PasswordsDiffer);
@@ -804,7 +806,6 @@ fn a_code_is_redeemed_with_its_new_password_in_one_request() {
         password: Typed::new("my new long password"),
         again: Typed::new("my new long password"),
         look: Look::default(),
-        retry: false,
     });
     let hello_ask = only_ask(&out).id;
     let out = rig.reply(hello_ask, hello());
@@ -1065,7 +1066,7 @@ fn signing_out_keeps_the_note_before_forgetting_and_tells_the_backend_with_it() 
     let tell = tell.id;
     assert_eq!(rig.shown().sign_in.state, SignInState::SignedOut);
     let out = rig.reply(tell, done(SignedOut {}, receipt(1)));
-    assert_eq!(forgets(&out), vec![Forget::Note { session: SESSION_ID }]);
+    assert_eq!(forgets(&out), vec![note_forget(SESSION_ID)]);
 }
 
 #[test]
@@ -1087,7 +1088,7 @@ fn a_note_is_cleared_only_by_its_own_backends_done_a_gone_session_or_its_age() {
     let mut rig = Rig::new(DeviceKind::Pc);
     rig.start_verified(kept_signed_in(1));
     let tell = ask_to(&rig.press(Press::SignOut), account::SIGN_OUT).id;
-    assert_eq!(forgets(&rig.reply(tell, session_ended())), vec![Forget::Note { session: SESSION_ID }]);
+    assert_eq!(forgets(&rig.reply(tell, session_ended())), vec![note_forget(SESSION_ID)]);
 }
 
 #[test]
@@ -1114,7 +1115,7 @@ fn signing_out_offline_leaves_a_note_told_when_it_can_be() {
     rig.now += TELL_EVERY_MS;
     let tell = only_ask(&rig.happen(Happened::Tick)).id;
     let out = rig.reply(tell, done(SignedOut {}, receipt(1)));
-    assert_eq!(forgets(&out), vec![Forget::Note { session: SESSION_ID }]);
+    assert_eq!(forgets(&out), vec![note_forget(SESSION_ID)]);
 }
 
 #[test]
@@ -1134,7 +1135,7 @@ fn an_expired_or_unusable_note_is_forgotten_at_start() {
         let mut rig = Rig::new(DeviceKind::Pc);
         let old = Note { request: 5, revoke: revoke(), nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS - NOTE_LIFE_MS };
         let out = rig.start(Kept { notes: vec![old], offline, ..Kept::default() });
-        assert_eq!(forgets(&out), vec![Forget::Note { session: SESSION_ID }]);
+        assert_eq!(forgets(&out), vec![note_forget(SESSION_ID)]);
         assert!(asks(&out).is_empty());
     }
 }
@@ -1168,7 +1169,7 @@ fn notes_for_two_sessions_are_kept_apart_and_a_new_sign_in_settles_neither() {
     let out = rig.reply(sign_in, answer);
     assert!(!forgets(&out).iter().any(|forget| matches!(forget, Forget::Note { .. })), "B's sign-in proves nothing of A's session");
     let out = rig.press(Press::SignOut);
-    assert!(!forgets(&out).contains(&Forget::Note { session: SESSION_ID }), "B's sign-out does not displace A's note");
+    assert!(!forgets(&out).contains(&note_forget(SESSION_ID)), "B's sign-out does not displace A's note");
     assert_eq!(kept_note(&out).map(|note| note.session()), Some(SESSION_ID + 1));
 }
 
@@ -1184,7 +1185,7 @@ fn a_late_sign_out_for_the_first_account_cannot_touch_the_second() {
     rig.reply(sign_in, signed_in_body(1));
     assert_eq!(rig.shown().screen, Screen::SignedIn);
     let out = rig.reply(tell, session_ended());
-    assert_eq!(forgets(&out), vec![Forget::Note { session: SESSION_ID }]);
+    assert_eq!(forgets(&out), vec![note_forget(SESSION_ID)]);
     assert_eq!(rig.shown().screen, Screen::SignedIn);
 }
 
@@ -1233,8 +1234,9 @@ fn a_report_from_the_account_before_does_not_touch_the_next() {
     let mut rig = running(4);
     let before = rig.handed;
     rig.client.stop();
-    let out = rig.start_verified(kept_signed_in(4));
-    let check = only_ask(&out).id;
+    // The backend seen at the address is known from before the switch: no new hello.
+    let out = rig.start(kept_signed_in(4));
+    let check = ask_to(&out, account::LIST_DEVICES).id;
     rig.reply(check, devices_body(4, vec![this_device()]));
     assert_ne!(rig.handed, before);
     let out = rig.happen(Happened::MusicRefused { count: 4, generation: before });
@@ -1589,7 +1591,7 @@ fn changing_the_password() {
 fn start_json(saved: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"start": {
         "app": {"version": "0.41.0", "kind": "phone", "device_name": "Ada's phone"},
-        "kept": {"device_secret": hex(&[0xd5; 32]), "saved": saved, "notes": [], "offline": false},
+        "kept": {"device_secret": {"secret": hex(&[0xd5; 32]), "backend_id": backend().to_hex()}, "saved": saved, "notes": [], "offline": false},
         "given": {"now_ms": START_MS, "local_offset_minutes": 600, "random": hex(&[0x42; 32])}
     }})
 }
@@ -1656,14 +1658,14 @@ fn the_backends_line_is_judged_for_the_local_network_before_connecting() {
     let blocked = Look { inside: Some(true), permission: Some(false) };
     let mut rig = Rig::new(DeviceKind::Phone);
     rig.start(Kept::default());
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: blocked, retry: false });
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: blocked });
     assert!(asks(&out).is_empty(), "nothing is asked: it would be dropped silently");
     assert_eq!(rig.shown().sign_in.state, SignInState::NeedsPermission);
     assert!(rig.shown().sign_in.ask_permission);
     for look in [Look { inside: Some(true), permission: Some(true) }, Look { inside: Some(false), permission: Some(false) }, Look::default()] {
         let mut rig = Rig::new(DeviceKind::Phone);
         rig.start(Kept::default());
-        let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look, retry: false });
+        let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look });
         assert_eq!(asks(&out).len(), 1, "{look:?}");
     }
 }
@@ -1752,6 +1754,378 @@ fn what_keep_writes_is_what_start_reads() {
     let out = call(&mut client, &answer_json(verify, hello()));
     let tell = out["do"].as_array().unwrap().iter().find_map(|thing| thing.get("ask")).unwrap();
     assert!(tell["url"].as_str().unwrap().ends_with(account::SIGN_OUT));
+}
+
+// ---------------------------------------------------------------------------------------
+// The second review (round 2, part B)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn b1_a_busy_renewal_with_a_failed_check_asks_no_renewal_from_its_own_answer() {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start_verified(kept_signed_in(4));
+    let check = only_ask(&out).id;
+    let renew = only_ask(&rig.refuse(4)).id;
+    rig.fail(check, How::Connect);
+    for _ in 0..3 {
+        let out = rig.reply(renew, refused_stamped(Refusal::Busy { retry_after_seconds: None }, receipt(5)));
+        assert_eq!(asks_to(&out, account::MUSIC_LOGIN), 0, "{out:?}");
+    }
+    // It is asked at the next reachability event, once.
+    assert_eq!(asks_to(&rig.happen(Happened::Network { up: true }), account::MUSIC_LOGIN), 1);
+}
+
+/// Signed in to A at the address; the person signs in again there and B answers.
+fn signed_out_at_a_then_b_answers() -> (Rig, Vec<Do>) {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let mut kept = kept_signed_in(4);
+    if let Some(saved) = kept.saved.as_mut() {
+        saved.session = None;
+        saved.sign_out = None;
+    }
+    rig.start(kept);
+    let hello_ask = only_ask(&rig.sign_in_press()).id;
+    let out = rig.reply(hello_ask, hello_from(stranger(), &["accounts"]));
+    (rig, out)
+}
+
+#[test]
+fn b2_a_sign_in_where_another_backend_now_answers_is_made_as_a_new_device() {
+    let (mut rig, out) = signed_out_at_a_then_b_answers();
+    let sign_in = ask_to(&out, account::SIGN_IN);
+    let body = body_of(sign_in);
+    assert_ne!(body["device_secret"], hex(&[0xd5; 32]), "the old secret never goes to the new id");
+    assert_eq!(body["device_secret"], hex(&[0x42; 32]), "a new one, from this call's random bytes");
+    assert_eq!(body["restore"], serde_json::Value::Null);
+    assert!(!out.iter().any(|thing| matches!(thing, Do::Keep(_))), "nothing kept until it succeeds");
+    let sign_in = sign_in.id;
+    // It succeeds: B's secret is kept, for B.
+    let answer = done(
+        SignedIn {
+            session: Session::from_bytes(SESSION),
+            session_id: SessionId::new(SESSION_ID).unwrap(),
+            sign_out: revoke(),
+            person: person(),
+            device: DeviceId::new(3).unwrap(),
+            restore: 1,
+            music: MusicLoginResult::Login(login(1)),
+            notice: Notice::new("Recorded.").unwrap(),
+        },
+        receipt_full(stranger(), account(), 1, 1, 1),
+    );
+    let out = rig.reply(sign_in, answer);
+    let key = out.iter().find_map(|thing| match thing {
+        Do::Keep(Keep::DeviceSecret(key)) => Some(key.clone()),
+        _ => None,
+    });
+    let key = key.unwrap();
+    assert_eq!(key.secret.expose_bytes(), &[0x42; 32]);
+    assert_eq!(key.backend_id, Some(stranger().to_hex()));
+    // Failed instead: nothing of it is kept.
+    let (mut rig, out) = signed_out_at_a_then_b_answers();
+    let sign_in = ask_to(&out, account::SIGN_IN).id;
+    let out = rig.reply(sign_in, refused(Refusal::NotAllowed(NotAllowed::WrongLogin)));
+    assert!(!out.iter().any(|thing| matches!(thing, Do::Keep(_))));
+}
+
+#[test]
+fn b2_a_note_is_refused_once_its_address_names_another_backend() {
+    // Queued, then a form's hello at that address names B: the queued telling is no longer
+    // waited for, and no new one is made.
+    let note = || Note { request: 5, revoke: revoke(), nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS };
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(Kept { notes: vec![note()], ..Kept::default() });
+    let verify = only_ask(&out).id;
+    let tell = ask_to(&rig.reply(verify, hello()), account::SIGN_OUT).id;
+    assert!(rig.client.waits_for(tell));
+    let hello_ask = ask_to(&rig.sign_in_press(), proto::HELLO).id;
+    rig.reply(hello_ask, hello_from(stranger(), &["accounts"]));
+    assert!(!rig.client.waits_for(tell), "a queued note");
+    rig.now += TELL_EVERY_MS;
+    assert_eq!(asks_to(&rig.happen(Happened::Tick), account::SIGN_OUT), 0, "a new one");
+    // The same across stop: a parted telling is refused after a mismatching hello.
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(Kept { notes: vec![note()], ..Kept::default() });
+    let verify = only_ask(&out).id;
+    let tell = ask_to(&rig.reply(verify, hello()), account::SIGN_OUT).id;
+    rig.client.stop();
+    assert!(rig.client.waits_for(tell));
+    rig.start(Kept::default());
+    let hello_ask = ask_to(&rig.sign_in_press(), proto::HELLO).id;
+    rig.reply(hello_ask, hello_from(stranger(), &["accounts"]));
+    assert!(!rig.client.waits_for(tell));
+    // And after a stamped answer from another backend: a note made then is not told there.
+    let mut rig = running(4);
+    let out = rig.press(Press::OpenDevices);
+    let list = ask_to(&out, account::LIST_DEVICES).id;
+    rig.reply(list, done(DevicePage::new(vec![], false).unwrap(), receipt_full(stranger(), account(), 1, 1, 4)));
+    let out = rig.press(Press::SignOut);
+    assert!(kept_note(&out).is_some(), "the sign-out is still lasting on the device");
+    assert_eq!(asks_to(&out, account::SIGN_OUT), 0, "but its note is not told where B answers");
+    rig.now += TELL_EVERY_MS;
+    assert_eq!(asks_to(&rig.happen(Happened::Tick), account::SIGN_OUT), 0);
+}
+
+#[test]
+fn b3_a_sign_out_cut_short_is_finished_at_start_and_its_login_not_handed() {
+    for offline in [false, true] {
+        let mut rig = Rig::new(DeviceKind::Phone);
+        let note = Note { request: 5, revoke: revoke(), nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS };
+        let mut kept = kept_signed_in(4);
+        kept.notes = vec![note];
+        kept.offline = offline;
+        let out = rig.start(kept);
+        assert!(matches!(&out[0], Do::Forget(Forget::Saved)), "{out:?}");
+        assert!(handed(&out).is_empty(), "the signed-out login is not handed");
+        assert!(asks(&out).iter().all(|ask| ask.authorization.is_none()), "the session is not checked");
+        assert_eq!(rig.shown().screen, Screen::SignIn);
+    }
+}
+
+#[test]
+fn b3_notes_are_keyed_by_backend_and_session() {
+    let a = Note { request: 5, revoke: revoke(), nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS };
+    let b = Note { request: 6, revoke: revoke(), nexus: "https://other.example.net".to_owned(), backend_id: stranger().to_hex(), restore: 1, made_ms: START_MS };
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(Kept { notes: vec![a, b], ..Kept::default() });
+    assert!(forgets(&out).is_empty(), "the same session number at two backends is two notes");
+    let mut tells = Vec::new();
+    for verify in asks(&out).iter().map(|ask| (ask.id, ask.url.clone())).collect::<Vec<_>>() {
+        let answer = if verify.1.contains("other.example.net") { hello_from(stranger(), &["accounts"]) } else { hello() };
+        tells.extend(asks(&rig.reply(verify.0, answer)).iter().map(|ask| (ask.id, ask.url.clone())));
+    }
+    assert_eq!(tells.len(), 2, "both are told");
+    // The unstamped "session ended" for A's settles A's alone.
+    let a_tell = tells.iter().find(|(_, url)| url.starts_with(NEXUS)).unwrap().0;
+    let out = rig.reply(a_tell, session_ended());
+    assert_eq!(forgets(&out), vec![note_forget(SESSION_ID)]);
+}
+
+#[test]
+fn b3_past_four_the_new_note_is_kept_first_and_the_oldest_retired() {
+    let notes: Vec<Note> = (1..=4)
+        .map(|n| Note {
+            request: n,
+            revoke: SignOutNote { session: SessionId::new(100 + n).unwrap(), secret: SignOutSecret::from_bytes([n as u8; 32]) },
+            nexus: NEXUS.to_owned(),
+            backend_id: backend().to_hex(),
+            restore: 1,
+            made_ms: START_MS - 1000 * n,
+        })
+        .collect();
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let mut kept = kept_signed_in(4);
+    kept.notes = notes;
+    let out = rig.start(kept);
+    let verify = ask_to(&out, proto::HELLO).id;
+    let out = rig.reply(verify, hello());
+    let oldest = asks(&out).iter().find(|ask| ask.url.ends_with(account::SIGN_OUT) && body_of(ask)["revoke"]["session"] == 104).map(|ask| ask.id).unwrap();
+    let out = rig.press(Press::SignOut);
+    let keep_at = out.iter().position(|thing| matches!(thing, Do::Keep(Keep::Note(_)))).unwrap();
+    let forget_at = out.iter().position(|thing| matches!(thing, Do::Forget(forget) if *forget == note_forget(104))).unwrap();
+    assert!(keep_at < forget_at, "the new one is kept before the oldest goes");
+    assert!(!rig.client.waits_for(oldest), "its telling is retired");
+    assert!(rig.reply(oldest, done(SignedOut {}, receipt(1))).iter().all(|thing| !matches!(thing, Do::Forget(_))));
+    // More than four at start: trimmed, oldest first.
+    let six: Vec<Note> = (1..=6)
+        .map(|n| Note {
+            request: n,
+            revoke: SignOutNote { session: SessionId::new(200 + n).unwrap(), secret: SignOutSecret::from_bytes([n as u8; 32]) },
+            nexus: NEXUS.to_owned(),
+            backend_id: backend().to_hex(),
+            restore: 1,
+            made_ms: START_MS - 1000 * n,
+        })
+        .collect();
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(Kept { notes: six, ..Kept::default() });
+    assert_eq!(forgets(&out), vec![note_forget(205), note_forget(206)]);
+}
+
+fn json_start(kept: serde_json::Value) -> (Client, serde_json::Value) {
+    let mut client = Client::default();
+    let start = serde_json::json!({"start": {
+        "app": {"version": "0.41.0", "kind": "phone", "device_name": "Ada's phone"},
+        "kept": kept,
+        "given": {"now_ms": START_MS, "local_offset_minutes": 600, "random": hex(&[0x42; 32])}
+    }});
+    let out = call(&mut client, &start);
+    (client, out)
+}
+
+fn has_forget(out: &serde_json::Value, forget: serde_json::Value) -> bool {
+    out["do"].as_array().unwrap().iter().any(|thing| thing.get("forget") == Some(&forget))
+}
+
+fn hands_a_login(out: &serde_json::Value) -> bool {
+    out["do"].as_array().unwrap().iter().any(|thing| thing["hand"].get("login").is_some())
+}
+
+#[test]
+fn take3_an_unknown_member_in_the_kept_music_login_forgets_what_was_saved() {
+    let mut saved_json = serde_json::to_value(saved(4)).unwrap();
+    saved_json["music"]["unexpected"] = serde_json::json!(1);
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json}));
+    assert!(out.get("error").is_none(), "the start is never refused for what was kept: {out}");
+    assert!(has_forget(&out, serde_json::json!("saved")));
+    assert!(!hands_a_login(&out), "nothing is handed");
+    let shown = out["do"].as_array().unwrap().iter().find_map(|thing| thing.get("show")).unwrap();
+    assert_eq!(shown["screen"], "sign_in");
+    // An older form of it, likewise.
+    let mut saved_json = serde_json::to_value(saved(4)).unwrap();
+    saved_json["music"]["token"] = serde_json::json!("not hex");
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json}));
+    assert!(has_forget(&out, serde_json::json!("saved")) && !hands_a_login(&out));
+}
+
+#[test]
+fn take3_an_unreadable_device_key_beside_a_good_saved_is_forgotten_and_the_music_handed() {
+    let saved_json = serde_json::to_value(saved(4)).unwrap();
+    // The form of 763325d: the key as a bare hex string.
+    let (_, out) = json_start(serde_json::json!({"device_secret": hex(&[0xd5; 32]), "saved": saved_json}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(out["do"][0]["hand"]["login"]["login"]["count"], 4, "the player first");
+    assert!(has_forget(&out, serde_json::json!("device_secret")));
+    // A new one is made, for whichever backend is signed in to next.
+    assert!(out["do"].as_array().unwrap().iter().any(|thing| thing["keep"].get("device_secret").is_some()));
+}
+
+#[test]
+fn take3_an_unreadable_note_beside_a_good_saved_is_forgotten_by_its_place() {
+    let saved_json = serde_json::to_value(saved(4)).unwrap();
+    let good = serde_json::to_value(Note { request: 5, revoke: SignOutNote { session: SessionId::new(99).unwrap(), secret: SignOutSecret::from_bytes([3; 32]) }, nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS }).unwrap();
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json, "notes": [good, {"older": "form"}]}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(out["do"][0]["hand"]["login"]["login"]["count"], 4);
+    assert!(has_forget(&out, serde_json::json!({"unreadable_note": {"index": 1}})));
+    assert!(!has_forget(&out, serde_json::json!({"note": {"backend_id": backend().to_hex(), "session": 99}})), "the good one is kept");
+}
+
+#[test]
+fn take1_two_spellings_of_an_address_are_one_address() {
+    // Saved with the trailing slash; the note without: one hello, and both trusted from it.
+    let mut kept = kept_signed_in(4);
+    if let Some(saved) = kept.saved.as_mut() {
+        saved.nexus = format!("{NEXUS}/");
+    }
+    kept.notes = vec![Note { request: 5, revoke: SignOutNote { session: SessionId::new(99).unwrap(), secret: SignOutSecret::from_bytes([3; 32]) }, nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS }];
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(kept);
+    assert_eq!(asks_to(&out, proto::HELLO), 1, "{out:?}");
+    let verify = ask_to(&out, proto::HELLO).id;
+    let out = rig.reply(verify, hello());
+    assert_eq!(asks_to(&out, account::LIST_DEVICES), 1);
+    let tell = ask_to(&out, account::SIGN_OUT).id;
+    // A sign-in hello typed the other way that names another backend refuses the note too.
+    rig.press(Press::SignOut);
+    let hello_ask = ask_to(&rig.press(sign_in("nexus.example.org", EMAIL)), proto::HELLO).id;
+    rig.reply(hello_ask, hello_from(stranger(), &["accounts"]));
+    assert!(!rig.client.waits_for(tell));
+}
+
+#[test]
+fn take2_a_clock_set_back_does_not_make_a_sign_out_drop_its_own_note() {
+    let notes: Vec<Note> = (1..=4)
+        .map(|n| Note {
+            request: n,
+            revoke: SignOutNote { session: SessionId::new(100 + n).unwrap(), secret: SignOutSecret::from_bytes([n as u8; 32]) },
+            nexus: NEXUS.to_owned(),
+            backend_id: backend().to_hex(),
+            restore: 1,
+            made_ms: START_MS + 1000 * n,
+        })
+        .collect();
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let mut kept = kept_signed_in(4);
+    kept.notes = notes;
+    rig.start(kept);
+    // The clock is now before all four.
+    let out = rig.press(Press::SignOut);
+    let new = kept_note(&out).unwrap();
+    assert_eq!(new.session(), SESSION_ID);
+    assert!(!forgets(&out).contains(&note_forget(SESSION_ID)), "its own note is kept: {out:?}");
+    assert!(forgets(&out).contains(&note_forget(101)), "the oldest of the four before it goes");
+}
+
+#[test]
+fn b4_an_answer_larger_than_its_ask_allows_is_refused_and_the_ask_still_waited_for() {
+    let mut client = Client::default();
+    let out = call(&mut client, &start_json(serde_json::to_value(saved(4)).unwrap()));
+    let verify = first_ask(&out);
+    let big = "x".repeat(proto::HELLO_MAX_BYTES + 1);
+    let answer = serde_json::json!({"happened": {"event": {"answered": {"ask": verify, "status": 200, "body": big}}, "given": {"now_ms": START_MS}}});
+    assert_eq!(client.call_json(answer.to_string().as_bytes()), br#"{"error":"input"}"#.to_vec());
+    assert!(client.waits_for(verify));
+    let out = call(&mut client, &answer_json(verify, hello()));
+    assert!(out["do"].as_array().unwrap().iter().any(|thing| thing.get("ask").is_some()), "the right answer is still taken");
+}
+
+#[test]
+fn b8_a_different_account_with_no_music_login_takes_the_old_one_from_the_player() {
+    for music in [MusicLoginResult::NoneSetYet, MusicLoginResult::UnusableNow] {
+        let mut rig = Rig::new(DeviceKind::Phone);
+        let out = rig.start_verified(kept_signed_in(4));
+        let check = only_ask(&out).id;
+        rig.reply(check, refused(Refusal::NotSignedIn(NotSignedIn::DataPutBack)));
+        rig.happen(Happened::MusicLooked { look: Look { inside: Some(true), permission: Some(false) }, count: 4, generation: rig.handed });
+        assert!(rig.shown().music_ask_permission);
+        assert!(rig.shown().plays, "A's login still plays after start again");
+        let hello_ask = only_ask(&rig.sign_in_press()).id;
+        let sign_in = only_ask(&rig.reply(hello_ask, hello())).id;
+        let out = rig.reply(sign_in, signed_in_as(0, music));
+        assert!(handed(&out).iter().any(|hand| matches!(hand, Hand::NoLogin { .. })), "{out:?}");
+        assert!(!rig.shown().plays);
+        assert!(!rig.shown().music_ask_permission, "the old permission decision is reset");
+    }
+}
+
+#[test]
+fn b11_too_old_belongs_to_the_backend_that_said_it() {
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start_verified(kept_signed_in(4));
+    let check = only_ask(&out).id;
+    rig.reply(check, refused(Refusal::NotAllowed(NotAllowed::Incompatible { speaks: Speaks::new(7, 9).unwrap() })));
+    rig.press(Press::SignOut);
+    let hello_ask = only_ask(&rig.press(sign_in("other.example.net", EMAIL))).id;
+    let sign_in = only_ask(&rig.reply(hello_ask, hello())).id;
+    rig.reply(sign_in, signed_in_body(1));
+    assert!(!rig.shown().row.contains("too old"), "{}", rig.shown().row);
+}
+
+#[test]
+fn b12_a_force_out_answer_clears_only_a_row_still_naming_its_session() {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start_verified(kept_signed_in(4));
+    let check = only_ask(&out).id;
+    rig.reply(check, devices_body(4, vec![this_device(), device(9, Some(90), false)]));
+    let force = only_ask(&rig.press(Press::ForceOut { device: 9 })).id;
+    let refresh = ask_to(&rig.press(Press::OpenDevices), account::LIST_DEVICES).id;
+    rig.reply(refresh, devices_body(4, vec![this_device(), device(9, Some(91), false)]));
+    rig.reply(force, done(ForcedOut { music_cut_off: true }, receipt(4)));
+    let row = rig.shown().devices.rows.iter().find(|row| row.id == 9).unwrap().clone();
+    assert_eq!(row.session, Some(91));
+    assert!(row.can_force_out, "the newer session is left as it is");
+}
+
+#[test]
+fn b10_after_a_mismatch_the_music_line_says_sign_in_and_a_notes_address_is_not_the_rows() {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start(kept_signed_in(4));
+    let verify = only_ask(&out).id;
+    rig.refuse(4);
+    rig.reply(verify, hello_from(stranger(), &["accounts"]));
+    assert!(rig.shown().music.as_deref().unwrap().contains("Sign in"), "{:?}", rig.shown().music);
+    // A note at another address reached, the active one not: the row does not say connected.
+    let note = Note { request: 5, revoke: revoke(), nexus: "https://other.example.net".to_owned(), backend_id: stranger().to_hex(), restore: 1, made_ms: START_MS };
+    let mut kept = kept_signed_in(4);
+    kept.notes = vec![note];
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(kept);
+    let ours = asks(&out).iter().find(|ask| ask.url.starts_with(NEXUS)).unwrap().id;
+    let theirs = asks(&out).iter().find(|ask| ask.url.contains("other.example.net")).unwrap().id;
+    rig.fail(ours, How::Connect);
+    rig.reply(theirs, hello_from(stranger(), &["accounts"]));
+    assert!(rig.shown().row.contains("not reachable"), "{}", rig.shown().row);
 }
 
 // ---------------------------------------------------------------------------------------

@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! {"start":{"app":{"version":"0.41.0","kind":"phone","device_name":"…"},
-//!           "kept":{"device_secret":"<64 hex>"|null,"saved":{…}|null,"notes":[{…}…],"offline":false},
+//!           "kept":{"device_secret":{"secret":"<64 hex>","backend_id":"<32 hex>"|null}|null,
+//!                   "saved":{…}|null,"notes":[{…}…],"offline":false},
 //!           "given":{"now_ms":…,"local_offset_minutes":600,"random":"<64 hex>"|null}}}
 //! {"happened":{"event":EVENT,"given":{…}}}
 //! {"stop":{}}
@@ -17,11 +18,11 @@
 //!        {"answered":{"ask":7,"status":200,"body":"<the body as text>"}}   (or "body_bytes":[…]
 //!                                                                         when it is not UTF-8)
 //!        {"failed":{"ask":7,"failure":{"how":"connect","inside":true,"permission":false}}}
-//!        {"network":{"up":true}}  {"offline":true}  {"tick":{}}  {"wait_passed":{}}
+//!        {"network":{"up":true}}  {"offline":true}  {"tick":{}}
 //!        {"music_refused":{"count":3,"generation":5}}
 //!        {"music_looked":{"look":{"inside":true,"permission":false},"count":3,"generation":5}}
-//! PRESS: {"sign_in":{"address":…,"email":…,"password":…,"look":{…},"retry":false}}
-//!        {"sign_in_with_code":{"address":…,"code":…,"password":…,"again":…,"look":{…},"retry":false}}
+//! PRESS: {"sign_in":{"address":…,"email":…,"password":…,"look":{…}}}
+//!        {"sign_in_with_code":{"address":…,"code":…,"password":…,"again":…,"look":{…}}}
 //!        {"form_closed":{}}  {"sign_out":{}}  {"open_devices":{}}  {"force_out":{"device":12}}
 //!        {"change_password":{"current":…,"new":…,"again":…}}  {"notice_seen":{}}
 //! ```
@@ -31,11 +32,17 @@
 //!
 //! Out: `{"generation":N,"do":[…]}`, each thing to do as [`Do`] serialises it; or
 //! `{"error":"input"}` for input this cannot read, which names no part of it and changes
-//! nothing.
+//! nothing: an envelope that is not one of these, and an answer larger than its ask allows
+//! (the ask is still waited for). **What was kept never stops a start**: a part of it that
+//! is there and does not read (the music login with a member it does not know, a session
+//! that is not 64 hex digits, an older form) is treated as absent and given back as a
+//! `Forget` (`saved`, `device_secret`, or `unreadable_note` by its place in `notes`).
 //!
 //! Secrets read here (passwords, a session, the music login, an answer's body) go straight
 //! into buffers that are wiped when dropped, on the error path too. What the JVM side holds
-//! (its strings and byte arrays) cannot be wiped from here, and is not.
+//! (its strings and byte arrays) cannot be wiped from here, and is not. Nor is what the JSON
+//! decoder keeps while it reads: the same bytes are already in the JVM's memory, which
+//! cannot be wiped, so wiping that would buy nothing (ruled).
 
 use super::*;
 use serde::Deserialize;
@@ -125,14 +132,40 @@ struct GivenIn {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeptIn<'a> {
-    #[serde(default)]
-    device_secret: Option<Hex>,
+    /// Each part is taken as it was kept and read by itself, so that one that does not read
+    /// is forgotten and never stops the start.
     #[serde(default, borrow)]
-    saved: Option<SavedIn<'a>>,
-    #[serde(default)]
-    notes: Vec<NoteIn>,
+    device_secret: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    saved: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    notes: Vec<&'a RawValue>,
     #[serde(default)]
     offline: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceKeyIn {
+    secret: Hex,
+    #[serde(default)]
+    backend_id: Option<String>,
+}
+
+/// The music login as kept: every member named, nothing else, before account reads it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct MusicIn<'a> {
+    #[serde(borrow)]
+    address: &'a RawValue,
+    #[serde(borrow)]
+    name: &'a RawValue,
+    #[serde(borrow)]
+    salt: &'a RawValue,
+    #[serde(borrow)]
+    token: &'a RawValue,
+    count: u64,
 }
 
 #[derive(Deserialize)]
@@ -197,7 +230,6 @@ enum EventIn {
     },
     Offline(bool),
     Tick {},
-    WaitPassed {},
     MusicRefused {
         count: u64,
         generation: u64,
@@ -218,8 +250,6 @@ enum PressIn {
         password: Typed,
         #[serde(default)]
         look: Look,
-        #[serde(default)]
-        retry: bool,
     },
     SignInWithCode {
         address: String,
@@ -228,8 +258,6 @@ enum PressIn {
         again: Typed,
         #[serde(default)]
         look: Look,
-        #[serde(default)]
-        retry: bool,
     },
     FormClosed {},
     SignOut {},
@@ -270,53 +298,93 @@ fn revoke(revoke: RevokeIn) -> Option<SignOutNote> {
     Some(SignOutNote { session: SessionId::new(revoke.session)?, secret: account::SignOutSecret::from_hex(&revoke.secret.0)? })
 }
 
-/// What was kept, read back. A part that cannot be read is left out (and so, for a session,
-/// signs nobody in), never guessed at; the music login, if it reads, is still handed over.
-/// A saved account whose number cannot be read is not used.
+fn device_key(raw: &RawValue) -> Option<DeviceKey> {
+    let key: DeviceKeyIn = serde_json::from_str(raw.get()).ok()?;
+    if key.backend_id.as_deref().is_some_and(|id| BackendId::from_hex(id).is_none()) {
+        return None;
+    }
+    Some(DeviceKey { secret: DeviceSecret::from_hex(&key.secret.0)?, backend_id: key.backend_id })
+}
+
+/// What signing in left, read strictly, its music login included: all of it or nothing.
+fn saved(raw: &RawValue) -> Option<Saved> {
+    let saved: SavedIn<'_> = serde_json::from_str(raw.get()).ok()?;
+    let music = match saved.music {
+        Some(raw) => {
+            serde_json::from_str::<MusicIn<'_>>(raw.get()).ok()?;
+            Some(account::read::<MusicLogin>(raw.get().as_bytes()).ok()?)
+        }
+        None => None,
+    };
+    Some(Saved {
+        nexus: saved.nexus,
+        backend_id: saved.backend_id,
+        account: AccountId::new(saved.account)?,
+        email: saved.email,
+        name: saved.name,
+        device: saved.device,
+        restore: saved.restore,
+        life: saved.life,
+        change: saved.change,
+        notice: saved.notice,
+        session: match saved.session {
+            Some(hex) => Some(Session::from_hex(&hex.0)?),
+            None => None,
+        },
+        sign_out: match saved.sign_out {
+            Some(note) => Some(revoke(note)?),
+            None => None,
+        },
+        music,
+    })
+}
+
+fn note(raw: &RawValue) -> Option<Note> {
+    let note: NoteIn = serde_json::from_str(raw.get()).ok()?;
+    Some(Note {
+        request: note.request,
+        revoke: revoke(note.revoke)?,
+        nexus: note.nexus,
+        backend_id: note.backend_id,
+        restore: note.restore,
+        made_ms: note.made_ms,
+    })
+}
+
+/// What was kept, read back: each part strictly and by itself (as ruled). A part that is
+/// there and does not read (an unknown member, a wrong or older form) is treated as absent
+/// and forgotten; what does read is used, whatever the others are.
 fn kept(kept: KeptIn<'_>) -> Kept {
-    let device_secret = kept.device_secret.and_then(|hex| DeviceSecret::from_hex(&hex.0));
-    let saved = kept.saved.and_then(|saved| {
-        let music = saved.music.and_then(|raw| account::read::<MusicLogin>(raw.get().as_bytes()).ok());
-        Some(Saved {
-            nexus: saved.nexus,
-            backend_id: saved.backend_id,
-            account: AccountId::new(saved.account)?,
-            email: saved.email,
-            name: saved.name,
-            device: saved.device,
-            restore: saved.restore,
-            life: saved.life,
-            change: saved.change,
-            notice: saved.notice,
-            session: saved.session.and_then(|hex| Session::from_hex(&hex.0)),
-            sign_out: saved.sign_out.and_then(revoke),
-            music,
-        })
+    let mut unreadable = Vec::new();
+    let device_secret = kept.device_secret.filter(|raw| raw.get() != "null").and_then(|raw| {
+        let key = device_key(raw);
+        if key.is_none() {
+            unreadable.push(Forget::DeviceSecret);
+        }
+        key
     });
-    let notes = kept
-        .notes
-        .into_iter()
-        .filter_map(|note| {
-            Some(Note {
-                request: note.request,
-                revoke: revoke(note.revoke)?,
-                nexus: note.nexus,
-                backend_id: note.backend_id,
-                restore: note.restore,
-                made_ms: note.made_ms,
-            })
-        })
-        .collect();
-    Kept { device_secret, saved, notes, offline: kept.offline }
+    let saved = kept.saved.filter(|raw| raw.get() != "null").and_then(|raw| {
+        let found = saved(raw);
+        if found.is_none() {
+            unreadable.push(Forget::Saved);
+        }
+        found
+    });
+    let mut notes = Vec::new();
+    for (index, raw) in kept.notes.into_iter().enumerate() {
+        match note(raw) {
+            Some(found) => notes.push(found),
+            None => unreadable.push(Forget::UnreadableNote { index }),
+        }
+    }
+    Kept { device_secret, saved, notes, offline: kept.offline, unreadable }
 }
 
 fn event(event: EventIn) -> Result<Happened, ()> {
     Ok(match event {
         EventIn::Pressed(press) => Happened::Pressed(match press {
-            PressIn::SignIn { address, email, password, look, retry } => Press::SignIn { address, email, password, look, retry },
-            PressIn::SignInWithCode { address, code, password, again, look, retry } => {
-                Press::SignInWithCode { address, code, password, again, look, retry }
-            }
+            PressIn::SignIn { address, email, password, look } => Press::SignIn { address, email, password, look },
+            PressIn::SignInWithCode { address, code, password, again, look } => Press::SignInWithCode { address, code, password, again, look },
             PressIn::FormClosed {} => Press::FormClosed,
             PressIn::SignOut {} => Press::SignOut,
             PressIn::OpenDevices {} => Press::OpenDevices,
@@ -338,7 +406,6 @@ fn event(event: EventIn) -> Result<Happened, ()> {
         EventIn::Network { up } => Happened::Network { up },
         EventIn::Offline(on) => Happened::Offline(on),
         EventIn::Tick {} => Happened::Tick,
-        EventIn::WaitPassed {} => Happened::WaitPassed,
         EventIn::MusicRefused { count, generation } => Happened::MusicRefused { count, generation },
         EventIn::MusicLooked { look, count, generation } => Happened::MusicLooked { look, count, generation },
     })
@@ -373,6 +440,13 @@ impl Client {
             }
             Call::Happened { event: event_in, given: given_in } => {
                 let (Ok(event), Ok(given)) = (event(event_in), given(given_in)) else { return error() };
+                // An answer larger than its ask allows is refused before the ask is touched,
+                // so that the right one can still be handed in for it.
+                if let Happened::Answered { ask, body, .. } = &event
+                    && self.max_body_for(*ask).is_some_and(|max_body| body.0.len() > max_body)
+                {
+                    return error();
+                }
                 self.happened(event, &given)
             }
             Call::Stop {} => {
