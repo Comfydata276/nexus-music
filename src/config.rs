@@ -103,9 +103,6 @@ impl Paths {
 
 pub use nexus_core::sync::ListPrefs;
 
-/// One of the person's other devices, as the new linking last saw it: the library's own
-/// record, kept here as it is.
-pub use nexus_core::link::seen::Seen as LinkSeen;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -184,31 +181,13 @@ pub struct Settings {
     /// neither used nor bound (see `keep::take_token_telling`), until a token is next kept
     /// bound.
     pub lidarr_token_spent: bool,
-    /// Hosting jams is switched on, and the relay they're hosted at. (The host key for it is
-    /// kept with the account password, not here.)
-    pub jam_host: bool,
-    pub jam_relay: String,
-    /// The name to go by in jams; empty for the account's name.
-    pub jam_name: String,
-    /// Guests in a jam hosted here may pause and skip.
-    pub jam_guests_control: bool,
-    /// Other copies of the app signed in to the same account can see this one, steer it,
-    /// and take over what it's playing (and it them). Needs the relay.
-    pub link_devices: bool,
-    /// What this device is called in other devices' lists; empty for the computer's name.
+    /// What this device is called in the person's list of devices at the Nexus server; empty
+    /// for the computer's name.
     pub device_name: String,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
     pub device_id: String,
-    /// What this installation calls itself to the person's other devices under the new
-    /// linking (see `link`): sixteen random bytes. Made the first time it is needed.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub link_device: String,
-    /// The person's other devices as the new linking has seen them, so that the list can
-    /// show them at once. Written only where that linking is switched on.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub link_seen: Vec<LinkSeen>,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
     /// When the pins and the theme that were last agreed with the server were chosen (see
@@ -292,16 +271,9 @@ impl Default for Settings {
             lidarr_gate_client: String::new(),
             lidarr_signed_in: String::new(),
             lidarr_token_spent: false,
-            jam_host: false,
-            jam_relay: String::new(),
-            jam_name: String::new(),
-            jam_guests_control: true,
-            link_devices: true,
             device_name: String::new(),
             sync: true,
             device_id: String::new(),
-            link_device: String::new(),
-            link_seen: Vec::new(),
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,

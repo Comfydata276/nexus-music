@@ -14,7 +14,6 @@ use nexus_core::queue::{Lineup, compare_lists, follow_list};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{Durable, SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
-use crate::jam::Remote;
 use crate::subsonic::{ApiError, Lyrics, Song};
 use crate::ui;
 
@@ -326,10 +325,6 @@ impl Controller {
     /// Replaces the queue and starts playing from `start`. `any_start` says no particular
     /// song was asked for, so a shuffled list may open with any of them.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
-        if self.remote_play(&songs, start, context, any_start) {
-            self.play_from.take();
-            return;
-        }
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins, source_list) = match self.play_from.take() {
             Some(from) if from.rows.len() == songs.len() => {
@@ -674,9 +669,6 @@ impl Controller {
     // ---- transport -----------------------------------------------------------------------------
 
     pub fn toggle_play(self: &Rc<Self>) {
-        if self.remote(Remote::Toggle) {
-            return;
-        }
         self.toggle_play_here();
     }
 
@@ -747,9 +739,6 @@ impl Controller {
 
     /// Used by the media keys and the sleep timer.
     pub fn set_playing(self: &Rc<Self>, playing: bool) {
-        if self.remote(Remote::Play(playing)) {
-            return;
-        }
         self.set_playing_here(playing);
     }
 
@@ -760,9 +749,6 @@ impl Controller {
     }
 
     pub fn next_track(self: &Rc<Self>) {
-        if self.remote(Remote::Next) {
-            return;
-        }
         self.next_track_here();
     }
 
@@ -791,9 +777,6 @@ impl Controller {
     }
 
     pub fn previous_track(self: &Rc<Self>) {
-        if self.remote(Remote::Previous) {
-            return;
-        }
         self.previous_track_here();
     }
 
@@ -821,9 +804,6 @@ impl Controller {
     }
 
     pub fn seek(self: &Rc<Self>, seconds: f64) {
-        if self.remote(Remote::Seek(seconds)) {
-            return;
-        }
         self.seek_here(seconds);
     }
 
@@ -884,9 +864,6 @@ impl Controller {
     }
 
     pub fn set_volume(self: &Rc<Self>, volume: f32) {
-        if self.remote(Remote::Volume(volume)) {
-            return;
-        }
         self.set_volume_here(volume);
     }
 
@@ -904,9 +881,6 @@ impl Controller {
     }
 
     pub fn toggle_shuffle(self: &Rc<Self>) {
-        if self.remote(Remote::Shuffle) {
-            return;
-        }
         let on = !self.playback.borrow().shuffle;
         self.set_shuffle(on);
     }
@@ -981,9 +955,6 @@ impl Controller {
     }
 
     fn cycle_repeat(self: &Rc<Self>) {
-        if self.remote(Remote::Repeat) {
-            return;
-        }
         let mode = (self.playback.borrow().repeat + 1) % 3;
         self.set_repeat(mode);
     }
@@ -1021,9 +992,6 @@ impl Controller {
     /// list is queued all the same, and plays again when its turn in the list comes.
     pub fn enqueue(self: &Rc<Self>, songs: Vec<Song>, play_next: bool) {
         if songs.is_empty() {
-            return;
-        }
-        if self.remote_add(&songs, play_next) {
             return;
         }
         self.enqueue_here(songs, play_next);
@@ -1064,9 +1032,6 @@ impl Controller {
 
     /// Removes the entry `offset` places after the current track.
     pub fn remove_upcoming(self: &Rc<Self>, offset: usize) {
-        if self.remote(Remote::Remove(offset)) {
-            return;
-        }
         self.remove_upcoming_here(offset);
     }
 
@@ -1086,9 +1051,6 @@ impl Controller {
     /// Moves the entry `from` places after the current track to `to` places after it.
     /// `queued` says which part of the queue it lands in: "Next in queue" or the list.
     pub fn move_upcoming(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
-        if self.remote(Remote::Move(from, to, queued)) {
-            return;
-        }
         self.move_upcoming_here(from, to, queued);
     }
 
@@ -1106,9 +1068,6 @@ impl Controller {
     /// Empties part of what's to come: with `queued`, the songs queued by hand; otherwise
     /// the rest of the list behind them.
     pub fn clear_upcoming(self: &Rc<Self>, queued: bool) {
-        if self.remote(Remote::Clear(queued)) {
-            return;
-        }
         self.clear_upcoming_here(queued);
     }
 
@@ -1123,9 +1082,6 @@ impl Controller {
 
     /// Plays the entry `offset` places after the current track now.
     pub fn jump_to_upcoming(self: &Rc<Self>, offset: usize) {
-        if self.remote(Remote::Jump(offset)) {
-            return;
-        }
         self.jump_to_upcoming_here(offset);
     }
 
@@ -1208,11 +1164,6 @@ impl Controller {
     pub fn on_engine_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::Started(token) => {
-                // (Where the new linking is switched on, the window may have been brought
-                // up to this already: see `link_catch_up`.)
-                if self.link_caught_up(token) {
-                    return;
-                }
                 let advanced = {
                     let mut pb = self.playback.borrow_mut();
                     pb.failures = 0;
@@ -1487,7 +1438,6 @@ impl Controller {
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
-        self.jam_tick();
         self.tick_downloads();
         // Every few seconds while there's a queue, see that the next songs are on hand.
         let keep_ticks = self.keep_ticks.get() + 1;
@@ -1879,9 +1829,6 @@ impl Controller {
                 }
             }
         }
-        if self.show_remote() {
-            return;
-        }
         let player = self.ui.global::<ui::Player>();
         let current = self.playback.borrow().current().cloned();
         match &current {
@@ -1915,9 +1862,6 @@ impl Controller {
     }
 
     pub fn sync_transport(self: &Rc<Self>) {
-        if self.show_remote() {
-            return;
-        }
         let pb = self.playback.borrow();
         let player = self.ui.global::<ui::Player>();
         player.set_playing(pb.playing);
@@ -1937,11 +1881,6 @@ impl Controller {
     }
 
     pub fn sync_queue(self: &Rc<Self>) {
-        if self.show_remote() {
-            return;
-        }
-        // In a jam hosted here, songs guests queued say who queued them.
-        let added_by = self.jam.borrow().added_by();
         let pb = self.playback.borrow();
         let ahead = pb.queued_ahead();
         let rows: Vec<ui::Track> = pb
@@ -1950,13 +1889,7 @@ impl Controller {
             .skip(pb.cursor + 1)
             .take(QUEUE_ROWS)
             .filter_map(|&i| pb.queue.get(i))
-            .map(|song| {
-                let mut row = self.track_row(song);
-                if let Some(name) = added_by.get(&song.id).filter(|_| song.queued) {
-                    row.by = name.as_str().into();
-                }
-                row
-            })
+            .map(|song| self.track_row(song))
             .collect();
         drop(pb);
         self.show_queue(rows, ahead);
@@ -2184,7 +2117,7 @@ impl Controller {
             // A queue taken up from another device is still that device's after a restart.
             // (One marked as handed on by a run in which linking existed is this PC's own
             // in a run in which it does not: `nexus_core::handover::restored`.)
-            self.queue_owner.restored(nexus_core::handover::restored(place.taken, crate::link::on()));
+            self.queue_owner.restored(nexus_core::handover::restored(place.taken, false));
         }
         self.queue_saved.set(shape);
         {

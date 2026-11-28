@@ -116,14 +116,6 @@ pub(crate) fn make_public_agent(idle: Duration) -> ureq::Agent {
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
-/// Splits a call's address into where the calls are and the sign-in as a form's fields:
-/// what is before the call's own name, and the query without the answer's format.
-fn account_of(url: &str) -> (String, String) {
-    let (address, form) = url.split_once('?').unwrap_or((url, ""));
-    let rest = address.rsplit_once('/').map_or(address, |(rest, _)| rest);
-    (rest.to_string(), form.replacen("&f=json", "", 1))
-}
-
 pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
     agent_following(0, Duration::from_secs(300))
 }
@@ -567,14 +559,6 @@ impl Client {
             .build()
             .send(form)
             .map_err(|e| ApiError::Network(network_hint(&e)))
-    }
-
-    /// The sign-in as a look at the linking secret uses it (`nexus_core::link::look`): where
-    /// the server's calls are, and the sign-in as the fields of a form. The look sends
-    /// every call as a form POST, so neither the sign-in nor the secret is in an address.
-    pub fn link_account(&self) -> nexus_core::link::look::Account {
-        let (rest, form) = account_of(&self.url("getPlaylists", &[]));
-        nexus_core::link::look::Account { rest, form, username: self.inner.username.clone() }
     }
 
     /// Whether the person has put the app in offline mode: nothing is asked of the server.

@@ -104,19 +104,9 @@ impl Controller {
     }
 
     fn owe(&self, owed: Owed, whose: Option<Who>) {
-        if owed.count {
-            self.link_moved();
-        }
+        // (The count of choices was the relay linking's, taken out with it.)
+        let _ = (owed.count, whose);
         if owed.claim {
-            // (Written down only where a run is being watched from outside: see `link::log`.)
-            crate::link::log(format!(
-                "queue: this PC's own from now, chosen {}",
-                match whose {
-                    Some(Who::Elsewhere) => "at another of the person's devices",
-                    Some(Who::Guest) => "by a guest",
-                    _ => "here",
-                }
-            ));
             self.claim_queue();
         }
     }

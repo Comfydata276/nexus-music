@@ -93,8 +93,6 @@ pub enum Route {
     OutsideArtist(String),
     /// An album that isn't in the library, by MusicBrainz's name for it.
     OutsideAlbum(String),
-    /// The jam this PC has joined: someone else's queue.
-    Jam,
 }
 
 impl Route {
@@ -123,7 +121,6 @@ impl Route {
             "stats" => Route::Stats(rest.parse().unwrap_or(0)),
             "outside-artist" => Route::OutsideArtist(rest.to_string()),
             "outside-album" => Route::OutsideAlbum(rest.to_string()),
-            "jam" => Route::Jam,
             _ => return None,
         })
     }
@@ -153,7 +150,6 @@ impl Route {
             Route::Stats(_) => "stats".into(),
             Route::OutsideArtist(id) => format!("outside-artist:{id}"),
             Route::OutsideAlbum(id) => format!("outside-album:{id}"),
-            Route::Jam => "jam".into(),
         }
     }
 
@@ -180,7 +176,6 @@ impl Route {
             Route::Settings => ui::Page::Settings,
             Route::Lyrics => ui::Page::Lyrics,
             Route::NowPlaying => ui::Page::NowPlaying,
-            Route::Jam => ui::Page::Jam,
         }
     }
 }
@@ -300,20 +295,9 @@ pub struct Controller {
     quick_pool: Pool,
     pub art_pool: Pool,
     pub download_pool: Pool,
-    /// For talking to a jam's relay, which can be slow and mustn't hold up anything else.
-    pub jam_pool: std::sync::Arc<Pool>,
-    /// The jam being hosted or joined, if any (see `jam`).
-    pub jam: RefCell<crate::jam::Jam>,
-    /// The order of choices on this PC: what a command from another of the person's
-    /// devices is judged against (see `link`).
-    pub link_rule: RefCell<nexus_core::link::rule::Rule>,
     /// The choices under way in the player: who chose what is being done to it now, from
     /// which both that order and whose the queue is are worked out (see `ways`).
     pub ways: crate::ways::Choices,
-    /// The new linking of a person's devices, where it is switched on (see `link`).
-    pub link: RefCell<crate::link::Link>,
-    /// Waits for typing in a jam's search box to pause.
-    pub jam_timer: slint::Timer,
     pub downloads: RefCell<crate::downloads::Downloads>,
     pub covers: Covers,
     pub engine: Engine,
@@ -544,12 +528,7 @@ impl Controller {
             playlist_pool: Pool::new("playlists", 1, false),
             undo: RefCell::default(),
             quick_pool: Pool::new("quick", 1, true),
-            jam_pool: std::sync::Arc::new(Pool::new("jam", 4, false)),
-            jam: RefCell::default(),
-            link_rule: RefCell::default(),
             ways: Default::default(),
-            link: RefCell::default(),
-            jam_timer: slint::Timer::default(),
             download_pool: Pool::new("download", 2, false),
             // Nobody is signed in yet: whose downloads to show is known in `enter`.
             downloads: RefCell::new(crate::downloads::Downloads::load(
@@ -1234,11 +1213,6 @@ impl Controller {
         // From the first moment of shutting down, nothing more is sent to keep in step: a
         // write about to be made is not, and an answer on its way is dropped.
         self.let_go();
-        // A jam hosted here ends with the app; its guests are told so, not left waiting.
-        self.stop_linking();
-        // (The new linking ends with the sign-in, and a look still on its way with it.)
-        self.link_stop();
-        self.end_jam(true);
         self.save_queue();
         // (The settings are written once, waiting for the disk, as the app ends: `main`.)
         let _ = slint::quit_event_loop();
@@ -2586,12 +2560,6 @@ impl Controller {
         }
         self.pending.borrow_mut().clear();
         self.sending.borrow_mut().clear();
-        self.leave_jam();
-        self.end_jam(false);
-        self.stop_linking();
-        // (The new linking ends with the sign-in, and a look still on its way with it.)
-        self.link_stop();
-        self.ui.global::<ui::Jam>().set_open(false);
         self.stop_sync();
         self.library_timer.stop();
         self.close_preview();
@@ -2838,18 +2806,12 @@ impl Controller {
                 if self.ui.global::<ui::Settings>().get_requests_state() != "waiting" {
                     self.check_requests(false);
                 }
-                self.check_jam();
                 return;
             }
             Route::Lyrics | Route::NowPlaying => {
                 view.set_loading(false);
                 view.set_error("".into());
                 self.load_lyrics();
-                return;
-            }
-            Route::Jam => {
-                view.set_loading(false);
-                view.set_error("".into());
                 return;
             }
             Route::Downloads => {
@@ -3635,7 +3597,6 @@ impl Controller {
             sections_before: 0,
             playing: false,
             progress: self.downloads.borrow().progress_of(&song.id),
-            by: SharedString::default(),
             selected: false,
             unavailable: self.is_offline() && !self.plays_offline(song),
             downloaded: self.downloads.borrow().has(&song.id),
@@ -3719,7 +3680,7 @@ impl Controller {
     /// or by a look at what other devices have changed (which reads it anyway).
     pub fn playlists_arrived(self: &Rc<Self>, mut playlists: Vec<Playlist>) {
         // The playlist the app keeps its shared data in isn't one to listen to.
-        playlists.retain(|p| !crate::link::unlisted(&p.name));
+        playlists.retain(|p| !nexus_core::link::secret::unlisted(&p.name, false));
         *self.playlists.borrow_mut() = playlists;
         self.show_playlists();
         self.reload_changed_playlist();
@@ -3810,6 +3771,7 @@ impl Controller {
     pub fn push_settings(&self) {
         let settings = self.settings.borrow();
         let page = self.ui.global::<ui::Settings>();
+        page.set_device_name(settings.device_name.as_str().into());
         let strings = |items: Vec<&str>| {
             ModelRc::new(VecModel::from(items.into_iter().map(SharedString::from).collect::<Vec<_>>()))
         };
@@ -3902,7 +3864,6 @@ impl Controller {
         page.set_lidarr_has_token(usable);
         page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
         drop(settings);
-        self.push_jam();
     }
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
@@ -3999,6 +3960,9 @@ impl Controller {
             });
             #[cfg(not(windows))]
             let _ = (height, nav_right, search_left, search_right, controls_left);
+        });
+        self.ui.global::<ui::Settings>().on_set_device_name(|name| {
+            with(|ctl| ctl.change_setting(true, |settings| settings.device_name = name.trim().to_string()));
         });
         app.on_navigate(|route| {
             with(|ctl| {
@@ -4494,8 +4458,6 @@ impl Controller {
         });
 
         self.wire_playback();
-        self.wire_jam();
-        self.wire_link();
         self.wire_actions();
     }
 
@@ -4547,7 +4509,7 @@ pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     }
     // The page of a playlist the app keeps for itself holds, as its comment, what the app
     // keeps there: for one of them that is a secret. It is never written to disk.
-    if page.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name, &playlist.comment)) {
+    if page.playlist.as_ref().is_some_and(|playlist| !nexus_core::link::secret::page_may_be_kept(&playlist.name, &playlist.comment)) {
         return;
     }
     let Ok(json) = serde_json::to_vec(page) else { return };
@@ -4580,7 +4542,7 @@ pub(crate) fn read_page(path: &std::path::Path) -> Option<(Duration, PageData)> 
     // A page that was written before it was known not to be (by an earlier version, or
     // while its playlist had another name) holds what the app keeps in that playlist's
     // comment. It is not read: it goes.
-    if data.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name, &playlist.comment)) {
+    if data.playlist.as_ref().is_some_and(|playlist| !nexus_core::link::secret::page_may_be_kept(&playlist.name, &playlist.comment)) {
         let _ = std::fs::remove_file(path);
         return None;
     }

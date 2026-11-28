@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, Jam, JamSong, Linked } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, DeviceRow } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, ChipRow, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -2046,7 +2046,7 @@ export component SettingsPage inherits Rectangle {
         y: root.short ? 10px : 66px;
         width: root.column;
         spacing: 6px;
-        names: ["Appearance", "Playback", "Sound", "Storage", "Requests", "Jam", "Account", "About"];
+        names: ["Appearance", "Playback", "Sound", "Storage", "Requests", "Account", "About"];
         selected: Settings.tab;
         chosen(index) => {
             Settings.tab = index;
@@ -2601,148 +2601,8 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
 
-                    // ---- Jam ----
-                    if Settings.tab == 5: VerticalLayout {
-                        SettingRow {
-                            title: "Host jams";
-                            detail: "A jam is one queue that friends add to while the music plays on this PC. They join from a link, in a browser or in Nexus Music. Hosting needs a jam relay: a small service you run beside your music server, which is what lets friends reach the jam from wherever they are. Joining someone else's jam needs none of this.";
-                            Toggle {
-                                on: Settings.jam-host;
-                                label: "Host jams";
-                                toggled(on) => { Settings.set-jam-host(on); }
-                            }
-                        }
-
-                        if Settings.jam-host: SettingNest {
-                            jam-box := VerticalLayout {
-                                function connect() {
-                                    if jam-link.text != "" {
-                                        Settings.save-jam-link(jam-link.text);
-                                        jam-link.text = "";
-                                    }
-                                }
-                                spacing: 12px;
-
-                                VerticalLayout {
-                                    spacing: 6px;
-
-                                    Text {
-                                        text: "Host link";
-                                        color: Theme.text;
-                                        font-size: 13px;
-                                        font-weight: 600;
-                                    }
-
-                                    jam-link := Field {
-                                        input-type: InputType.password;
-                                        placeholder: Settings.jam-relay != "" ? "The link for " + Settings.jam-relay + " is on file" : "https://jam.example.org/#key";
-                                        placeholder-ink: Settings.jam-relay != "" ? Theme.muted : Theme.faint;
-                                        label: "Host link";
-                                        accepted => { jam-box.connect(); }
-                                    }
-
-                                    Text {
-                                        text: "The relay prints this link when it starts. It ends with a key, so treat it like a password: this PC keeps the key where it keeps your password, not in its settings file.";
-                                        color: Theme.muted;
-                                        font-size: 13px;
-                                        wrap: word-wrap;
-                                    }
-                                }
-
-                                // Where things stand, and the one thing to do next.
-                                Rectangle {
-                                    background: Theme.raised;
-                                    border-radius: 10px;
-                                    border-width: 1px;
-                                    border-color: Theme.line;
-
-                                    HorizontalLayout {
-                                        padding: 14px;
-                                        padding-left: 16px;
-                                        spacing: 12px;
-
-                                        VerticalLayout {
-                                            alignment: center;
-
-                                            Rectangle {
-                                                width: 10px;
-                                                height: 10px;
-                                                border-radius: 5px;
-                                                background: Settings.jam-state == "connected" ? #4cc38a
-                                                    : Settings.jam-state == "error" ? Theme.danger
-                                                    : Settings.jam-state == "none" ? Theme.faint
-                                                    : Theme.warm;
-                                                animate background { duration: 150ms; }
-                                            }
-                                        }
-
-                                        Text {
-                                            text: Settings.jam-status;
-                                            color: Theme.text;
-                                            font-size: 14px;
-                                            font-weight: 500;
-                                            wrap: word-wrap;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
-                                        }
-
-                                        VerticalLayout {
-                                            alignment: center;
-
-                                            if jam-link.text != "" || Settings.jam-state == "none": TextButton {
-                                                text: "Connect";
-                                                primary: true;
-                                                enabled: jam-link.text != "";
-                                                clicked => { jam-box.connect(); }
-                                            }
-
-                                            if jam-link.text == "" && Settings.jam-state == "error": TextButton {
-                                                text: "Try again";
-                                                clicked => { Settings.check-jam(); }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if Settings.jam-host: SettingRow {
-                            title: "Link my devices";
-                            detail: "Other PCs running Nexus Music, signed in to the same account and set up with the same relay, appear under the devices button in the player bar. Pick one to move what you're playing over to it, or to steer what it's playing from here.";
-                            Toggle {
-                                on: Settings.link-devices;
-                                label: "Link my devices";
-                                toggled(on) => { Settings.set-link-devices(on); }
-                            }
-                        }
-
-                        if Settings.jam-host && Settings.link-devices: SettingRow {
-                            nested: true;
-                            title: "This device's name";
-                            detail: "What it's called in the list on your other devices.";
-                            Field {
-                                width: 220px;
-                                text: Settings.device-name;
-                                label: "This device's name";
-                                accepted => { Settings.set-device-name(self.text); }
-                            }
-                        }
-
-                        // The new linking, where it is switched on for a test (see src/link.rs).
-                        if Settings.jam-host && Settings.link-devices && Linked.on: SettingRow {
-                            nested: true;
-                            title: "Reset linking";
-                            detail: "Starts all your devices afresh with a new link between them. Every device still signed in rejoins by itself within two minutes. Do this after you change your music server password, or if you lose a device." + (Linked.note != "" ? "\n" + Linked.note : "");
-                            TextButton {
-                                height: 32px;
-                                text: "Reset linking";
-                                clicked => { Linked.reset(); }
-                            }
-                        }
-                    }
-
                     // ---- Account ----
-                    if Settings.tab == 6: VerticalLayout {
+                    if Settings.tab == 5: VerticalLayout {
                         // The Nexus server: who is signed in, and how it stands (src/nexus/).
                         SettingRow {
                             title: "Nexus server";
@@ -2869,6 +2729,17 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "This PC's name";
+                            detail: "What it is called in your list of devices. It is sent the next time you sign in.";
+                            Field {
+                                width: 220px;
+                                text: Settings.device-name;
+                                label: "This PC's name";
+                                accepted => { Settings.set-device-name(self.text); }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Keep my devices in step";
                             detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to Nexus Music on other devices. Kept on your server in a playlist named “Nexus Music sync”, which other apps will show; leave it be." + (Settings.sync && Settings.sync-note != "" ? " " + Settings.sync-note : "");
                             Toggle {
@@ -2889,7 +2760,7 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     // ---- About ----
-                    if Settings.tab == 7: VerticalLayout {
+                    if Settings.tab == 6: VerticalLayout {
                         SettingRow {
                             title: "Nexus Music " + App.app-version;
                             detail: Settings.update-status;
@@ -2956,302 +2827,6 @@ export component SettingsPage inherits Rectangle {
         content-y <=> scroll.content-y;
         content-height: scroll.content-height;
         visible-height: scroll.visible-height;
-    }
-}
-
-// A song found in the jam host's library, with a button to add it to the jam's queue.
-component JamRow inherits Rectangle {
-    in property <JamSong> song;
-    callback acted;
-
-    height: 60px;
-    border-radius: 6px;
-    background: touch.has-hover ? Theme.hover : transparent;
-
-    accessible-role: list-item;
-    accessible-label: self.song.title + ", " + self.song.about;
-
-    touch := TouchArea {
-        // Double-clicking adds it, as it would play a song elsewhere.
-        double-clicked => {
-            if root.song.action == 1 {
-                root.acted();
-            }
-        }
-    }
-
-    HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 12px;
-
-        VerticalLayout {
-            alignment: center;
-            Cover {
-                width: 44px;
-                height: 44px;
-                art: root.song.cover;
-                detail: 44px;
-            }
-        }
-
-        VerticalLayout {
-            alignment: center;
-            spacing: 3px;
-            horizontal-stretch: 1;
-            min-width: 60px;
-            preferred-width: 0px;
-
-            Text {
-                text: root.song.title;
-                color: Theme.text;
-                font-size: 15px;
-                font-weight: 500;
-                overflow: elide;
-            }
-
-            Text {
-                text: root.song.about;
-                color: Theme.muted;
-                font-size: 13px;
-                overflow: elide;
-            }
-        }
-
-        Text {
-            text: root.song.duration;
-            color: Theme.muted;
-            font-size: 13px;
-            vertical-alignment: center;
-        }
-
-        VerticalLayout {
-            alignment: center;
-            width: 32px;
-
-            if root.song.action != 3: IconButton {
-                icon: Icons.plus;
-                tint: Theme.text;
-                enabled: root.song.action == 1;
-                label: root.song.action == 1 ? "Add to the jam's queue" : "Adding…";
-                clicked => { root.acted(); }
-            }
-
-            if root.song.action == 3: Icon {
-                x: (parent.width - self.width) / 2;
-                source: Icons.check;
-                tint: Theme.accent-bright;
-                accessible-role: text;
-                accessible-label: "In the queue";
-            }
-        }
-    }
-}
-
-// The jam this PC has joined: who's in it, and the host's library to add from. What's
-// playing and what's queued are in the player and the queue panel, which are the jam's
-// for as long as this PC is in it.
-export component JamPage inherits Rectangle {
-    property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
-
-    if !Jam.joined: VerticalLayout {
-        alignment: center;
-        padding: 48px;
-        spacing: 10px;
-
-        HorizontalLayout {
-            alignment: center;
-            padding-bottom: 8px;
-            Rectangle {
-                width: 72px;
-                height: 72px;
-                border-radius: 36px;
-                background: Theme.raised;
-                Icon {
-                    source: Icons.party-popper;
-                    size: 30px;
-                    tint: Theme.faint;
-                }
-            }
-        }
-
-        Text {
-            text: "You're not in a jam";
-            color: Theme.text;
-            font-family: Theme.display;
-            font-size: 26px;
-            font-weight: 700;
-            horizontal-alignment: center;
-        }
-
-        Text {
-            text: "Join one with the link its host sent you.";
-            color: Theme.muted;
-            font-size: 14px;
-            horizontal-alignment: center;
-        }
-
-        HorizontalLayout {
-            alignment: center;
-            padding-top: 10px;
-            TextButton {
-                text: "Join a jam";
-                primary: true;
-                clicked => {
-                    Jam.opened();
-                    Jam.open = true;
-                }
-            }
-        }
-    }
-
-    if Jam.joined: Rectangle {
-        scroll := ScrollView {
-            vertical-scrollbar-policy: always-off;
-            horizontal-scrollbar-policy: always-off;
-
-            VerticalLayout {
-                width: scroll.visible-width;
-                alignment: start;
-
-                HorizontalLayout {
-                    alignment: center;
-
-                    VerticalLayout {
-                        width: root.column;
-                        alignment: start;
-                        padding-top: 8px;
-                        padding-bottom: 56px;
-                        spacing: 16px;
-
-                        // Whose jam, who's in it, and the way out.
-                        HorizontalLayout {
-                            spacing: 16px;
-
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                spacing: 4px;
-
-                                Text {
-                                    text: "JAM";
-                                    color: Theme.accent-bright;
-                                    font-size: 12px;
-                                    font-weight: 700;
-                                }
-
-                                Text {
-                                    text: Jam.host + "'s jam";
-                                    color: Theme.text;
-                                    font-family: Theme.display;
-                                    font-size: 34px;
-                                    font-weight: 800;
-                                    overflow: elide;
-                                }
-
-                                Text {
-                                    text: Jam.with;
-                                    color: Theme.muted;
-                                    font-size: 14px;
-                                    wrap: word-wrap;
-                                }
-                            }
-
-                            VerticalLayout {
-                                alignment: center;
-                                TextButton {
-                                    text: "Leave jam";
-                                    clicked => { Jam.leave(); }
-                                }
-                            }
-                        }
-
-                        if Jam.notice != "": Rectangle {
-                            height: notice.preferred-height + 24px;
-                            border-radius: 10px;
-                            background: Theme.warm.with-alpha(0.12);
-                            border-width: 1px;
-                            border-color: Theme.warm.with-alpha(0.3);
-
-                            notice := Text {
-                                x: 14px;
-                                width: parent.width - 28px;
-                                text: Jam.notice;
-                                color: Theme.warm;
-                                font-size: 14px;
-                                wrap: word-wrap;
-                            }
-                        }
-
-                        Text {
-                            text: "The music is playing where " + Jam.host + " is. The player at the bottom and the queue panel are the jam's while you're in it"
-                                + (Jam.control ? ": pause, skip, drag songs into a new order or take them out, and everyone sees it." : ". " + Jam.host + " is choosing what plays, so you can add songs and take your own back out.")
-                                + " “Add to queue” anywhere in the app adds to the jam, and so does playing a song.";
-                            color: Theme.muted;
-                            font-size: 14px;
-                            wrap: word-wrap;
-                        }
-
-                        // Looks in the host's library, not this PC's.
-                        HorizontalLayout {
-                            spacing: 8px;
-
-                            Field {
-                                text <=> Jam.query;
-                                placeholder: "Find a song in " + Jam.host + "'s library to add";
-                                label: "Find a song to add";
-                                horizontal-stretch: 1;
-                                edited => { Jam.search(self.text); }
-                            }
-
-                            if Jam.query != "": VerticalLayout {
-                                alignment: center;
-                                IconButton {
-                                    icon: Icons.x;
-                                    label: "Clear the search";
-                                    clicked => {
-                                        Jam.query = "";
-                                        Jam.search("");
-                                    }
-                                }
-                            }
-                        }
-
-                        if Jam.query != "": VerticalLayout {
-                            spacing: 2px;
-
-                            Text {
-                                height: 28px;
-                                text: "Songs";
-                                color: Theme.muted;
-                                font-size: 13px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                            }
-
-                            for song in Jam.results: JamRow {
-                                song: song;
-                                acted => { Jam.add(song.id); }
-                            }
-
-                            if Jam.searched && Jam.results.length == 0: Text {
-                                text: "Nothing in " + Jam.host + "'s library matches that.";
-                                color: Theme.faint;
-                                font-size: 14px;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        ScrollThumb {
-            x: parent.width - self.width;
-            y: 0;
-            height: parent.height;
-            content-y <=> scroll.content-y;
-            content-height: scroll.content-height;
-            visible-height: scroll.visible-height;
-        }
     }
 }
 

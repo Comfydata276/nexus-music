@@ -292,14 +292,10 @@ impl Controller {
 
     /// `index` is the row in the queue panel, or -1 for the track that's playing.
     pub fn open_queue_menu(self: &Rc<Self>, index: i32, x: f32, y: f32) {
-        // Controlling playback elsewhere, the queue on show is that one, not this PC's.
-        let song = match self.remote_song(index) {
-            Some(found) => found,
-            None => {
-                let pb = self.playback.borrow();
-                let at = (pb.cursor as i64 + 1 + index as i64) as usize;
-                pb.order.get(at).and_then(|&i| pb.queue.get(i)).cloned()
-            }
+        let song = {
+            let pb = self.playback.borrow();
+            let at = (pb.cursor as i64 + 1 + index as i64) as usize;
+            pb.order.get(at).and_then(|&i| pb.queue.get(i)).cloned()
         };
         if let Some(song) = song {
             self.song_menu(song, None, (index >= 0).then_some(index as usize), x, y);
@@ -1145,7 +1141,7 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if let Some(kept) = crate::link::kept_name(&name) {
+                if let Some(kept) = nexus_core::link::secret::kept_name(&name, false) {
                     // A name the app keeps for a playlist of its own.
                     return self.toast(kept);
                 }
@@ -1168,7 +1164,7 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if let Some(kept) = crate::link::kept_name(&name) {
+                if let Some(kept) = nexus_core::link::secret::kept_name(&name, false) {
                     // A name the app keeps for a playlist of its own.
                     return self.toast(kept);
                 }

@@ -221,7 +221,7 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
         .playlists()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|p| !crate::link::unlisted(&p.name) && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
+        .filter(|p| !nexus_core::link::secret::unlisted(&p.name, false) && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
         .map(|p| (name_of(&p.name), p.id))
         .collect();
     let mut reports = Vec::new();
@@ -266,7 +266,7 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
                 }
                 None => {
                     let ids: Vec<String> = found.iter().map(|(id, _)| id.clone()).collect();
-                    if let Some(kept) = crate::link::kept_name(&list.name) {
+                    if let Some(kept) = nexus_core::link::secret::kept_name(&list.name, false) {
                         return Err(kept.to_string());
                     }
                     report.playlist = client.create_playlist(&list.name, &ids).map_err(|e| e.to_string())?.id;
