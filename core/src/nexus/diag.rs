@@ -20,6 +20,7 @@ pub const MAX_ENTRIES: usize = 200;
 pub const MAX_LINE_CHARS: usize = 300;
 pub const CALL_BYTES: usize = 64 * 1024;
 pub const MIN_GAP_MS: u64 = 10 * 60 * 1000;
+pub const FIRST_REPORT_WAIT_MS: u64 = 5 * 60 * 1000;
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_PER_DAY: usize = 30;
 pub const STORED_REPORTS: usize = 31;
@@ -102,7 +103,8 @@ impl Schedule {
         }
     }
 
-    /// Use a rolling 24-hour cap and a full day from first use or the last attempt.
+    /// Use a rolling 24-hour cap. The first report waits five minutes from sign-in,
+    /// and each subsequent daily report waits a full day from the last attempt.
     /// The design does not say how to handle clock changes. Keep the existing
     /// wait for small backward steps, but ignore times more than a day ahead.
     pub fn due(&self, now_ms: u64, enabled: bool, in_use: bool) -> Option<Due> {
@@ -123,7 +125,10 @@ impl Schedule {
         }
         if fault.is_some_and(|at| elapsed(at, now_ms, FAULT_WAIT_MS)) {
             Some(Due::Fault)
-        } else if elapsed(last.unwrap_or(started), now_ms, DAY_MS) {
+        } else if last.map_or_else(
+            || elapsed(started, now_ms, FIRST_REPORT_WAIT_MS),
+            |last| elapsed(last, now_ms, DAY_MS),
+        ) {
             Some(Due::Daily)
         } else {
             None

@@ -88,17 +88,18 @@ fn faults_wait_five_minutes_and_do_not_postpone_each_other() {
 }
 
 #[test]
-fn the_daily_timer_and_every_send_require_use_and_consent() {
+fn first_report_waits_five_minutes_then_the_daily_timer_waits_a_full_day() {
+    let first = AT + 5 * 60 * 1000;
     let mut schedule = Schedule::new(AT).unwrap();
-    assert_eq!(schedule.due(AT + DAY_MS - 1, true, true), None);
-    assert_eq!(schedule.due(AT + DAY_MS, false, true), None);
-    assert_eq!(schedule.due(AT + DAY_MS, true, false), None);
-    assert_eq!(schedule.take_due(AT + DAY_MS, true, true), Some(Due::Daily));
-    assert_eq!(schedule.due(AT + 2 * DAY_MS - 1, true, true), None);
-    assert_eq!(schedule.due(AT + 2 * DAY_MS, true, true), Some(Due::Daily));
-    schedule.note_fault(AT + DAY_MS);
-    assert_eq!(schedule.due(AT + 2 * DAY_MS, false, true), None);
-    assert_eq!(schedule.due(AT + 2 * DAY_MS, true, false), None);
+    assert_eq!(schedule.due(first - 1, true, true), None);
+    assert_eq!(schedule.due(first, false, true), None);
+    assert_eq!(schedule.due(first, true, false), None);
+    assert_eq!(schedule.take_due(first, true, true), Some(Due::Daily));
+    assert_eq!(schedule.due(first + DAY_MS - 1, true, true), None);
+    assert_eq!(schedule.due(first + DAY_MS, true, true), Some(Due::Daily));
+    schedule.note_fault(first);
+    assert_eq!(schedule.due(first + DAY_MS, false, true), None);
+    assert_eq!(schedule.due(first + DAY_MS, true, false), None);
 }
 
 #[test]

@@ -193,6 +193,9 @@ impl Client {
     /// session's check if one is due, the waiting sign-outs).
     pub(super) fn after_reach(&mut self, given: &Given, out: &mut Vec<Do>, why: Reached) {
         let Some(live) = self.live.as_mut() else { return };
+        if why == Reached::Start && live.saved.is_some() {
+            live.diagnostics.signed_in(given.now_ms, out);
+        }
         if live.offline {
             return;
         }
@@ -911,7 +914,7 @@ impl Client {
         }
     }
 
-    fn answered_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, secret: DeviceSecret, outcome: Outcome<SignInAnswer>, _given: &Given, out: &mut Vec<Do>) {
+    fn answered_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, secret: DeviceSecret, outcome: Outcome<SignInAnswer>, given: &Given, out: &mut Vec<Do>) {
         if let Outcome::Done(_, seen) | Outcome::Refused(_, Some(seen)) = &outcome {
             self.saw(&origin.origin().to_string(), seen.backend);
         }
@@ -1000,6 +1003,7 @@ impl Client {
             None => {}
         }
         live.saved = Some(saved);
+        live.diagnostics.signed_in(given.now_ms, out);
         self.set_form(SignInState::Idle, 0);
     }
 

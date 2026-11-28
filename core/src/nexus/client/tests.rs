@@ -2510,9 +2510,12 @@ fn a_hold_is_lifted_only_by_more_of_the_signed_in_accounts_events() {
 fn diagnostics_are_sent_at_their_own_pace() {
     let mut rig = running(4);
     rig.happen(Happened::InUse(true));
-    // Nothing is due yet: the day since first use has not passed, and no fault.
-    rig.now += TICK_MS;
-    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    // Spend the first report so that the next one is due only from the fault.
+    rig.now += diag::FIRST_REPORT_WAIT_MS;
+    let first = rig.now;
+    let read = diag_read_asked(&rig.happen(Happened::Tick)).unwrap();
+    rig.happen(Happened::DiagnosticsRead { read, text: None });
+    rig.now += diag::MIN_GAP_MS;
     // A fault: a few minutes after it, not before.
     let fault = rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
     assert!(matches!(&fault[..], [Do::Keep(Keep::DiagSchedule(schedule))] if schedule.fault_ms == Some(rig.now)), "{fault:?}");
@@ -2521,7 +2524,7 @@ fn diagnostics_are_sent_at_their_own_pace() {
     rig.now += 1;
     let out = rig.happen(Happened::Tick);
     // The attempt is kept before anything is read or sent (C6).
-    let kept = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::DiagSchedule(schedule)) if schedule.attempts == vec![rig.now]));
+    let kept = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::DiagSchedule(schedule)) if schedule.attempts == vec![first, rig.now]));
     let read_at = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::ReadDiagnostics { .. })));
     assert!(kept < read_at);
     assert!(asks(&out).is_empty());
@@ -2630,6 +2633,23 @@ fn diagnostics_wait_for_the_hello_and_send_only_a_report() {
     rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
     rig.now += diag::FAULT_WAIT_MS;
     assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+}
+
+#[test]
+fn diagnostics_wait_five_minutes_from_first_sign_in_not_app_start() {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start(Kept::default());
+    assert!(!out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DiagSchedule(_)))));
+    rig.happen(Happened::InUse(true));
+    rig.now += DAY;
+    let out = rig.sign_in(4);
+    let saved = out.iter().position(|thing| matches!(thing, Do::Keep(Keep::Saved(_)))).unwrap();
+    let schedule = out.iter().position(|thing| matches!(thing, Do::Keep(Keep::DiagSchedule(schedule)) if schedule.started_ms == rig.now)).unwrap();
+    assert!(saved < schedule);
+    rig.now += 5 * 60 * 1000 - 1;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    rig.now += 1;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_some());
 }
 
 #[test]

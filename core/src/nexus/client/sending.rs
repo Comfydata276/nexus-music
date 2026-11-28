@@ -59,7 +59,7 @@ struct Held {
 
 /// Diagnostics, between `start` and `stop`.
 pub(super) struct Diagnostics {
-    schedule: diag::Schedule,
+    schedule: Option<diag::Schedule>,
     /// The person's own choice on this device.
     choice: Option<bool>,
     in_use: bool,
@@ -68,8 +68,8 @@ pub(super) struct Diagnostics {
 }
 
 impl Diagnostics {
-    /// What was kept, or a new schedule from now (kept at once, so that it lasts).
-    pub(super) fn from_kept(choice: Option<bool>, kept: Option<DiagSchedule>, now_ms: u64, out: &mut Vec<Do>) -> Diagnostics {
+    /// The device schedule from an earlier sign-in, if one was kept.
+    pub(super) fn from_kept(choice: Option<bool>, kept: Option<DiagSchedule>, _now_ms: u64, out: &mut Vec<Do>) -> Diagnostics {
         let schedule = match kept {
             Some(kept) => match kept.schedule() {
                 Some(schedule) => Some(schedule),
@@ -80,13 +80,15 @@ impl Diagnostics {
             },
             None => None,
         };
-        let schedule = schedule.unwrap_or_else(|| {
-            // A clock past what C6 takes gives a schedule that is never due.
-            let schedule = diag::Schedule::new(now_ms.min(events::TIME_MAX_MS)).unwrap_or_else(|| diag::Schedule::new(events::TIME_MAX_MS).expect("the last time is a time"));
-            out.push(Do::Keep(Keep::DiagSchedule(DiagSchedule::of(&schedule))));
-            schedule
-        });
         Diagnostics { schedule, choice, in_use: false, reading: None }
+    }
+
+    pub(super) fn signed_in(&mut self, now_ms: u64, out: &mut Vec<Do>) {
+        if self.schedule.is_none() {
+            let schedule = diag::Schedule::new(now_ms.min(events::TIME_MAX_MS)).expect("a valid time");
+            out.push(Do::Keep(Keep::DiagSchedule(DiagSchedule::of(&schedule))));
+            self.schedule = Some(schedule);
+        }
     }
 }
 
@@ -407,10 +409,11 @@ impl Client {
         let Some(live) = self.live.as_mut() else { return };
         let diagnostics = &mut live.diagnostics;
         let enabled = diag::enabled(diagnostics.choice, default);
-        if diagnostics.schedule.take_due(given.now_ms, enabled, diagnostics.in_use).is_none() {
+        let Some(schedule) = diagnostics.schedule.as_mut() else { return };
+        if schedule.take_due(given.now_ms, enabled, diagnostics.in_use).is_none() {
             return;
         }
-        out.push(Do::Keep(Keep::DiagSchedule(DiagSchedule::of(&diagnostics.schedule))));
+        out.push(Do::Keep(Keep::DiagSchedule(DiagSchedule::of(schedule))));
         let read = self.next_read();
         if let Some(live) = self.live.as_mut() {
             live.diagnostics.reading = Some(read);
@@ -444,9 +447,10 @@ impl Client {
 
     pub(super) fn diagnostics_fault(&mut self, at_ms: u64, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
-        let before = DiagSchedule::of(&live.diagnostics.schedule);
-        live.diagnostics.schedule.note_fault(at_ms);
-        let after = DiagSchedule::of(&live.diagnostics.schedule);
+        let Some(schedule) = live.diagnostics.schedule.as_mut() else { return };
+        let before = DiagSchedule::of(schedule);
+        schedule.note_fault(at_ms);
+        let after = DiagSchedule::of(schedule);
         if after != before {
             out.push(Do::Keep(Keep::DiagSchedule(after)));
         }
