@@ -7,7 +7,7 @@ use super::wire::{self, Fields, object, plain_json, read_text, write_backend, wr
 pub use super::wire::{BODY_MAX_BYTES, BadMessage, WireBody, encode, read};
 use serde::{Serialize, Serializer};
 use serde_json::value::RawValue;
-use sha2::digest::{CtOutput, Output, OutputSizeUser, array::ArraySize, consts::{U8, U12, U16, U32, U512}};
+use sha2::digest::{CtOutput, Output, OutputSizeUser, array::ArraySize, consts::{U8, U12, U16, U32, U64, U512}};
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::Ipv6Addr;
@@ -35,7 +35,8 @@ pub const CODE_ALPHABET: &[u8] = b"CDFHJKMNPRUVWXY346789";
 // the design does not say the field ceilings. Names are counted as UTF-8 bytes.
 pub const NAME_MAX_BYTES: usize = 128;
 pub const MUSIC_ADDRESS_MAX_BYTES: usize = 2048;
-pub const SALT_LENGTH: usize = 16;
+pub const SALT_BYTES: usize = 32;
+pub const SALT_LENGTH: usize = 2 * SALT_BYTES;
 pub const TOKEN_BYTES: usize = 16;
 pub const DEVICES_PER_PAGE: usize = 256;
 
@@ -285,8 +286,8 @@ impl Session {
 /// CODE_ALPHABET. This constructor does not make random choices.
 pub struct OneTimeCode(Zeroizing<[u8; CODE_LENGTH]>);
 
-/// §9.4. the design does not say the salt's form. Use the 16 ASCII letters or digits that
-/// the existing app uses when it makes a salt.
+/// §9.4. the design does not say the salt's form or its module. Keep the music
+/// prover's spelling of 32 random bytes as 64 lower-case hex digits.
 #[derive(Clone)]
 pub struct MusicSalt(Zeroizing<[u8; SALT_LENGTH]>);
 
@@ -336,7 +337,23 @@ macro_rules! text_secret {
 }
 
 text_secret!(OneTimeCode, CODE_LENGTH, U12, |byte| CODE_ALPHABET.contains(byte));
-text_secret!(MusicSalt, SALT_LENGTH, U16, u8::is_ascii_alphanumeric);
+text_secret!(MusicSalt, SALT_LENGTH, U64, |byte| lower_hex(*byte).is_some());
+
+impl MusicSalt {
+    pub fn from_random(bytes: [u8; SALT_BYTES]) -> Self {
+        let bytes = Zeroizing::new(bytes);
+        let hex = hex_text(bytes.as_ref());
+        let mut text = Zeroizing::new([0; SALT_LENGTH]);
+        for (out, byte) in text.iter_mut().zip(hex.bytes()) {
+            *out = byte;
+        }
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.expose()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -377,19 +394,44 @@ impl MusicAddress {
     }
 }
 
-/// A device number is never zero. the design does not say its wire type; use the kept
-/// state's u64 device numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct DeviceId(u64);
+// the design does not say the number representation. Use kept's nonzero u64
+// identifiers. Zero remains available to kept for an unassigned row.
+macro_rules! number_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(u64);
 
-impl DeviceId {
-    pub fn new(number: u64) -> Option<Self> {
-        (number > 0).then_some(Self(number))
-    }
-    pub fn get(self) -> u64 {
-        self.0
-    }
+        impl $name {
+            pub fn new(number: u64) -> Option<Self> {
+                (number != 0).then_some(Self(number))
+            }
+
+            pub fn get(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl wire::Value for $name {
+            fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+                Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
+            }
+        }
+    };
+}
+
+number_id! {
+    /// The account's immutable number, never reassigned on this backend.
+    AccountId
+}
+number_id! {
+    /// The device's number.
+    DeviceId
+}
+number_id! {
+    /// The identity issued to one session. The bearer is a separate secret.
+    SessionId
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -424,7 +466,7 @@ object! {
     }
 }
 
-object! { Person { email: Email, name: Name, admin: bool } }
+object! { Person { id: AccountId, revision: u64, email: Email, name: Name, admin: bool } }
 object! { MusicLogin { address: MusicAddress, name: Name, salt: MusicSalt, token: MusicToken, count: u64 } }
 
 // §13.6. the design does not say the notice's wire type. Use bounded text, leaving
@@ -466,7 +508,7 @@ object! {
         #[serde(serialize_with = "write_backend")]
         backend: BackendId,
         restore: u64,
-        account: Email,
+        account: AccountId,
         life: u64,
         change: u64,
         tag: StampTag,
@@ -669,12 +711,6 @@ text_value!(DeviceKind, |text| match text {
     _ => None,
 });
 
-impl wire::Value for DeviceId {
-    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
-    }
-}
-
 impl wire::Value for RequestId {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
         Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
@@ -770,8 +806,8 @@ impl ReplyResult for MusicLogin {
 impl ReplyResult for SignInAnswer {
     fn agrees(&self, receipt: &Receipt) -> bool {
         match self {
-            Self::SignedIn(reply) => reply.person.email == receipt.stamp.account && reply.music.agrees(receipt),
-            Self::PasswordSetup(reply) => reply.person.email == receipt.stamp.account,
+            Self::SignedIn(reply) => reply.person.id == receipt.stamp.account && reply.music.agrees(receipt),
+            Self::PasswordSetup(reply) => reply.person.id == receipt.stamp.account,
         }
     }
 }
