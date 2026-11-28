@@ -153,9 +153,21 @@ fn sign_in(keeper: &mut Keeper, account: u64, secret: u8, pass: u8, session: u8,
 }
 
 /// A new account's person chooses a password with the code they were given, then signs in.
+/// The fingerprint of a one-time code as the data keeps it, found as S8 finds it: by the
+/// code typed, among the account's codes. None if the data has no such code (finding 11).
+fn stored_code(keeper: &Keeper, account: u64, code: u8) -> Option<Fingerprint> {
+    let typed = [code; SECRET_BYTES];
+    let found: Option<Vec<u8>> = keeper
+        .data()
+        .connection()
+        .query_row("SELECT code FROM codes WHERE account = ?1 AND code = ?2", rusqlite::params![account as i64, typed.as_slice()], |row| row.get(0))
+        .ok();
+    found.map(|bytes| Fingerprint::from_bytes(bytes.try_into().unwrap()))
+}
+
 fn first_password(keeper: &mut Keeper, account: u64, secret: u8, code: u8, pass: u8, session: u8, now: u64) -> Result<u64, Failed> {
     let vacant = keeper.vacant_device();
-    let code_fp = Fingerprint::from_bytes([code; SECRET_BYTES]);
+    let code_fp = stored_code(keeper, account, code).ok_or_else(|| Failed("no such code in the data".into()))?;
     let check = decide(keeper, account, now, &[], |turn| turn.check_code(&DeviceSecret::new([secret; SECRET_BYTES]), vacant, code_fp.clone()))?.map_err(failed)?;
     let receipt = check.check(code_fp, keeper.clock(now)).map_err(failed)?;
     let restricted = fp(200);
@@ -246,6 +258,11 @@ fn reads(keeper: &mut Keeper, account: u64, device: u64, session: u8, now: u64) 
     let held = fp(session);
     let (restore, clock) = (keeper.restore(), keeper.clock(now));
     matches!(loaded.request(restore, clock, |turn| turn.arrive(bearer(device, &held), Access::Read).map(|_| ())).apply(|_| Ok::<_, ()>(())), Ok(Ok(())))
+}
+
+/// When the data says a device was last heard from.
+fn last_heard(keeper: &Keeper, device: u64) -> Option<u64> {
+    keeper.data().connection().query_row("SELECT last_heard FROM devices WHERE id = ?1", [device as i64], |row| row.get::<_, Option<i64>>(0)).unwrap().map(|at| at as u64)
 }
 
 fn readers(keeper: &mut Keeper, ids: &Ids, now: u64) -> Vec<u8> {
@@ -364,6 +381,7 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
         "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
+        "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         "put-back" => keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0),
         "put-back with a reader" => {
@@ -540,20 +558,25 @@ fn a_change_under_leave_cut_at_any_point_holds_once_the_store_has_it() {
     };
     let changing = with_leave("leave-password", LeaveFor::ChangePassword);
     at_every_point("a password changed", &changing, |root, cut| {
-        let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
-        let read = readers(&mut keeper, &ids, T0 + 21 * MINUTE);
+        // Within the grant's life (granted at T0 + 4 minutes, for LEAVE_MS).
+        let (mut keeper, _) = settled(root, T0 + 6 * MINUTE);
+        let read = readers(&mut keeper, &ids, T0 + 6 * MINUTE);
         let alice = state(&mut keeper, ALICE).unwrap();
         if cut.took() || cut.whole() {
             // Her other device is signed out, and the old password never works again.
             assert!(!read.contains(&3), "{read:?} at {}", cut.at);
             assert_eq!(alice.password_changes, 2, "at {}", cut.at);
-            assert!(sign_in(&mut keeper, ALICE, 13, 12, 8, T0 + 21 * MINUTE).is_err(), "the old password signed in at {}", cut.at);
+            assert!(sign_in(&mut keeper, ALICE, 13, 12, 8, T0 + 6 * MINUTE).is_err(), "the old password signed in at {}", cut.at);
+            // The grant was spent: tried again while it would still be live, it is refused.
+            let (held, chosen) = (fp(1), password(15));
+            let again = decide(&mut keeper, ALICE, T0 + 6 * MINUTE, &[Change::Password { account: ALICE, password: Some(&chosen) }], |turn| turn.change_password(bearer(ids.a1, &held)));
+            assert!(!matches!(again, Ok(Ok(()))), "at {}: a spent grant changed the password again", cut.at);
         } else {
             assert_eq!((alice.password_changes, read.contains(&3)), (1, true), "at {}", cut.at);
         }
         if cut.whole() {
             assert!(read.contains(&1));
-            sign_in(&mut keeper, ALICE, 13, 14, 8, T0 + 21 * MINUTE).unwrap();
+            sign_in(&mut keeper, ALICE, 13, 14, 8, T0 + 6 * MINUTE).unwrap();
         }
     });
     let deleting = with_leave("leave-history", LeaveFor::DeleteHistory);
@@ -583,6 +606,10 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
             assert_eq!(read.contains(&5), !done, "{scenario}: {read:?} at {}", cut.at);
             assert!(read.contains(&1) && read.contains(&3), "{scenario}: {read:?}");
             if done {
+                // The grant was spent: the same action again, while it would still be live,
+                // is refused (finding 11).
+                let again = administer(&mut keeper, &ids, action, ALICE, &[], T0 + 6 * MINUTE);
+                assert!(again.is_err(), "{scenario} at {}: a spent grant was used again", cut.at);
                 match scenario {
                     "an account switched off" => assert_eq!(bob.map(|bob| bob.status), Some(Status::Off)),
                     "an account deleted" => assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "at {}", cut.at),
@@ -600,9 +627,15 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
 fn a_change_the_data_alone_has_cut_at_any_point_leaves_both_agreeing() {
     let setup = Root::new("heard");
     let ids = world(&setup);
-    at_every_point("a device heard from", &setup, |root, _| {
+    at_every_point("a device heard from", &setup, |root, cut| {
         let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
         assert_eq!(readers(&mut keeper, &ids, T0 + 21 * MINUTE), [30, 1, 3, 5]);
+        // The step itself, in the data: all of it or none (finding 11).
+        let heard = last_heard(&keeper, ids.b1);
+        assert!(heard.is_none() || heard == Some(T0 + 7 * MINUTE), "at {}: {heard:?}", cut.at);
+        if cut.whole() || cut.points[..cut.at].iter().any(|point| point == "data: committed") {
+            assert_eq!(heard, Some(T0 + 7 * MINUTE), "at {}", cut.at);
+        }
     });
 }
 
@@ -821,6 +854,9 @@ fn what_was_taken_away_since_a_copy_is_taken_away_again_when_it_is_put_back() {
                 let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
                 let answer = decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&DeviceSecret::new([51; SECRET_BYTES]), vacant, code.clone())).unwrap();
                 assert!(answer.is_err(), "a used code was taken again");
+                // And the copy's code itself is gone from the data (finding 11).
+                assert!(stored_code(&keeper, carol, 44).is_none(), "the used code's fingerprint is back in the data");
+                assert!(first_password(&mut keeper, carol, 51, 44, 52, 53, now).is_err());
             }
             _ => assert!(bob.unwrap().history_held, "listening data deleted since is held"),
         }
@@ -838,10 +874,12 @@ fn a_change_the_data_alone_has_is_seen_once_the_store_has_its_mark() {
     let copy = snapshot(&root, &["nexus.db"]);
     let mut keeper = opened(&root, T0 + 2 * MINUTE);
     keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(last_heard(&keeper, ids.b1), Some(T0 + 2 * MINUTE), "the step was not written");
     keeper.close();
     put_by_hand(&root, &copy);
     let (keeper, started) = settled(&root, T0 + 3 * MINUTE);
     assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+    assert_eq!(last_heard(&keeper, ids.b1), None, "the copy is from before it");
     keeper.close();
     // Within the minute, the store has not heard: the same age to the comparison. The design
     // gives that case to a device's stamp (12.4).
@@ -1112,8 +1150,35 @@ fn a_full_store_folder_at_each_write_fails_that_step_and_leaves_both_agreeing() 
             let (mut keeper, _) = settled(&root, T0 + 20 * MINUTE);
             let read = readers(&mut keeper, &ids, T0 + 21 * MINUTE);
             assert!(read.contains(&5) && read.contains(&30), "{scenario} at {at}: {read:?}");
+            // What the step was for (finding 11): a failed step never gives; what it takes
+            // away is taken once the store's first write of it was in place.
+            let cut = Cut { at, points: points.clone() };
+            match *scenario {
+                // Given only once the store's last write of it is in place (its answer, not
+                // given, never reaches the device).
+                "signing in" => assert_eq!(read.contains(&7), cut.gave(), "{scenario} failing at {at}: {read:?}"),
+                "signing out" => assert_eq!(read.contains(&1), !cut.took(), "{scenario} failing at {at}: {read:?}"),
+                "forcing out" => assert_eq!(read.contains(&3), !cut.took(), "{scenario} failing at {at}: {read:?}"),
+                _ => {}
+            }
         }
     }
+}
+
+#[test]
+fn a_full_data_disk_fails_a_real_transaction_and_leaves_nothing_half_done() {
+    // Room for the file SQLite shares between connections (32 KiB) and no more: the step that
+    // makes an account with a 40 KiB name to show cannot be written ahead, and fails as on a
+    // full disk; the backend says so, and nothing of it is kept (finding 11).
+    let setup = Root::new("full-data-real");
+    let ids = world(&setup);
+    let (_, _) = child("a large account made", &setup, 0, 0, Some(64));
+    let outcome = fs::read_to_string(setup.path.join("outcome")).unwrap_or_else(|_| "(no outcome)".into());
+    assert!(outcome.starts_with("Err") && outcome.contains("The data couldn't be written"), "{outcome}");
+    let (mut keeper, _) = settled(&setup, T0 + 20 * MINUTE);
+    assert_eq!(keeper.account_named("large@example.org").unwrap(), None);
+    assert_eq!(readers(&mut keeper, &ids, T0 + 21 * MINUTE), [30, 1, 3, 5]);
+    keeper.close();
 }
 
 #[test]
@@ -1136,8 +1201,8 @@ fn a_full_data_disk_fails_writes_and_leaves_nothing_half_done() {
 }
 
 #[test]
-fn opening_and_reading_the_data_writes_nothing() {
-    let root = Root::new("read-only");
+fn opening_and_reading_writes_neither_store() {
+    let root = Root::new("reading");
     let ids = world(&root);
     let mut keeper = opened(&root, T0 + 5 * MINUTE);
     let _ = readers(&mut keeper, &ids, T0 + 5 * MINUTE);
@@ -1460,4 +1525,3 @@ fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
     assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
     assert_eq!(names(&one), before);
 }
-
