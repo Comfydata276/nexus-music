@@ -27,6 +27,7 @@ thread_local! {
 }
 
 static CHECKPOINT_PENDING: AtomicBool = AtomicBool::new(false);
+const RECORD_FILE: &str = "diagnostics-record.txt";
 
 // Keep report building and file I/O off the window thread. One worker keeps repeated
 // exports and previews in the order they were requested.
@@ -53,6 +54,12 @@ pub fn finish(ctl: &Controller) {
 
 pub fn install(ctl: &Controller) {
     static PREVIEW: AtomicU64 = AtomicU64::new(0);
+    let paths = ctl.paths.clone();
+    worker().spawn(move || {
+        if let Some(folder) = paths.crash_log.parent() {
+            config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
+        }
+    });
     sending::install(ctl);
     ctl.ui.global::<ui::Settings>().on_preview_diagnostics(|| {
         with(|ctl| {
@@ -270,7 +277,7 @@ impl ReportStore {
 }
 
 fn record_path(paths: &config::Paths) -> std::path::PathBuf {
-    paths.crash_log.with_file_name("diagnostics-record.txt")
+    paths.crash_log.with_file_name(RECORD_FILE)
 }
 
 fn checkpoint(paths: &config::Paths, session: Session) -> std::io::Result<()> {

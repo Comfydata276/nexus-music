@@ -18,6 +18,9 @@ use slint::ComponentHandle;
 use super::{STORE, read_limited, report_text, worker};
 use crate::{config, controller::{Controller, post, with}, ui};
 
+const CHOICE_FILE: &str = "diagnostics-choice.json";
+const SCHEDULE_FILE: &str = "diagnostics-schedule.json";
+
 type Account = (String, BackendId);
 type EventSink = Rc<dyn Fn(Happened)>;
 
@@ -64,6 +67,9 @@ pub(super) fn install(ctl: &Controller) {
     paint();
     let paths = ctl.paths.clone();
     on_worker(move || {
+        if let Some(folder) = paths.settings.parent() {
+            config::clear_leftovers(folder, |name| matches!(name, CHOICE_FILE | SCHEDULE_FILE), &[]);
+        }
         let choice = read_profile::<bool>(&choice_path(&paths), 8).ok().flatten();
         post(move |_| {
             SETTINGS.with_borrow_mut(|state| {
@@ -183,11 +189,11 @@ pub(crate) fn on_worker(job: impl FnOnce() + Send + 'static) {
 }
 
 fn choice_path(paths: &config::Paths) -> PathBuf {
-    paths.settings.with_file_name("diagnostics-choice.json")
+    paths.settings.with_file_name(CHOICE_FILE)
 }
 
 fn schedule_path(paths: &config::Paths) -> PathBuf {
-    paths.settings.with_file_name("diagnostics-schedule.json")
+    paths.settings.with_file_name(SCHEDULE_FILE)
 }
 
 fn read_profile<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> io::Result<Option<T>> {
