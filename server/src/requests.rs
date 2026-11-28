@@ -290,7 +290,7 @@ impl Requests {
             let now = clock();
             let (_, device, account, kind) = events::authenticated(keeper, &head, &ingress.hash, Access::Read, now)?;
             ingress.check(&account, device, kind)?;
-            let actor = Actor { account: account.state().id, session: ingress.caller.session, admin: account.state().admin,
+            let actor = Actor { account: account.state().id, session: ingress.caller.session, admin_page: kind == SessionKind::AdminPage && account.state().admin,
                 restore: head.restore, now: keeper.clock(now).effective() };
             let done = step(keeper, actor)?;
             Ok((done, events::receipt(keeper, account.state())?))
@@ -336,7 +336,7 @@ impl Ingress {
 struct Actor {
     account: AccountId,
     session: SessionId,
-    admin: bool,
+    admin_page: bool,
     restore: u64,
     now: u64,
 }
@@ -919,7 +919,7 @@ struct Job {
     row: i64,
     account: AccountId,
     restore: u64,
-    admin: bool,
+    admin_page: bool,
     change: Change,
     plan: Plan,
     recovering: bool,
@@ -1091,15 +1091,15 @@ fn keep_line(db: &Connection, row: i64, index: u16, text: &str) -> rusqlite::Res
     )
 }
 
-fn submitting_session_live(
+fn submitting_session_kind(
     keeper: &Keeper, actor: &mut Account, session: i64, now: u64,
-) -> Result<bool, Refusal> {
+) -> Result<Option<SessionKind>, Refusal> {
     let session = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
     let live = rows::session_by_id(keeper.data().connection(), session).map_err(sql_error)?;
-    Ok(live.is_some_and(|(number, device, hash, _)| {
-        number == actor.state().id.get() &&
-        events::inspect_session(keeper, actor, device, &Fingerprint::from_bytes(hash), now).is_ok()
-    }))
+    Ok(live.filter(|(number, ..)| *number == actor.state().id.get())
+        .and_then(|(_, device, hash, _)| {
+            events::inspect_session(keeper, actor, device, &Fingerprint::from_bytes(hash), now).ok()
+        }))
 }
 
 fn close_parked_lines(keeper: &mut Keeper, now: u64) -> Result<(), Refusal> {
@@ -1119,7 +1119,7 @@ fn close_parked_lines(keeper: &mut Keeper, now: u64) -> Result<(), Refusal> {
         let account = unsigned(account)?;
         let session_live = if rows::account_exists(keeper.data().connection(), account).map_err(sql_error)? {
             let mut actor = keeper.load(account).map_err(|_| Refusal::NotDealtWith)?;
-            submitting_session_live(keeper, &mut actor, session, now)?
+            submitting_session_kind(keeper, &mut actor, session, now)?.is_some()
         } else {
             false
         };
@@ -1274,23 +1274,23 @@ fn owner_view(
             let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.as_str()).collect::<Vec<_>>())?;
             albums.retain_mut(|album| {
                 let requesters = known.get(album.album.as_str()).map(Vec::as_slice).unwrap_or_default();
-                album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin, requesters).is_ok();
-                actor.admin || requesters.iter().any(|&(id, _)| id == actor.account)
+                album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin_page, requesters).is_ok();
+                actor.admin_page || requesters.iter().any(|&(id, _)| id == actor.account)
             });
         }
-        Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin => {
+        Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.0.as_str()).collect::<Vec<_>>())?;
             for album in albums {
                 album.requested &= mine(&known, &album.album.0);
             }
         }
-        Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } if !actor.admin => {
+        Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &albums.iter().map(|release| release.album.album.0.as_str()).collect::<Vec<_>>())?;
             for release in albums {
                 release.album.requested &= mine(&known, &release.album.album.0);
             }
         }
-        Answer::Listed { releases, .. } if !actor.admin => {
+        Answer::Listed { releases, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &releases.iter().map(|release| release.album.as_str()).collect::<Vec<_>>())?;
             for release in releases {
                 release.wanted &= mine(&known, &release.album);
@@ -1393,12 +1393,12 @@ impl Requests {
                     return Ok(Dispatch::Done(Answer::Begun { job }));
                 }
                 if let Change::Cancel { release, .. } = &change {
-                    let known = if actor.admin {
+                    let known = if actor.admin_page {
                         HashMap::new()
                     } else {
                         owners(db, &binding, actor.account, &[release.as_str()])?
                     };
-                    wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin,
+                    wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin_page,
                         known.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
                 }
                 let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
@@ -1555,19 +1555,22 @@ impl Requests {
         let account_id = actor.state().id;
         let allowed = (|| {
             access(keeper, account_id)?.check()?;
-            if actor.state().status != Status::On ||
-                (!matches!(&change, Change::Batch { .. }) && !submitting_session_live(keeper, &mut actor, session, now)?)
-            {
+            if actor.state().status != Status::On {
                 return Err(Refusal::NotSignedIn);
             }
+            let kind = if matches!(&change, Change::Batch { .. }) {
+                None
+            } else {
+                Some(submitting_session_kind(keeper, &mut actor, session, now)?.ok_or(Refusal::NotSignedIn)?)
+            };
             let key = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
             if plan.binding != binding(endpoint) || plan.revision != key.revision {
                 return Err(Refusal::LidarrNotSetUp);
             }
-            Ok(key)
+            Ok((key, kind == Some(SessionKind::AdminPage) && actor.state().admin))
         })();
-        let key = match allowed {
-            Ok(key) => key,
+        let (key, admin_page) = match allowed {
+            Ok(allowed) => allowed,
             Err(reason) => {
                 finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)?;
                 self.wake.notify_one();
@@ -1584,7 +1587,7 @@ impl Requests {
             row,
             account: account_id,
             restore,
-            admin: actor.state().admin,
+            admin_page,
             change,
             plan,
             recovering: stage == MAY_HAVE_CHANGED,
@@ -2048,14 +2051,14 @@ impl Job {
                 check_pending_target(lidarr, *album, release)?;
                 let binding = self.plan.binding;
                 let account = self.account;
-                let admin = self.admin;
+                let admin_page = self.admin_page;
                 let target = release.clone();
                 journal.ask(move |keeper, _, _| {
                     let current = keeper.load(account.get()).map_err(|_| Refusal::NotAllowed)?;
                     let db = keeper.data().connection();
                     let access = access(keeper, account)?;
                     let owners = owners(db, &binding, account, &[target.as_str()])?;
-                    wire::may_cancel(access, account, admin && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
+                    wire::may_cancel(access, account, admin_page && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
                 })?;
                 lidarr_result(lidarr.cancel((*album).into()), None)?;
                 Ok((Completed::Cancelled, Vec::new(), Some(release.clone())))

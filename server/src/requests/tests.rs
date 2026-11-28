@@ -848,8 +848,10 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     assert_eq!(server.post(wire::ADMIN_ATTRIBUTION, Some(&first.signed_in), TEST_PAGE, read.bytes()).0, 403);
     assert!(matches!(server.call(&first, begin(2, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
     let admin_app = server.admin_app(&admin);
-    let cancel = begun(server.call(&admin_app, begin(1, cancelled())));
-    assert_eq!(server.done(&admin_app, cancel), Completed::Cancelled);
+    assert!(matches!(server.call(&admin_app, begin(1, cancelled())),
+        Answer::Refused { reason: Refusal::AskedByOthers }));
+    let cancel = begun(server.call(&admin, begin(1, cancelled())));
+    assert_eq!(server.done(&admin, cancel), Completed::Cancelled);
     assert!(matches!(server.call(&first, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
     assert!(!lidarr.take_calls().iter().any(|line| line == "POST command"));
 
@@ -866,7 +868,7 @@ fn a_finished_job_releases_its_worker_before_reporting_completion() {
     let actor = Actor {
         account: AccountId::new(1).unwrap(),
         session: SessionId::new(1).unwrap(),
-        admin: false,
+        admin_page: false,
         restore: keeper.restore(),
         now: now(),
     };
@@ -994,8 +996,10 @@ fn asking_for_an_already_monitored_album_does_not_grant_removal() {
     assert!(lock(&lidarr.state).monitored);
     assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ") || call.starts_with("POST ")));
     let admin_app = server.admin_app(&admin);
-    let job = begun(server.call(&admin_app, begin(1, cancelled())));
-    assert_eq!(server.done(&admin_app, job), Completed::Cancelled);
+    assert!(matches!(server.call(&admin_app, begin(1, cancelled())),
+        Answer::Refused { reason: Refusal::AskedByOthers }));
+    let job = begun(server.call(&admin, begin(1, cancelled())));
+    assert_eq!(server.done(&admin, job), Completed::Cancelled);
 }
 
 #[test]
@@ -1849,7 +1853,7 @@ fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
         thread::sleep(Duration::from_millis(30));
     }
     let second = loop {
-        match server.call(&admin, begin(2, cancelled())) {
+        match server.call(&page, begin(2, cancelled())) {
             Answer::Begun { job } => break job,
             Answer::Refused { reason: Refusal::Busy } if Instant::now() < until => {
                 thread::sleep(Duration::from_millis(30));
@@ -1857,7 +1861,7 @@ fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
             _ => panic!("the parked batch held the account's place"),
         }
     };
-    assert_eq!(server.outcome(&admin, second), Err(Refusal::NoLongerListed));
+    assert_eq!(server.outcome(&page, second), Err(Refusal::NoLongerListed));
     // Include the keeper's one-minute clock allowance after opening the store.
     offset.store((wire::RESOLUTION_WAIT_SECONDS + 61) * 1000, Ordering::Relaxed);
     assert!(matches!(server.call(&admin, Call::ResolveBatchLine { job, index: 0, release: MusicBrainzId::new(ALBUM) }),
@@ -1962,4 +1966,34 @@ fn batch_keeps_its_original_lines_and_exact_device_resolution_across_restart() {
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&call| call == "POST command").count(), 1);
     assert_eq!(calls.iter().filter(|&call| call == &format!("GET album/lookup?term=lidarr%3A{ALBUM}")).count(), 1);
+}
+
+#[test]
+fn only_an_admin_page_can_remove_another_accounts_placement() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("placement-scope", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&page);
+    let admin = server.admin_app(&page);
+    let member = server.redeem(member, 2, "");
+
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+    assert!(matches!(server.call(&admin, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.iter().all(|album| !album.removable)));
+    assert!(matches!(server.call(&admin, begin(1, cancelled())),
+        Answer::Refused { reason: Refusal::AskedByOthers }));
+    assert!(matches!(server.call(&page, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable));
+    let job = begun(server.call(&page, begin(1, cancelled())));
+    assert_eq!(server.done(&page, job), Completed::Cancelled);
+
+    let offer = server.offer(&admin);
+    let job = begun(server.call(&admin, begin(2, Change::Request { offer })));
+    assert_eq!(server.done(&admin, job), Completed::Requested { placed: true });
+    assert!(matches!(server.call(&admin, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable));
+    let job = begun(server.call(&admin, begin(3, cancelled())));
+    assert_eq!(server.done(&admin, job), Completed::Cancelled);
 }
