@@ -46,7 +46,6 @@ pub const REPLY_MAX_BYTES: usize = account::SMALL_REPLY_MAX_BYTES;
 pub const LIST_REPLY_MAX_BYTES: usize = account::LIST_REPLY_MAX_BYTES;
 pub const ACCOUNTS_PER_PAGE: usize = 500;
 pub const DEVICES_PER_PAGE: usize = 500;
-pub const GRANT_LIFETIME_MS: u64 = account::PASSWORD_LEAVE_MS;
 pub const REQUESTS_DEFAULT_ENABLED: bool = true;
 pub const DIAGNOSTICS_DEFAULT_ENABLED: bool = true;
 pub const PAGE_SESSION_IDLE_MS: u64 = 30 * 60 * 1000;
@@ -253,12 +252,14 @@ object! { NewAccount { email: Email, name: Name } }
 object! { AccountEnabled { account: AccountId, enabled: bool } }
 object! { AdminRole { account: AccountId, admin: bool } }
 object! { AccountTarget { account: AccountId } }
-object! { MusicServerAddress { internal: InternalAddress, public: MusicAddress } }
+object! {
+    /// The address people use. The backend's internal address is set by NEXUS_MUSIC_SERVER.
+    MusicServerAddress { public: MusicAddress }
+}
 object! { TypedMusicLogin { account: AccountId, name: Name, password: MusicPassword } }
 object! { SessionTarget { account: AccountId, device: DeviceId, session: SessionId } }
 object! { RequestsEnabled { account: AccountId, enabled: bool } }
 object! { Applied {} }
-object! { MusicServerSetting {} }
 
 /// the design does not say how a code-bearing reply is retried without showing
 /// the code twice. Persist only the result with the code set to AlreadyShown.
@@ -301,7 +302,7 @@ pub enum Action {
     SetAdmin(AdminRole),
     DeleteAccount(AccountId),
     ResetPassword(AccountId),
-    SetMusicServer(MusicServerSetting),
+    SetMusicServer(MusicAddress),
     SetMusicLogin(AccountId),
     ForceOut(SessionTarget),
     SetDiagnosticsDefault(DiagnosticsDefault),
@@ -321,7 +322,7 @@ impl wire::Value for Action {
             "set_admin" => AdminRole::read(value).map(Self::SetAdmin),
             "delete_account" => AccountId::read(value).map(Self::DeleteAccount),
             "reset_password" => AccountId::read(value).map(Self::ResetPassword),
-            "set_music_server" => MusicServerSetting::read(value).map(Self::SetMusicServer),
+            "set_music_server" => MusicAddress::read(value).map(Self::SetMusicServer),
             "set_music_login" => AccountId::read(value).map(Self::SetMusicLogin),
             "force_out" => SessionTarget::read(value).map(Self::ForceOut),
             "set_diagnostics_default" => DiagnosticsDefault::read(value).map(Self::SetDiagnosticsDefault),
@@ -336,91 +337,6 @@ impl wire::Value for Action {
 object! { NamedChange { request_id: RequestId, action: Action } }
 
 pub type RequestGrant = GrantRequest<NamedChange>;
-
-/// All fields are from authenticated backend state, checked again at issuance
-/// and at spend. The caller supplies time under the store's nondecreasing clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GrantContext {
-    pub restore: u64,
-    pub account: AccountId,
-    pub revision: u64,
-    pub session: SessionId,
-    pub enabled: bool,
-    pub admin: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantError {
-    NotAllowed,
-    Changed,
-    Expired,
-    WrongChange,
-    Used,
-}
-
-#[derive(Debug)]
-pub struct Grant {
-    context: GrantContext,
-    issued_ms: u64,
-    request_id: RequestId,
-    action: Action,
-    used: bool,
-}
-
-fn fresh(at: u64, now: u64) -> bool {
-    // the design does not say what a backwards clock or the exact end of the
-    // window means. Refuse both. Subtract to avoid an overflowing deadline.
-    now.checked_sub(at).is_some_and(|age| age < GRANT_LIFETIME_MS)
-}
-
-impl Grant {
-    /// Call after a successful password check. Pass the context captured before
-    /// the check, and the current context inside the write transaction.
-    pub fn issue(
-        checked: GrantContext,
-        current: GrantContext,
-        checked_ms: u64,
-        now_ms: u64,
-        request_id: RequestId,
-        action: Action,
-    ) -> Result<Self, GrantError> {
-        if !current.enabled || !current.admin {
-            return Err(GrantError::NotAllowed);
-        }
-        if checked != current {
-            return Err(GrantError::Changed);
-        }
-        if !fresh(checked_ms, now_ms) {
-            return Err(GrantError::Expired);
-        }
-        // the design does not say whether slow issuance extends the freshness of
-        // the proof. Keep the earlier deadline, ten minutes from the check.
-        Ok(Self { context: current, issued_ms: checked_ms, request_id, action, used: false })
-    }
-
-    /// Do this in the same serialized transaction as the mutation, after
-    /// checking for a matching idempotency record. The backend uses the supplied
-    /// token to find this record and commits the spend with the mutation.
-    pub fn spend(&mut self, current: GrantContext, now_ms: u64, request_id: RequestId, action: &Action) -> Result<(), GrantError> {
-        if self.used {
-            return Err(GrantError::Used);
-        }
-        if !current.enabled || !current.admin {
-            return Err(GrantError::NotAllowed);
-        }
-        if current != self.context {
-            return Err(GrantError::Changed);
-        }
-        if !fresh(self.issued_ms, now_ms) {
-            return Err(GrantError::Expired);
-        }
-        if request_id != self.request_id || *action != self.action {
-            return Err(GrantError::WrongChange);
-        }
-        self.used = true;
-        Ok(())
-    }
-}
 
 pub trait Change {
     fn action(&self) -> Action;
@@ -442,7 +358,7 @@ change!(AccountEnabled, v => Action::SetAccountEnabled(AccountEnabled { account:
 change!(AdminRole, v => Action::SetAdmin(AdminRole { account: v.account, admin: v.admin }));
 impl Change for MusicServerAddress {
     fn action(&self) -> Action {
-        Action::SetMusicServer(MusicServerSetting {})
+        Action::SetMusicServer(self.public.clone())
     }
 }
 change!(TypedMusicLogin, v => Action::SetMusicLogin(v.account));
@@ -700,7 +616,7 @@ mod tests {
         write_change(AdminRole { account: account_id(), admin: true });
         write_change(DeleteTarget { account: account_id() });
         write_change(AccountTarget { account: account_id() });
-        write_change(MusicServerAddress { internal: internal(), public: public() });
+        write_change(MusicServerAddress { public: public() });
         write_change(TypedMusicLogin {
             account: account_id(),
             name: Name::new("sample music user").unwrap(),
@@ -840,12 +756,9 @@ mod tests {
         };
         round_trip(grant);
 
-        let internal_prefix = "http://music.test/";
         let public_prefix = "https://music.example.test/";
-        let internal = format!("{internal_prefix}{}", "a".repeat(INTERNAL_ADDRESS_MAX_BYTES - internal_prefix.len()));
         let public = format!("{public_prefix}{}", "a".repeat(account::MUSIC_ADDRESS_MAX_BYTES - public_prefix.len()));
         let request = granted(MusicServerAddress {
-            internal: InternalAddress::new(&internal).unwrap(),
             public: MusicAddress::new(&public).unwrap(),
         });
         assert!(encode(&request).unwrap().bytes().len() > account::SMALL_REQUEST_MAX_BYTES);
@@ -853,51 +766,24 @@ mod tests {
     }
 
     #[test]
-    fn grants_require_recent_password_and_unchanged_active_admin_context() {
-        let context = GrantContext {
-            restore: 2, account: account_id(), revision: 10, session: session_target().session,
-            enabled: true, admin: true,
-        };
-        let request = granted(session_target());
-        let issue = |checked, current, at, now| {
-            Grant::issue(checked, current, at, now, request.request_id, request.change.action())
-        };
-        let at = 1000;
-        assert!(matches!(issue(context, context, at, at - 1), Err(GrantError::Expired)));
-        assert!(matches!(issue(context, context, at, at + GRANT_LIFETIME_MS), Err(GrantError::Expired)));
-        let mut grant = issue(context, context, at, at + 20).unwrap();
-        let spend = |grant: &mut Grant, current, now| {
-            grant.spend(current, now, request.request_id, &request.change.action())
-        };
+    fn wire_grant_targets_distinguish_addresses_accounts_and_toggle_values() {
+        let public = |address| MusicServerAddress { public: MusicAddress::new(address).unwrap() }.action();
+        assert_ne!(public("https://one.example.test"), public("https://two.example.test"));
+        assert_ne!(Action::ResetPassword(account_id()), Action::ResetPassword(AccountId::new(8).unwrap()));
+        assert_ne!(
+            AdminRole { account: account_id(), admin: true }.action(),
+            AdminRole { account: account_id(), admin: false }.action(),
+        );
+        assert_ne!(
+            RequestsEnabled { account: account_id(), enabled: true }.action(),
+            RequestsEnabled { account: account_id(), enabled: false }.action(),
+        );
 
-        for wrong in [
-            GrantContext { restore: 3, ..context },
-            GrantContext { account: AccountId::new(1).unwrap(), ..context },
-            GrantContext { revision: 11, ..context },
-            GrantContext { session: SessionId::new(1).unwrap(), ..context },
-        ] {
-            assert!(matches!(issue(context, wrong, at, at), Err(GrantError::Changed)));
-            assert_eq!(spend(&mut grant, wrong, at), Err(GrantError::Changed));
-        }
-        for inactive in [
-            GrantContext { enabled: false, ..context },
-            GrantContext { admin: false, ..context },
-        ] {
-            assert!(matches!(issue(inactive, inactive, at, at), Err(GrantError::NotAllowed)));
-            assert_eq!(spend(&mut grant, inactive, at), Err(GrantError::NotAllowed));
-        }
-        assert_eq!(spend(&mut grant, context, at + GRANT_LIFETIME_MS), Err(GrantError::Expired));
-        assert_eq!(spend(&mut grant, context, at - 1), Err(GrantError::Expired));
-        let mut new_session = session_target();
-        new_session.session = SessionId::new(123).unwrap();
-        assert_eq!(grant.spend(context, at, request.request_id, &new_session.action()), Err(GrantError::WrongChange));
-        assert_eq!(grant.spend(context, at, request.request_id, &Action::DeleteAccount(account_id())), Err(GrantError::WrongChange));
-        assert_eq!(grant.spend(context, at, RequestId::new(1).unwrap(), &request.change.action()), Err(GrantError::WrongChange));
-        let last = at + GRANT_LIFETIME_MS - 1;
-        assert_eq!(spend(&mut grant, context, last), Ok(()));
-        assert_eq!(spend(&mut grant, context, last), Err(GrantError::Used));
-
-        let mut near_limit = issue(context, context, u64::MAX, u64::MAX).unwrap();
-        assert_eq!(spend(&mut near_limit, context, u64::MAX), Ok(()));
+        let first = NewAccount { email: email(), name: Name::new("One").unwrap() };
+        let second = NewAccount {
+            email: Email::new("someone-else@example.test").unwrap(),
+            name: Name::new("Two").unwrap(),
+        };
+        assert_ne!(first.action(), second.action());
     }
 }
