@@ -356,7 +356,7 @@ impl Client {
                 // The password chosen is held to the rule before the code is spent on it. The
                 // email is not known here: "not the email" is the backend's to check.
                 let Some(new_password) = Password::new(new.expose()) else { return self.set_form(SignInState::PasswordNotAllowed, 0) };
-                match tidy_code(secret.expose()) {
+                match OneTimeCode::typed(secret.expose()) {
                     Some(code) => Pressed::Code { code, new_password },
                     None => return self.set_form(SignInState::WrongLogin, 0),
                 }

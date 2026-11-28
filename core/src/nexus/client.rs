@@ -971,15 +971,6 @@ fn typed_origin(text: &str) -> Result<NexusOrigin, SignInState> {
     })
 }
 
-/// The tidying of a typed one-time code: account's reading (case, and Crockford's I, L and
-/// O), after the spaces and dashes a person may type between groups are taken out.
-// to be account's: `OneTimeCode::new` takes exactly twelve characters; the groups a person
-// types it in are not yet its to take apart.
-fn tidy_code(text: &str) -> Option<OneTimeCode> {
-    let tidied: Zeroizing<String> = Zeroizing::new(text.chars().filter(|c| !matches!(c, ' ' | '-')).collect());
-    OneTimeCode::new(&tidied)
-}
-
 /// Whether what this device kept under the person it was signed in to before this version
 /// (downloads, settings, the queue) becomes the person's who signs in now (11): only if
 /// the music login handed over names the same music server and the same user. Asked once,
