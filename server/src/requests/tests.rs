@@ -1059,6 +1059,8 @@ fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
     server.kill_child();
     let mut keeper = reopen(&server.root);
     keeper.write_data(now(), |tx| {
+        tx.execute("INSERT INTO requests_way_back (binding, artist, artist_key, setting) VALUES (?1, 17, ?2, 'all')",
+            params![binding.as_slice(), ARTIST])?;
         tx.execute("INSERT INTO requests_way_back (binding,artist,artist_key,setting) VALUES (?1,5,?2,'all')",
             params![binding.as_slice(), ARTIST])?;
         Ok(((), true))
@@ -1076,7 +1078,7 @@ fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(lock(&lidarr.state).new_releases.as_deref(), Some("all"));
-    assert_eq!(lidarr.take_calls(), ["GET artist", "GET artist/5", "PUT artist/5"]);
+    assert_eq!(lidarr.take_calls(), ["GET artist", "GET artist", "GET artist/5", "PUT artist/5"]);
 }
 
 fn find_artist_call() -> Call {
@@ -1142,7 +1144,7 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
         let start = Instant::now();
         let _ = server.redeem(other, 3, "");
         assert!(start.elapsed() < Duration::from_secs(3));
-        assert!(matches!(search.join().unwrap(), Answer::Refused { reason: Refusal::LidarrUnavailable }));
+        assert!(matches!(search.join().unwrap(), Answer::FoundArtists { artists, .. } if artists.is_empty()));
     });
     reply.join().unwrap();
 }

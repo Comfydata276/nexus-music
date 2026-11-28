@@ -54,6 +54,9 @@ use crate::events;
 use crate::store::keeper::Keeper;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
+// The released Windows Lidarr line allows 30 seconds for response headers.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(33);
 const UPSTREAM_HEAD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -89,8 +92,9 @@ impl Endpoint {
     }
 
     fn lidarr(&self, runtime: Handle, key: &str, deadline: Option<Instant>) -> Lidarr {
+        let within = deadline.map_or(UPSTREAM_TIMEOUT, |deadline| deadline.saturating_duration_since(Instant::now()));
         Lidarr::new(self.url.as_str(), key, None, Arc::new(Line {
-            endpoint: self.clone(), runtime, deadline, within: UPSTREAM_TIMEOUT, before_write: None,
+            endpoint: self.clone(), runtime, deadline, within, before_write: None,
         }))
     }
 
@@ -233,7 +237,7 @@ pub(crate) struct Requests {
     rooms: Arc<Mutex<Rooms>>,
     books: Mutex<Books>,
     wake: Arc<Notify>,
-    mutation: Mutex<()>,
+    mutation: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Requests {
@@ -246,7 +250,7 @@ impl Requests {
             rooms: Arc::default(),
             books: Mutex::default(),
             wake: Arc::new(Notify::new()),
-            mutation: Mutex::new(()),
+            mutation: Arc::default(),
         })
     }
 
@@ -429,6 +433,13 @@ impl Read {
             Call::Pending { after } => (Self::Pending, after),
             _ => return None,
         })
+    }
+
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::FindReleases(_) | Self::FindAny(_) | Self::FindArtists(_) => SEARCH_TIMEOUT,
+            _ => UPSTREAM_TIMEOUT,
+        }
     }
 
     fn ask(&self, lidarr: &Lidarr) -> Result<Answer, String> {
@@ -1258,7 +1269,7 @@ async fn call(
             let binding = binding(&endpoint);
             let found = tokio::task::spawn_blocking(move || {
                 let _place = place;
-                let lidarr = endpoint.lidarr(runtime, credential.key.expose(), Some(Instant::now() + UPSTREAM_TIMEOUT));
+                let lidarr = endpoint.lidarr(runtime, credential.key.expose(), Some(Instant::now() + for_read.timeout()));
                 for_read.ask(&lidarr).map_err(|error| wire::refusal_for(&error, None))
             }).await.unwrap_or(Err(Refusal::NotDealtWith));
             let state = service.clone();
@@ -1358,20 +1369,23 @@ impl Requests {
             loop {
                 let Some(state) = service.upgrade() else { return };
                 state.restore_at_start().await;
-                loop {
+                // A queued mutation takes no upstream place while the turn is held.
+                if let Ok(turn) = state.mutation.clone().try_lock_owned() {
                     let dispatching = state.clone();
                     let clock = state.accounts.clock.clone();
                     let selected = state.accounts.desk.ask(move |keeper| {
                         dispatching.claim(keeper, clock())
                     }).await;
-                    let Ok(Ok(Some((job, place, credential)))) = selected else { break };
-                    let state = state.clone();
-                    let runtime = Handle::current();
-                    tokio::task::spawn_blocking(move || {
-                        state.run(job, credential, runtime);
-                        drop(place);
-                        state.wake.notify_one();
-                    });
+                    if let Ok(Ok(Some((job, place, credential)))) = selected {
+                        let state = state.clone();
+                        let runtime = Handle::current();
+                        tokio::task::spawn_blocking(move || {
+                            state.run(job, credential, runtime);
+                            drop(place);
+                            drop(turn);
+                            state.wake.notify_one();
+                        });
+                    }
                 }
                 drop(state);
                 let _ = tokio::time::timeout(Duration::from_secs(2), wake.notified()).await;
@@ -1394,6 +1408,7 @@ impl Requests {
             Ok(credential(keeper, &lookup)?.map(|credential| (keeper.restore(), credential)))
         }).await;
         let Ok(Ok::<_, Refusal>(Some((restore, key)))) = found else { return };
+        let Ok(turn) = self.mutation.clone().try_lock_owned() else { return };
         let Some(place) = Place::upstream(self.rooms.clone(), 0) else { return };
         let runtime = Handle::current();
         let journal = Journal {
@@ -1401,7 +1416,7 @@ impl Requests {
         };
         let _ = tokio::task::spawn_blocking(move || {
             let _place = place;
-            let _turn = lock(&journal.service.mutation);
+            let _turn = turn;
             let lidarr = endpoint.lidarr(runtime, key.key.expose(), None);
             journal.restore_pending(&lidarr)
         }).await;
@@ -1483,7 +1498,7 @@ impl Requests {
         }, place, key)))
     }
 
-    fn run(self: &Arc<Self>, job: Job, credential: Credential, runtime: Handle) {
+    fn run(self: &Arc<Self>, mut job: Job, credential: Credential, runtime: Handle) {
         let Some(endpoint) = &self.endpoint else { return };
         let journal = Journal {
             service: self.clone(), runtime: runtime.clone(), binding: job.plan.binding,
@@ -1493,6 +1508,7 @@ impl Requests {
         let ready = Arc::new(AtomicBool::new(job.recovering));
         let pre_write = {
             let journal = journal.clone();
+            let ready = ready.clone();
             Arc::new(move || {
                 if ready.load(Ordering::Relaxed) {
                     return true;
@@ -1519,10 +1535,23 @@ impl Requests {
             }
             return;
         }
-        let _mutation = lock(&self.mutation);
         let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, credential.key.expose(), None));
         let result = cleaned.and_then(|()| {
-            if job.recovering { job.recover(&lidarr) } else { job.run(&journal, &lidarr) }
+            if job.recovering {
+                return job.recover(&lidarr);
+            }
+            let result = job.run(&journal, &lidarr);
+            if result.is_err() && ready.load(Ordering::Relaxed) {
+                // The write may have reached Lidarr before its response was lost.
+                // Recover from the album-level evidence just kept by the writer.
+                if let Ok(plan) = journal.read_plan() {
+                    job.plan = plan;
+                    if let Ok(confirmed) = job.recover(&lidarr) {
+                        return Ok(confirmed);
+                    }
+                }
+            }
+            result
         });
         let account = job.account;
         let binding = job.plan.binding;
@@ -1632,6 +1661,15 @@ impl Journal {
             }
             step(keeper, clock(), row)
         })).map_err(|_| Refusal::Busy)?
+    }
+
+    fn read_plan(&self) -> Result<Plan, Refusal> {
+        self.ask(|keeper, _, row| {
+            let work: Vec<u8> = keeper.data().connection().query_row(
+                "SELECT work FROM requests_jobs WHERE id = ?1", [row], |record| record.get(0),
+            ).map_err(sql_error)?;
+            decode(&work)
+        })
     }
 
     fn keep_placements(&self, observed: &[AlbumPlacement]) -> Result<(), String> {
@@ -1891,6 +1929,14 @@ impl Job {
                 let records = recovered_asks(asked, &wire::ArtistTarget { id: artist, artist: id }, &current, &self.plan.placements)?;
                 Ok((Completed::AddedWanting { artist }, records, None))
             }
+            Change::Cancel { album, release } => {
+                let pending = lidarr_result(lidarr.pending(), None)?;
+                if pending.iter().any(|row| row.id == album.get() && row.album == release.as_str()) {
+                    Err(Refusal::NotDealtWith)
+                } else {
+                    Ok((Completed::Cancelled, Vec::new(), Some(release.clone())))
+                }
+            }
             _ => Err(Refusal::NotDealtWith),
         }
     }
@@ -1988,7 +2034,6 @@ impl Requests {
             batch
         };
 
-        let _turn = lock(&self.mutation);
         journal.restore_pending(lidarr)?;
         if job.plan.prepared_batch.is_some() {
             let indexed = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;

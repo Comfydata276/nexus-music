@@ -154,6 +154,7 @@ pub struct Shell {
     /// Who may take a reserved slot (the backend's own; none in a shell without accounts).
     admit: Option<Arc<Admission>>,
     requests: Option<Arc<crate::requests::Requests>>,
+    request_answers: Semaphore,
     open: AtomicUsize,
     serving: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
@@ -194,7 +195,7 @@ impl Shell {
 
     /// As [`Shell::with_routes`], with the proxy at an address or by a name ([`Proxy`]).
     pub fn with_proxy(proxy: impl Into<Proxy>, router: Router, routes: Vec<Route>) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.into(), router, routes, admit: None, requests: None, open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
+        Arc::new(Shell { proxy: proxy.into(), router, routes, admit: None, requests: None, request_answers: Semaphore::new(8), open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
     }
 
     /// How many connections are open now, turned-away ones included.
@@ -604,9 +605,25 @@ async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, c
         }
         Ok(Ok(bytes)) => Bytes::from(bytes),
     };
+    // Requests may wait longer for an upstream search. Bound those answers
+    // independently so a slow Lidarr cannot fill the listener's sign-in reserve.
+    let requests = shell.requests.is_some() && parts.uri.path() == nexus_core::nexus::requests::REQUESTS;
+    let _place = if requests {
+        match shell.request_answers.try_acquire() {
+            Ok(place) => Some(place),
+            Err(_) => {
+                let mut response = crate::events::respond(crate::accounts::session::refused(crate::events::busy()));
+                finish(&mut response);
+                return Ok(response);
+            }
+        }
+    } else {
+        None
+    };
+    let deadline = if requests { crate::requests::ANSWER_TIMEOUT } else { ANSWER_DEADLINE };
     let request = Request::from_parts(parts, Body::from(bytes));
     let mut task = tokio::spawn(ADMITTED.scope(admitted, shell.router.clone().oneshot(request)));
-    let mut response = match tokio::time::timeout(ANSWER_DEADLINE, &mut task).await {
+    let mut response = match tokio::time::timeout(deadline, &mut task).await {
         Err(_) => {
             task.abort();
             shell.count(Refusal::Slow);
