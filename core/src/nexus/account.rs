@@ -16,6 +16,8 @@ use crate::origin::{Address, AddressError, HandoverSource, MusicBase, Origin};
 use zeroize::Zeroizing;
 
 pub const SIGN_IN: &str = "/nexus/api/signin";
+// The design does not say how to spell the browser setup path.
+pub const SET_UP: &str = "/nexus/api/set-up";
 // the design does not say the spelling of the other paths. Each takes POST.
 pub const SIGN_OUT: &str = "/nexus/api/signout";
 pub const LIST_DEVICES: &str = "/nexus/api/devices";
@@ -26,7 +28,7 @@ pub const GRANT: &str = "/nexus/api/grant";
 /// Self-service listening-data deletion, implemented by S12.
 pub const DELETE_LISTENING_DATA: &str = "/nexus/api/delete-listening-data";
 pub const PATHS: &[&str] = &[
-    SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT, DELETE_LISTENING_DATA,
+    SIGN_IN, SET_UP, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT, DELETE_LISTENING_DATA,
 ];
 
 pub const EMAIL_MAX_BYTES: usize = 254;
@@ -48,6 +50,7 @@ pub const SMALL_REPLY_MAX_BYTES: usize = 4 * 1024;
 pub const SIGN_IN_REPLY_MAX_BYTES: usize = 8 * 1024;
 pub const LIST_REPLY_MAX_BYTES: usize = BODY_MAX_BYTES;
 pub const PASSWORD_REQUEST_MAX_BYTES: usize = 4 * 1024;
+pub const SET_UP_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
 // the design does not say the bound of a generic grant use. Allow the same 4 KiB
 // here because an admin can send both music addresses or login text in the change.
 pub const GRANTED_CHANGE_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
@@ -74,9 +77,15 @@ pub fn tidy_email(text: &str) -> Option<String> {
     Some(text.to_ascii_lowercase())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
+
+impl fmt::Debug for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Email(..)")
+    }
+}
 
 impl Email {
     pub fn new(text: &str) -> Option<Self> {
@@ -88,9 +97,15 @@ impl Email {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Name(String);
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Name(..)")
+    }
+}
 
 impl Name {
     // the design does not say whether blank names or controls are allowed.
@@ -903,6 +918,77 @@ impl RefusedWithReceipt {
     }
 }
 
+/// The page sends this once to set up the first admin. S8 checks the configured
+/// origin, the locally issued code, and the new password against its policy.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct SetUp {
+    pub code: OneTimeCode,
+    pub email: Email,
+    pub name: Name,
+    pub password: Password,
+}
+
+impl wire::Value for SetUp {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            code: fields.get("code")?,
+            email: fields.get("email")?,
+            name: fields.get("name")?,
+            password: read_text(fields.0.get("password").ok_or(BadMessage::Form)?, Password::new)?,
+        })
+    }
+
+    fn check(&self) -> Result<(), BadMessage> {
+        self.password.check_new_length()
+    }
+}
+
+/// Set-up creates a person and does not sign the browser in.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetUpReply {
+    Done { result: Person },
+    Refused(Refusal),
+}
+
+impl SetUpReply {
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Done { .. } => DONE_STATUS,
+            Self::Refused(reason) => reason.status(),
+        }
+    }
+
+    pub fn read(status: u16, body: &[u8]) -> Result<Self, BadMessage> {
+        let reply: Self = read(body)?;
+        if reply.status() != status {
+            return Err(BadMessage::Status(status));
+        }
+        Ok(reply)
+    }
+}
+
+impl wire::Value for SetUpReply {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let root = Fields::read(raw)?;
+        if root.0.contains_key("receipt") || root.0.contains_key("refused_with_receipt") {
+            return Err(BadMessage::Form);
+        }
+        match root.select(&["done", "refused"])? {
+            ("done", raw) => {
+                let fields = Fields::read(raw)?;
+                if fields.0.contains_key("receipt") {
+                    return Err(BadMessage::Form);
+                }
+                Ok(Self::Done { result: fields.get("result")? })
+            }
+            ("refused", raw) => Ok(Self::Refused(Refusal::read(raw)?)),
+            _ => Err(BadMessage::Form),
+        }
+    }
+}
+
 pub type SignInReply = Reply<SignInAnswer>;
 pub type SignOutReply = Reply<SignedOut>;
 pub type ListDevicesReply = Reply<DevicePage>;
@@ -1153,6 +1239,8 @@ macro_rules! request_bound {
 }
 
 request_bound!(PASSWORD_REQUEST_MAX_BYTES: SignIn, ChangePassword);
+request_bound!(SET_UP_MAX_BYTES: SetUp);
+request_bound!(SMALL_REPLY_MAX_BYTES: SetUpReply);
 request_bound!(SMALL_REQUEST_MAX_BYTES: SignOut, ListDevices, ForceOut, GetMusicLogin);
 request_bound!(SMALL_REPLY_MAX_BYTES: MusicLogin);
 
