@@ -1299,7 +1299,9 @@ mod listening {
         keeper.close();
         // The store must index existing starts when it upgrades form 2.
         fixture.db().execute_batch(
-            "DROP INDEX listening_by_time; PRAGMA user_version = 2;",
+            "ALTER TABLE meta DROP COLUMN lidarr_checked_seal;
+             DROP INDEX listening_by_time;
+             PRAGMA user_version = 2;",
         ).unwrap();
         let clock = fixture.start_with_clock();
         let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);
