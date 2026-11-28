@@ -1136,17 +1136,15 @@ impl std::fmt::Debug for SignedIn {
 }
 
 /// The sign-in this PC had before the Nexus server, and what became of its folder (design
-/// 11; the review of W7, MUST 14): **captured once**, at the first start of this version,
-/// before anything can change the settings' music server and user, and **decided once**, at
-/// the first music login kept on this PC: carried over to that person if the shared library
-/// says their login names that same music server and user, else to nobody, ever. Kept in a
-/// file of its own (`nexus-legacy.json`), which a sign-out does not touch.
+/// 11): captured before anything can change the settings' music server and user, and
+/// carried over at the first kept login that core matches to that server and user. Kept
+/// in `nexus-legacy.json` across sign-outs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Legacy {
     pub server: String,
     pub username: String,
-    /// Whether the folder's fate is decided (true at once when there was no sign-in before).
+    /// Whether the folder has been carried over.
     pub decided: bool,
     /// Who it was carried over to (`Legacy::who`), if anyone.
     pub carried_to: Option<String>,
@@ -1156,11 +1154,10 @@ impl Legacy {
     /// What the settings say now, at the first start of this version (and what the first
     /// build of W7 decided, if it did).
     pub fn of(settings: &Settings) -> Legacy {
-        let none = settings.server.is_empty() || settings.username.is_empty();
         Legacy {
             server: settings.server.clone(),
             username: settings.username.clone(),
-            decided: none || settings.carried_over.is_some(),
+            decided: settings.carried_over.is_some(),
             carried_to: settings.carried_over.as_ref().map(|(who, _)| who.clone()),
         }
     }
@@ -1183,7 +1180,10 @@ fn legacy_path(paths: &Paths) -> PathBuf {
 /// The decision, as kept. An unreadable one is an error, never taken for none.
 pub fn load_legacy(paths: &Paths) -> std::io::Result<Legacy> {
     let bytes = fs::read(legacy_path(paths))?;
-    serde_json::from_slice(&bytes).map_err(std::io::Error::from)
+    let mut legacy: Legacy = serde_json::from_slice(&bytes)?;
+    // 0.41.0 could close the decision without an owner. Those folders are still open.
+    legacy.decided = legacy.carried_to.is_some();
+    Ok(legacy)
 }
 
 pub fn save_legacy(paths: &Paths, legacy: &Legacy) -> std::io::Result<()> {
