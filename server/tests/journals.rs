@@ -1030,6 +1030,12 @@ mod listening {
         }).unwrap();
         let bad_origin = "Origin: https://other.example.org\r\nX-Nexus-Admin: 1\r\n";
         assert_eq!(fixture.post_with(wire::PATH, Some(&page_session), bad_origin, ask.bytes()).0, 400);
+        let no_marker = "Origin: https://nexus.example.org\r\n";
+        assert_eq!(fixture.post_with(wire::PATH, Some(&page_session), no_marker, ask.bytes()).0, 400);
+        let oversized = fixture.request(
+            wire::PATH, Some(&page_session.session), BROWSER, admin::REQUEST_MAX_BYTES + 1,
+        );
+        assert_eq!(response(oversized).0, 413);
 
         let open = Record::new(id(7), end - 1, Kind::Open {
             version: Version::parse("0.41.0").unwrap(), device: DeviceKind::Pc,

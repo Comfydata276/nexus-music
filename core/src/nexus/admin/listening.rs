@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use super::{AccountId, Name, RequestHead, ResultBody};
-use crate::nexus::events::TEXT_CHARS;
+use crate::nexus::events::text_ok;
 use crate::nexus::wire::{self, BadMessage, Fields};
 
 pub const PATH: &str = "/nexus/api/admin/listening";
@@ -103,7 +103,7 @@ pub struct Text(String);
 
 impl Text {
     pub fn new(value: String) -> Option<Self> {
-        (value.chars().count() <= TEXT_CHARS).then_some(Self(value))
+        text_ok(&value).then_some(Self(value))
     }
 }
 
