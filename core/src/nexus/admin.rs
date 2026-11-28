@@ -559,6 +559,8 @@ pub enum Denial {
     NoSuchAccount,
     NoSuchSession,
     MusicLoginRefused,
+    LidarrLoginRefused,
+    LidarrUnreachable,
     Conflict,
 }
 
@@ -571,6 +573,8 @@ impl wire::Value for Denial {
             "no_such_account" => Some(Self::NoSuchAccount),
             "no_such_session" => Some(Self::NoSuchSession),
             "music_login_refused" => Some(Self::MusicLoginRefused),
+            "lidarr_login_refused" => Some(Self::LidarrLoginRefused),
+            "lidarr_unreachable" => Some(Self::LidarrUnreachable),
             "conflict" => Some(Self::Conflict),
             _ => None,
         })
@@ -834,6 +838,8 @@ mod tests {
             Refusal::NotAllowed(Denial::NoSuchAccount),
             Refusal::NotAllowed(Denial::NoSuchSession),
             Refusal::NotAllowed(Denial::MusicLoginRefused),
+            Refusal::NotAllowed(Denial::LidarrLoginRefused),
+            Refusal::NotAllowed(Denial::LidarrUnreachable),
             Refusal::NotAllowed(Denial::Conflict),
             Refusal::Busy { retry_after_seconds: Wait::new(1) },
             Refusal::Busy { retry_after_seconds: None },

@@ -701,6 +701,27 @@ test("requests shows one container instruction and no key field when Lidarr has 
   assert.ok(page.button("requests-list", "Turn requests off"));
 });
 
+test("a refused Lidarr key and an unreachable Lidarr give distinct guidance", async () => {
+  const mock = adminStandIn();
+  let reason;
+  const page = loadPage((path, options) => path === "/nexus/api/admin/set-lidarr"
+    ? new Response(JSON.stringify({ refused: { not_allowed: reason } }), { status: 403 })
+    : mock.fetch(path, options));
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  for (const [refusal, message] of [
+    ["lidarr_login_refused", "Lidarr refused that key. Check it and try again."],
+    ["lidarr_unreachable", "Lidarr could not be reached. Check that it’s running and try again."],
+  ]) {
+    reason = refusal;
+    page.submit("lidarr-form", { "lidarr-key": lidarrKey });
+    await page.submit("grant-form", { "grant-password": adminPassword });
+    assert.equal(page.from("lidarr-key").value, "");
+    assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is not set.");
+    assert.equal(page.from("change-status").textContent, message);
+  }
+});
+
 const listeningTime = 1788883200000;
 const examplePlay = {
   id: 8, account: 7, name: "Jamie <script>example()</script>", at_ms: listeningTime - 1000,
