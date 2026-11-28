@@ -761,7 +761,7 @@ fn admin_accounts_require_authority_and_a_live_page_session() {
     let admin_code = fixture.set_up();
     let other_code = fixture.other();
     let clock = fixture.start_with_clock();
-    fixture.sign_in(with_code(admin_code), 1);
+    fixture.sign_in_with(with_code(admin_code), 1, BROWSER);
     let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
     let list = |stamp: &Stamp| account::encode(&admin::ListAccounts {
         head: head(stamp),
@@ -801,7 +801,7 @@ fn the_diagnostics_default_needs_a_matching_grant_and_reaches_hello() {
     let mut fixture = Fixture::new("admin-diagnostics");
     let code = fixture.set_up();
     fixture.start_with_clock();
-    fixture.sign_in(with_code(code), 1);
+    fixture.sign_in_with(with_code(code), 1, BROWSER);
     let (admin, stamp) = fixture.sign_in_with(with_password(), 2, BROWSER);
     let request_id = RequestId::new(41).unwrap();
     let request = account::encode(&admin::RequestGrant {
