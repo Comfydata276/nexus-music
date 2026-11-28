@@ -148,14 +148,12 @@ export global App {
     in property <string> nexus-email;
     in-out property <string> login-error;
     in property <bool> login-busy;
-    // `retry`: the form's own one retry after the Nexus server said to come back in a few
-    // seconds (the shared client's rule); a person's own press is not one.
-    callback sign-in(address: string, email: string, password: string, retry: bool);
+    callback sign-in(address: string, email: string, password: string);
     // A first sign-in with the one-time code the admin gave, and the password chosen, typed
     // twice: one press.
-    callback sign-in-code(address: string, code: string, password: string, again: string, retry: bool);
-    // Moved on by the Rust side when the form is to press again, as it is, by itself.
-    in property <int> send-again;
+    callback sign-in-code(address: string, code: string, password: string, again: string);
+    // The Nexus server said to come back in this many seconds: the button waits, counting.
+    in property <int> login-wait;
     // The sign-in form was closed with nothing sent.
     callback form-closed();
     callback sign-out();

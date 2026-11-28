@@ -2894,9 +2894,8 @@ export component SettingsPage inherits Rectangle {
 
 // The sign-in screen: the Nexus server's address, and an email and password; or, the first
 // time, the one-time code the admin gave and the password chosen. Signing in is to the
-// Nexus server alone, which hands this PC what it needs to play. What is typed is held by
-// this form while it is up (for the one retry the Nexus server may ask for), and goes when
-// it closes.
+// Nexus server alone, which hands this PC what it needs to play. The password fields are
+// emptied when a try is answered, and go when the form closes.
 export component LoginPage inherits Rectangle {
     background: Theme.base;
     property <bool> code: false;
@@ -2910,10 +2909,15 @@ export component LoginPage inherits Rectangle {
     property <string> code-in;
     property <string> again-in;
 
-    // The Nexus server asked to come back in a few seconds, and that time has passed: the
-    // form presses again, as it is.
-    property <int> send-again: App.send-again;
-    changed send-again => { root.go(true); }
+    // A try answered: what was typed as a password goes.
+    property <bool> busy: App.login-busy;
+    changed busy => {
+        if !self.busy {
+            root.password-in = "";
+            root.code-in = "";
+            root.again-in = "";
+        }
+    }
 
     // A wash of the brand colour behind the form.
     Rectangle {
@@ -2989,7 +2993,7 @@ export component LoginPage inherits Rectangle {
                         text <=> root.address-in;
                         placeholder: "nexus.example.org";
                         label: "Nexus server";
-                        accepted => { root.go(false); }
+                        accepted => { root.go(); }
                     }
 
                     if !root.code: Text {
@@ -3002,7 +3006,7 @@ export component LoginPage inherits Rectangle {
                     if !root.code: Field {
                         text <=> root.email-in;
                         label: "Email";
-                        accepted => { root.go(false); }
+                        accepted => { root.go(); }
                     }
 
                     if root.code: Text {
@@ -3016,7 +3020,7 @@ export component LoginPage inherits Rectangle {
                         text <=> root.code-in;
                         label: "One-time code";
                         placeholder: "ABCD EFGH JKMN";
-                        accepted => { root.go(false); }
+                        accepted => { root.go(); }
                     }
 
                     Text {
@@ -3030,7 +3034,7 @@ export component LoginPage inherits Rectangle {
                         text <=> root.password-in;
                         input-type: InputType.password;
                         label: root.code ? "Choose a password" : "Password";
-                        accepted => { root.go(false); }
+                        accepted => { root.go(); }
                     }
 
                     if root.code: Text {
@@ -3044,7 +3048,7 @@ export component LoginPage inherits Rectangle {
                         text <=> root.again-in;
                         input-type: InputType.password;
                         label: "The same again";
-                        accepted => { root.go(false); }
+                        accepted => { root.go(); }
                     }
 
                     if App.login-error != "": Text {
@@ -3059,11 +3063,11 @@ export component LoginPage inherits Rectangle {
                     }
 
                     TextButton {
-                        text: App.login-busy ? "Signing in…" : "Sign in";
+                        text: App.login-busy ? "Signing in…" : App.login-wait > 0 ? "Try again in " + App.login-wait + " s" : "Sign in";
                         primary: true;
-                        enabled: !App.login-busy;
+                        enabled: !App.login-busy && App.login-wait <= 0;
                         height: 46px;
-                        clicked => { root.go(false); }
+                        clicked => { root.go(); }
                     }
 
                     HorizontalLayout {
@@ -3102,13 +3106,13 @@ export component LoginPage inherits Rectangle {
         }
     }
 
-    // What the button does, and the retry: what the form holds, as it is.
-    function go(retry: bool) {
-        if App.login-busy && !retry { return; }
+    // What the button does.
+    function go() {
+        if App.login-busy || App.login-wait > 0 { return; }
         if root.code {
-            App.sign-in-code(root.address-in, root.code-in, root.password-in, root.again-in, retry);
+            App.sign-in-code(root.address-in, root.code-in, root.password-in, root.again-in);
         } else {
-            App.sign-in(root.address-in, root.email-in, root.password-in, retry);
+            App.sign-in(root.address-in, root.email-in, root.password-in);
         }
     }
 }
