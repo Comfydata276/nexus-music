@@ -245,22 +245,30 @@ fn save_schedule(path: &Path, schedule: Option<&DiagSchedule>) -> io::Result<()>
 
 /// Queue this in the order core issued it. The subsequent read cannot start ahead of it.
 #[allow(dead_code)] // W7 owns the live client.
-pub(crate) fn keep_schedule(schedule: Option<DiagSchedule>) {
-    if let Some(path) = with(|ctl| schedule_path(&ctl.paths)) {
-        on_worker(move || {
-            let written = save_schedule(&path, schedule.as_ref()).is_ok();
-            SCHEDULE_KEPT.set(written && schedule.is_some());
-        });
+pub(crate) fn keep_schedule_for_window(schedule: Option<DiagSchedule>) {
+    if let Some(paths) = with(|ctl| ctl.paths.clone()) {
+        keep_schedule(&paths, schedule);
     }
+}
+
+fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) {
+    let path = schedule_path(paths);
+    on_worker(move || {
+        let written = save_schedule(&path, schedule.as_ref()).is_ok();
+        SCHEDULE_KEPT.set(written && schedule.is_some());
+    });
 }
 
 /// Queue the matching reply for W7 to feed back into the same live client.
 #[allow(dead_code)] // W7 owns the live client.
-pub(crate) fn read(read: u64, answer: impl FnOnce(Happened) + Send + 'static) {
-    let paths = with(|ctl| ctl.paths.clone());
+pub(crate) fn read_for_window(number: u64, answer: impl FnOnce(Happened) + Send + 'static) {
+    read(with(|ctl| ctl.paths.clone()), number, answer);
+}
+
+fn read(paths: Option<config::Paths>, number: u64, answer: impl FnOnce(Happened) + Send + 'static) {
     on_worker(move || {
         let ready = SCHEDULE_KEPT.get() && STORE.with_borrow(|store| store.current);
-        answer(read_for_machine(paths.as_ref(), read, ready));
+        answer(read_for_machine(paths.as_ref(), number, ready));
     });
 }
 

@@ -47,7 +47,7 @@ fn list_accounts(keeper: &mut Keeper, after: Option<AccountId>, internal: &str) 
             name: Name::new(&shown).ok_or(Refusal::NotDealtWith)?,
             admin: state.admin,
             enabled: state.status == Status::On,
-            requests_enabled: admin::REQUESTS_DEFAULT_ENABLED,
+            requests_enabled: keeper.requests_switch(number).map_err(not_dealt_with)?.enabled,
             music: music_state(keeper, number, state, internal),
         })
     }).collect::<Result<_, _>>()?;

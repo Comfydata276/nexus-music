@@ -77,7 +77,7 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         observations.note(at as u64 * 1_000, line);
     }
     count_notices(&mut observations, messages);
-    let session = Session { about: Session::about(&settings, true), observations };
+    let about = Session::about(&settings, true);
     let dir = TestFolder::new()?;
     let paths = dir.paths();
     let crash = &paths.crash_log;
@@ -88,8 +88,8 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         format!("2023-11-14 22:13:27 UTC version 0.40.13 thread main at {folder}\\{artist}.rs:222: {album}\n{odd}{playlist}\n").as_bytes(),
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
     ].concat())?;
-    let preview = local_text(&paths, session)?;
-    save_text(&paths, &preview)?;
+    let preview = preview_text(&paths, Session { about, observations });
+    export_report(&paths, Session { about, observations: diag::Record::default() })?;
     assert_eq!(fs::read(&paths.diagnostics)?, preview.as_bytes());
     let model = diag::Report::read(&preview).unwrap();
     let upload = diag::Upload::new(RequestHead { speaks: SPEAKS, restore: 0 }, RequestId::new(1).unwrap(), &model).unwrap();
@@ -204,5 +204,69 @@ fn a_failed_checkpoint_still_shows_the_local_report() -> std::io::Result<()> {
     assert!(text.contains("Fault in app: write"));
     assert!(!STORE.with_borrow(|store| store.current));
     assert!(report_text(&paths).is_err());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_record_survives_a_blocked_replace_and_killed_write() -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::process::Stdio;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    const CHILD_HOME: &str = "NEXUS_W6T_CUT_RECORD";
+    const READY: &str = "partially written Diagnostics checkpoint";
+    if let Some(path) = std::env::var_os(CHILD_HOME) {
+        let steps = config::Steps {
+            flush: |temp| {
+                // Cut the temporary file between the write and its durable placement.
+                temp.set_len(5)?;
+                temp.sync_all()?;
+                eprintln!("{READY}");
+                let _ = std::io::stdin().read(&mut [0; 1]);
+                Err(std::io::Error::other("the parent should have killed this process"))
+            },
+            ..config::REPLACING
+        };
+        return config::write_whole(Path::new(&path), b"incomplete fixture", config::Durable::Flushed, &steps).map(drop);
+    }
+
+    let temp = TestFolder::new()?;
+    let paths = temp.paths();
+    let path = record_path(&paths);
+    let about = Session::about(&config::Settings::default(), false);
+    let mut observations = diag::Record::default();
+    observations.note(AT as u64 * 1_000, Line::Note(Note::DownloadsFolderChanged));
+    let mut store = ReportStore::default();
+    store.checkpoint(&path, Session { about, observations: observations.clone() })?;
+    let old = fs::read(&path)?;
+
+    // Windows denies replacement while this handle withholds delete sharing.
+    let reader = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path)?;
+    assert!(store.checkpoint(&path, Session { about, observations }).is_err());
+    assert_eq!(fs::read(&path)?, old);
+    drop(reader);
+    store.checkpoint(&path, Session { about, observations: diag::Record::default() })?;
+    let whole = fs::read(&path)?;
+    assert_ne!(whole, old);
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(["--exact", "diagnostics::tests::windows_record_survives_a_blocked_replace_and_killed_write", "--nocapture"])
+        .env(CHILD_HOME, &path)
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+    let ready = BufReader::new(child.stderr.take().unwrap()).lines()
+        .map_while(Result::ok).any(|line| line == READY);
+    child.kill()?;
+    assert!(!child.wait()?.success());
+    assert!(ready);
+    assert_eq!(fs::read(&path)?, whole);
+    assert!(fs::read_dir(path.parent().unwrap())?.flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "tmp")));
+
+    clear_report_leftovers(&paths);
+    assert!(!fs::read_dir(path.parent().unwrap())?.flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "tmp")));
+    assert_eq!(fs::read(&path)?, whole);
+    assert!(report_text(&paths)?.contains("Downloads folder changed  (2 times since"));
     Ok(())
 }

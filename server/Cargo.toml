@@ -12,6 +12,9 @@ publish = false
 
 [dependencies]
 nexus-core = { path = "../core" }
+# Durable Requests jobs and batch progress use typed JSON in SQLite.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # The runtime the listener, its deadlines and each request's own task run on.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 # The HTTP/1 connection itself, served one connection at a time with its bounds set by hand:
