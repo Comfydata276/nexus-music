@@ -331,7 +331,8 @@ impl Value for BackendId {
 
 /// A typed JSON object with every declared field required.
 macro_rules! object {
-    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $kind:ty),* $(,)? }) => {
+    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $kind:ty),* $(,)? }
+        $(check($value:ident) $check:block)?) => {
         $(#[$doc])*
         #[derive(Debug, PartialEq, Eq, Serialize)]
         pub struct $name {
@@ -343,6 +344,11 @@ macro_rules! object {
                 let _fields = $crate::nexus::wire::Fields::read(raw)?;
                 Ok(Self { $($field: _fields.get(stringify!($field))?,)* })
             }
+
+            $(fn check(&self) -> Result<(), $crate::nexus::wire::BadMessage> {
+                let $value = self;
+                $check
+            })?
         }
     };
 }
