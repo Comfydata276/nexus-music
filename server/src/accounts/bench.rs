@@ -60,9 +60,10 @@ impl Bench {
             .collect();
         let workers = PasswordWorkers::new(setup::dummy_salt_key(&keeper)).unwrap();
         let backend = keeper.backend();
-        let desk = Desk::open(keeper).unwrap();
         let now = Arc::new(AtomicU64::new(START));
         let read = now.clone();
+        let for_desk = now.clone();
+        let desk = Desk::open(keeper, Arc::new(move || for_desk.load(Ordering::SeqCst))).unwrap();
         let accounts = Arc::new(Accounts {
             desk,
             workers,

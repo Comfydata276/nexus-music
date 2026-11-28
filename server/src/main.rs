@@ -178,7 +178,7 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let desk = match Desk::open(keeper) {
+    let desk = match Desk::open(keeper, Arc::new(now)) {
         Ok(desk) => desk,
         Err(why) => {
             eprintln!("The thread that writes couldn't be started ({}).", why.kind());

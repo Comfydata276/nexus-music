@@ -21,10 +21,15 @@
 //!
 //! Nothing here reads anything while a socket is written: an answer is handed back to the
 //! request's own task, which writes it.
+//!
+//! **In idle time** (design 12.3; S3b's ask): the thread calls [`Keeper::idle`] when the
+//! store's mark of the data's changes falls due ([`Keeper::mark_due`]), whether or not anything
+//! is asked of it, and at least once a minute that nothing is.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -39,6 +44,12 @@ pub const WORK_WAITING_MAX: usize = crate::bounds::CONNECTIONS_MAX;
 /// How many strangers' sign-ins may wait for their first step at once. Small: each is a lookup
 /// and a decision; more waiting would only be more waiting.
 pub const STRANGER_WAITING_MAX: usize = 8;
+
+/// The longest the thread waits for work before it does the store's idle work anyway.
+pub const IDLE_EVERY: Duration = Duration::from_secs(60);
+
+/// The clock the thread does its idle work by: milliseconds, as the backend's decisions have it.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Which lane a piece of work waits in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,12 +85,28 @@ pub struct Busy;
 
 impl Desk {
     /// Hands `keeper` to a thread of its own, which does each piece of work in turn: the kept
-    /// lane's first, then the strangers'.
-    pub fn open(mut keeper: Keeper) -> std::io::Result<Desk> {
+    /// lane's first, then the strangers'; and the store's idle work by `clock`.
+    pub fn open(mut keeper: Keeper, clock: Clock) -> std::io::Result<Desk> {
         let shared = Arc::new(Shared { line: Mutex::new(Line { kept: VecDeque::new(), stranger: VecDeque::new(), open: true }), ready: Condvar::new() });
         let taken = shared.clone();
         let thread = thread::Builder::new().name("nexus-writer".into()).spawn(move || {
-            while let Some(step) = next(&taken) {
+            loop {
+                let now = clock();
+                let wait = keeper.mark_due().map_or(IDLE_EVERY, |due| Duration::from_millis(due.saturating_sub(now)).clamp(Duration::from_millis(10), IDLE_EVERY));
+                let step = match next(&taken, wait) {
+                    Next::Work(step) => step,
+                    Next::Quiet => {
+                        // A failure here is the store's to say at the next step; nothing is lost.
+                        let _ = keeper.idle(clock());
+                        continue;
+                    }
+                    Next::Closed => break,
+                };
+                // The mark due while work kept coming: the idle work first.
+                let now = clock();
+                if keeper.mark_due().is_some_and(|due| due <= now) {
+                    let _ = keeper.idle(now);
+                }
                 // A fault part-way through a step may leave the two stores between halves of a
                 // change; the start's comparison finishes it. Until then nothing more is written.
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut keeper))).is_err() {
@@ -146,17 +173,33 @@ impl Desk {
     }
 }
 
-/// The next piece of work, kept lane first; none once the line is shut and empty.
-fn next(shared: &Shared) -> Option<Work> {
-    let mut line = shared.line.lock().ok()?;
+enum Next {
+    Work(Work),
+    /// Nothing came within the wait.
+    Quiet,
+    /// The line is shut and empty.
+    Closed,
+}
+
+/// The next piece of work, kept lane first, waiting at most `wait` for one.
+fn next(shared: &Shared, wait: Duration) -> Next {
+    let Ok(mut line) = shared.line.lock() else { return Next::Closed };
+    let until = std::time::Instant::now() + wait;
     loop {
         if let Some(work) = line.kept.pop_front().or_else(|| line.stranger.pop_front()) {
-            return Some(work);
+            return Next::Work(work);
         }
         if !line.open {
-            return None;
+            return Next::Closed;
         }
-        line = shared.ready.wait(line).ok()?;
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Next::Quiet;
+        }
+        line = match shared.ready.wait_timeout(line, left) {
+            Ok((line, _)) => line,
+            Err(_) => return Next::Closed,
+        };
     }
 }
 
@@ -184,7 +227,7 @@ mod tests {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
         let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), 1).unwrap();
-        let desk = Arc::new(Desk::open(keeper).unwrap());
+        let desk = Arc::new(Desk::open(keeper, Arc::new(|| 1)).unwrap());
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         runtime.block_on(async {
@@ -227,7 +270,7 @@ mod tests {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
         let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), 1).unwrap();
-        let desk = Arc::new(Desk::open(keeper).unwrap());
+        let desk = Arc::new(Desk::open(keeper, Arc::new(|| 1)).unwrap());
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let done = Arc::new(Mutex::new(false));
         runtime.block_on(async {
@@ -250,6 +293,42 @@ mod tests {
             desk.ask(|_| ()).await.unwrap();
         });
         assert!(!*done.lock().unwrap());
+        drop(desk);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A change only the data keeps is heard by the store once its minute is out, with no
+    /// request asking for it (S3b's ask; design 12.3).
+    #[test]
+    fn the_store_hears_the_data_s_changes_in_idle_time() {
+        let root = std::env::temp_dir().join(format!("nexus-desk-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        let start = 1_800_000_000_000;
+        let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), start).unwrap();
+        let now = Arc::new(AtomicU64::new(start));
+        let read = now.clone();
+        let desk = Desk::open(keeper, Arc::new(move || read.load(Ordering::SeqCst))).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let due = desk.ask(move |keeper| {
+                // The first is heard at once (the store's minute was out); the second waits.
+                keeper.write_data(start, |_| Ok(((), true))).unwrap();
+                keeper.write_data(start, |_| Ok(((), true))).unwrap();
+                keeper.mark_due()
+            });
+            assert!(due.await.unwrap().is_some(), "the data has a change the store has not heard of");
+            now.store(start + 61_000, Ordering::SeqCst);
+            // Any step wakes the thread; the idle work is done before it, unasked.
+            assert_eq!(desk.ask(|keeper| keeper.mark_due()).await.unwrap(), None);
+        });
         drop(desk);
         let _ = std::fs::remove_dir_all(&root);
     }
