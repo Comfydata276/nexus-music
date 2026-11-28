@@ -4,38 +4,46 @@
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
-use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de};
+use serde_json::value::RawValue;
 
-use super::proto::{HELLO_MAX_DEPTH, Speaks};
+use super::account::{self, AccountId, Receipt};
+use super::wire::{self, BadMessage, Fields, Value, WireBody};
+pub use super::account::{RequestHead, RequestId};
 use crate::lidarr::{ArtistOffer, Listed, Pending, RequestLidarr, Single, WayBack};
 use crate::offer::Offer;
 
 // the design does not say how to spell the path and JSON tags. One POST with a closed call tag.
 pub const REQUESTS: &str = "/nexus/api/requests";
 pub const PATHS: &[&str] = &[REQUESTS];
-pub const CALL_MAX_BYTES: usize = 1024 * 1024;
-pub const SMALL_REPLY_MAX_BYTES: usize = 4096;
+pub const CALL_MAX_BYTES: usize = wire::BODY_MAX_BYTES;
+pub const SMALL_REPLY_MAX_BYTES: usize = account::SMALL_REPLY_MAX_BYTES;
 // The lead's ruling on §7.1 and §16.1: keep the small ceiling for status, jobs and
 // errors. A successful list has its own bounds and is refused whole when over them.
-pub const LIST_REPLY_MAX_BYTES: usize = 1024 * 1024;
+pub const LIST_REPLY_MAX_BYTES: usize = account::LIST_REPLY_MAX_BYTES;
+pub const PAGE_MAX_ITEMS: usize = 500;
+pub const NUMBER_PAGE_MAX_ITEMS: usize = 5000;
+pub const ITEM_MAX_BYTES: usize = 1024;
 pub const SEARCH_MAX_CHARS: usize = 200;
 pub const BUSY_MAX_ARTISTS: usize = 500;
 pub const BATCH_MAX_LINES: usize = 2000;
+pub const RUNNING_PER_ACCOUNT: usize = 1;
+pub const RUNNING_MAX: usize = 4;
+pub const WAITING_MAX: usize = 16;
 pub const KEPT_ALBUMS: usize = 500;
 pub const KEPT_ARTISTS: usize = 200;
 pub const OFFER_LIFETIME_SECONDS: i64 = 3600;
 
-// the design does not say the remaining field and count ceilings. Search results that
-// make offers fit in a session's book. Other catalog lists fit within Lidarr's 100 x 500
-// page ceiling, subject to the whole reply limit; no result is silently truncated.
+// the design does not say the total list or individual text field ceilings. Use
+// Lidarr's existing 100 x 500 pending bound for any complete list. Every text field
+// is subject to the combined per-item ceiling as well.
 pub const LIST_MAX_ITEMS: usize = 50_000;
-pub const NAME_MAX_BYTES: usize = 1024;
-pub const ABOUT_MAX_BYTES: usize = 1024;
-pub const COVER_MAX_BYTES: usize = 2048;
+pub const NAME_MAX_BYTES: usize = ITEM_MAX_BYTES;
+pub const ABOUT_MAX_BYTES: usize = ITEM_MAX_BYTES;
+pub const COVER_MAX_BYTES: usize = ITEM_MAX_BYTES;
 pub const CHANGE_MAX_RELEASES: usize = KEPT_ALBUMS;
 
 // the design does not say the integer widths. Lidarr's numbers are positive signed
@@ -67,10 +75,6 @@ impl From<LidarrNumber> for i64 {
         number.get()
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RequestId(pub NonZeroU64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -116,11 +120,11 @@ fn is_mbid(text: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OfferName(pub MusicBrainzId);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Search(String);
 
@@ -157,9 +161,12 @@ fn valid_search(text: &str) -> bool {
     // or alternate spellings of the reserved prefix. Keep ordinary search text as typed,
     // refuse blank/control text, and allow the reserved lookup only in its exact form.
     valid_name_to_find(text) && {
-        let reserved = text.trim_start().get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("lidarr:"));
-        !reserved || text.strip_prefix("lidarr:").is_some_and(is_mbid)
+        !reserved_lookup(text) || text.strip_prefix("lidarr:").is_some_and(is_mbid)
     }
+}
+
+fn reserved_lookup(text: &str) -> bool {
+    text.trim_start().get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("lidarr:"))
 }
 
 fn valid_name_to_find(text: &str) -> bool {
@@ -168,47 +175,103 @@ fn valid_name_to_find(text: &str) -> bool {
         && !text.chars().any(char::is_control)
 }
 
-/// Authentication stays in the transport header. The head mirrors the account calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Head {
-    pub speaks: [u32; 2],
-    pub restore: u64,
-}
-
-impl Head {
-    pub fn new(speaks: Speaks, restore: u64) -> Self {
-        Self { speaks: [speaks.low(), speaks.high()], restore }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Authentication stays in the transport header; use the same head as C7.
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Message {
-    #[serde(deserialize_with = "object")]
-    pub head: Head,
-    #[serde(deserialize_with = "object")]
+    pub head: RequestHead,
     pub call: Call,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Value for Message {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self { head: fields.get("head")?, call: fields.get("call")? })
+    }
+
+    fn check(&self) -> Result<(), BadMessage> {
+        self.call.check().map_err(Into::into)
+    }
+}
+
+/// the design does not say how to name a page's place. The backend assigns a
+/// snapshot number. A continuation advances to the next offset in that same
+/// snapshot. The first call has no cursor and starts from offset zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "(NonZeroU64, u32)", into = "(NonZeroU64, u32)")]
+pub struct PageCursor {
+    snapshot: NonZeroU64,
+    offset: u32,
+}
+
+impl PageCursor {
+    pub fn new(snapshot: NonZeroU64, offset: u32) -> Option<Self> {
+        usize::try_from(offset).ok().filter(|&offset| (1..LIST_MAX_ITEMS).contains(&offset))?;
+        Some(Self { snapshot, offset })
+    }
+
+    pub fn snapshot(self) -> NonZeroU64 { self.snapshot }
+
+    pub fn offset(self) -> u32 { self.offset }
+}
+
+impl TryFrom<(NonZeroU64, u32)> for PageCursor {
+    type Error = WireError;
+
+    fn try_from((snapshot, offset): (NonZeroU64, u32)) -> Result<Self, WireError> {
+        Self::new(snapshot, offset).ok_or(WireError::Bounds)
+    }
+}
+
+impl From<PageCursor> for (NonZeroU64, u32) {
+    fn from(cursor: PageCursor) -> Self { (cursor.snapshot, cursor.offset) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "ask", rename_all = "snake_case")]
 pub enum Call {
     Status,
-    FindReleases { search: Search },
-    FindAny { search: Search },
-    FindArtists { search: Search },
-    Tracked,
+    FindReleases { search: Search, after: Option<PageCursor> },
+    FindAny { search: Search, after: Option<PageCursor> },
+    FindArtists { search: Search, after: Option<PageCursor> },
+    Tracked { after: Option<PageCursor> },
+    ArtistNumbers { after: Option<PageCursor> },
     KnownArtist { artist: MusicBrainzId },
-    AlbumsOf { artist: LidarrNumber },
-    ReleasesOf { artist: LidarrNumber },
-    Listed { artist: LidarrNumber },
+    AlbumsOf { artist: LidarrNumber, after: Option<PageCursor> },
+    ReleasesOf { artist: LidarrNumber, after: Option<PageCursor> },
+    Listed { artist: LidarrNumber, after: Option<PageCursor> },
     Busy { artists: Vec<LidarrNumber> },
-    Pending,
-    Begin {
-        request_id: RequestId,
-        #[serde(deserialize_with = "object")]
-        change: Change,
-    },
+    Pending { after: Option<PageCursor> },
+    Begin { request_id: RequestId, change: Change },
     After { job: JobId },
+}
+
+impl Value for Call {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let tag: String = member(&fields, "ask")?;
+        let after = || member(&fields, "after");
+        let search = || member(&fields, "search");
+        let number = || member(&fields, "artist");
+        let call = match tag.as_str() {
+            "status" => Self::Status,
+            "find_releases" => Self::FindReleases { search: search()?, after: after()? },
+            "find_any" => Self::FindAny { search: search()?, after: after()? },
+            "find_artists" => Self::FindArtists { search: search()?, after: after()? },
+            "tracked" => Self::Tracked { after: after()? },
+            "artist_numbers" => Self::ArtistNumbers { after: after()? },
+            "known_artist" => Self::KnownArtist { artist: member(&fields, "artist")? },
+            "albums_of" => Self::AlbumsOf { artist: number()?, after: after()? },
+            "releases_of" => Self::ReleasesOf { artist: number()?, after: after()? },
+            "listed" => Self::Listed { artist: number()?, after: after()? },
+            "busy" => Self::Busy { artists: member(&fields, "artists")? },
+            "pending" => Self::Pending { after: after()? },
+            "begin" => Self::Begin { request_id: fields.get("request_id")?, change: object_json(raw_member(&fields, "change")?)? },
+            "after" => Self::After { job: member(&fields, "job")? },
+            _ => return Err(BadMessage::Form),
+        };
+        call.check().map_err(BadMessage::from)?;
+        Ok(call)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,7 +291,7 @@ pub enum Change {
 
 /// A playlist line is deliberately just three names. It goes through bulk's lookup
 /// rules on the server. It cannot carry a playlist ID, a Lidarr setting or an album body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchLine {
     pub artist: String,
     pub album: String,
@@ -237,7 +300,16 @@ pub struct BatchLine {
 
 impl BatchLine {
     fn valid(&self) -> bool {
-        valid_name_to_find(&self.artist) && valid_name_to_find(&self.album) && valid_name_to_find(&self.song)
+        // An imported playlist can omit the album. The released bulk lookup then
+        // finds it via the song. Keep the field present and use an empty string.
+        valid_name_to_find(&self.artist)
+            && valid_name_to_find(&self.song)
+            && (self.album.is_empty() || (valid_name_to_find(&self.album)
+                // the design does not say whether a batch album title can select a
+                // reserved lookup. Bulk prefixes the search with this title, as is
+                // and undecorated. Only ordinary name searches belong here.
+                && !reserved_lookup(&self.album)
+                && !reserved_lookup(&crate::text::undecorated(&self.album))))
     }
 }
 
@@ -249,25 +321,25 @@ fn require(valid: bool) -> Result<(), WireError> {
     if valid { Ok(()) } else { Err(WireError::Bounds) }
 }
 
-fn unique<T: Eq + std::hash::Hash>(items: &[T]) -> bool {
-    let mut seen = HashSet::with_capacity(items.len());
+fn unique<T: Ord>(items: &[T]) -> bool {
+    let mut seen = BTreeSet::new();
     items.iter().all(|item| seen.insert(item))
 }
 
-impl Message {
+impl Call {
     fn check(&self) -> Result<(), WireError> {
-        let [low, high] = self.head.speaks;
-        require(Speaks::new(low, high).is_some())?;
-        match &self.call {
-            Call::Busy { artists } => {
+        match self {
+            Self::Busy { artists } => {
                 within(artists.len(), BUSY_MAX_ARTISTS)?;
                 require(unique(artists))
             }
-            Call::Begin { change, .. } => change.check(),
+            Self::Begin { change, .. } => change.check(),
             _ => Ok(()),
         }
     }
 }
+
+impl wire::Message for Message {}
 
 impl Change {
     fn check(&self) -> Result<(), WireError> {
@@ -365,7 +437,7 @@ impl Completed {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum Answer {
     Status { lidarr: Availability },
@@ -374,33 +446,53 @@ pub enum Answer {
         albums: Vec<AlbumView>,
         #[serde(deserialize_with = "objects")]
         singles: Vec<SingleView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
     FoundAny {
         #[serde(deserialize_with = "objects")]
         albums: Vec<AlbumView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
     FoundArtists {
         #[serde(deserialize_with = "objects")]
         artists: Vec<ArtistView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
-    Tracked { artists: Vec<MusicBrainzId> },
-    KnownArtist { artist: Option<(LidarrNumber, String)> },
+    Tracked { artists: Vec<MusicBrainzId>, #[serde(deserialize_with = "Deserialize::deserialize")] next: Option<PageCursor> },
+    ArtistNumbers { artists: Vec<(MusicBrainzId, LidarrNumber)>, #[serde(deserialize_with = "Deserialize::deserialize")] next: Option<PageCursor> },
+    KnownArtist {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        artist: Option<(LidarrNumber, String)>,
+    },
     AlbumsOf {
         #[serde(deserialize_with = "objects")]
         albums: Vec<ReleaseView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
     ReleasesOf {
         #[serde(deserialize_with = "objects")]
         releases: Vec<ReleaseView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
     Listed {
         #[serde(deserialize_with = "objects")]
         releases: Vec<ListedView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
-    Busy { artists: Vec<LidarrNumber>, stamp: u64 },
+    /// the design does not say how to fit 500 64-bit numbers in a small answer.
+    /// Return their zero-based positions in the call's vector.
+    Busy { positions: Vec<u16>, stamp: u64 },
     Pending {
         #[serde(deserialize_with = "objects")]
         albums: Vec<PendingView>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
     },
     Begun { job: JobId },
     Working,
@@ -414,12 +506,13 @@ pub enum Answer {
 
 /// MusicBrainz group ID doubles as the offer's name. A mutation must still find that
 /// name in its own session's offers; the name conveys no authority by itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlbumView {
     pub album: OfferName,
     pub title: String,
     // the design does not say how to encode missing metadata from Lidarr. A release
     // listing can have no embedded artist; only an offer with an artist ID is actionable.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub artist_id: Option<MusicBrainzId>,
     pub artist: String,
     pub year: String,
@@ -437,7 +530,7 @@ pub enum Kind {
     Single,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtistView {
     pub id: MusicBrainzId,
     pub name: String,
@@ -445,11 +538,11 @@ pub struct ArtistView {
     pub cover: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingleView {
     pub title: String,
     pub artist_id: MusicBrainzId,
-    pub votes: u64,
+    pub votes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,14 +560,29 @@ pub struct ListedView {
     pub have: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingView {
     pub id: LidarrNumber,
     pub album: MusicBrainzId,
     pub title: String,
     pub artist: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub progress: Option<u8>,
 }
+
+// Free text can contain a secret pasted into a search or returned by an upstream.
+// Only the typed status and error codes are suitable for diagnostics.
+macro_rules! redact_debug {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl fmt::Debug for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($ty)).finish_non_exhaustive()
+            }
+        })+
+    };
+}
+
+redact_debug!(Search, BatchLine, Answer, AlbumView, ArtistView, SingleView, PendingView);
 
 fn safe_text(text: &str, max_bytes: usize) -> bool {
     text.len() <= max_bytes && !text.chars().any(char::is_control)
@@ -501,55 +609,114 @@ impl PendingView {
     }
 }
 
+fn raw_member<'a>(fields: &Fields<'a>, key: &str) -> Result<&'a RawValue, BadMessage> {
+    fields.0.get(key).copied().ok_or(BadMessage::Form)
+}
+
+fn member<T: de::DeserializeOwned>(fields: &Fields<'_>, key: &str) -> Result<T, BadMessage> {
+    wire::plain_json(raw_member(fields, key)?.get())
+}
+
+fn check_items<T: Serialize>(items: &[T]) -> Result<(), WireError> {
+    for item in items {
+        let bytes = serde_json::to_vec(item).map_err(|_| WireError::Form)?;
+        within_body(bytes.len(), ITEM_MAX_BYTES)?;
+    }
+    Ok(())
+}
+
+fn check_page(count: usize, limit: usize, next: Option<PageCursor>) -> Result<(), WireError> {
+    within(count, limit)?;
+    require(next.is_none_or(|next| count > 0 && usize::try_from(next.offset()).is_ok_and(|offset| offset >= count)))
+}
+
 impl Answer {
     fn check(&self) -> Result<(), WireError> {
         match self {
-            Self::FoundReleases { albums, singles } => {
-                within(albums.len(), KEPT_ALBUMS)?;
-                within(singles.len(), KEPT_ALBUMS)?;
-                require(albums.iter().all(AlbumView::valid) && singles.iter().all(|single| safe_text(&single.title, NAME_MAX_BYTES) && i64::try_from(single.votes).is_ok()))
+            Self::FoundReleases { albums, singles, next } => {
+                check_page(albums.len().saturating_add(singles.len()), PAGE_MAX_ITEMS, *next)?;
+                require(albums.iter().all(|album| album.kind == Kind::Album && album.valid())
+                    && singles.iter().all(|single| safe_text(&single.title, NAME_MAX_BYTES) && single.votes >= 0))?;
+                check_items(albums)?;
+                check_items(singles)
             }
-            Self::FoundAny { albums } => {
-                within(albums.len(), KEPT_ALBUMS)?;
-                require(albums.iter().all(AlbumView::valid))
+            Self::FoundAny { albums, next } => {
+                check_page(albums.len(), PAGE_MAX_ITEMS, *next)?;
+                require(albums.iter().all(AlbumView::valid))?;
+                check_items(albums)
             }
-            Self::FoundArtists { artists } => {
-                within(artists.len(), KEPT_ARTISTS)?;
-                require(artists.iter().all(ArtistView::valid))
+            Self::FoundArtists { artists, next } => {
+                check_page(artists.len(), PAGE_MAX_ITEMS, *next)?;
+                require(artists.iter().all(ArtistView::valid))?;
+                check_items(artists)
             }
-            Self::Tracked { artists } => {
-                within(artists.len(), LIST_MAX_ITEMS)?;
+            Self::Tracked { artists, next } => {
+                check_page(artists.len(), PAGE_MAX_ITEMS, *next)?;
                 require(unique(artists))
+            }
+            Self::ArtistNumbers { artists, next } => {
+                check_page(artists.len(), NUMBER_PAGE_MAX_ITEMS, *next)?;
+                require(unique(&artists.iter().map(|(id, _)| id).collect::<Vec<_>>()))
             }
             Self::KnownArtist { artist } => require(artist.as_ref().is_none_or(|(_, name)| safe_text(name, NAME_MAX_BYTES))),
-            Self::AlbumsOf { albums } => {
-                within(albums.len(), LIST_MAX_ITEMS)?;
-                require(albums.iter().all(|release| release.album.kind == Kind::Album && release.album.valid()))
+            Self::AlbumsOf { albums, next } => {
+                check_page(albums.len(), PAGE_MAX_ITEMS, *next)?;
+                require(albums.iter().all(|release| release.album.kind == Kind::Album && release.album.valid()))?;
+                check_items(albums)
             }
-            Self::ReleasesOf { releases } => {
-                within(releases.len(), LIST_MAX_ITEMS)?;
-                require(releases.iter().all(|release| release.album.valid()))
+            Self::ReleasesOf { releases, next } => {
+                check_page(releases.len(), PAGE_MAX_ITEMS, *next)?;
+                require(releases.iter().all(|release| release.album.valid()))?;
+                check_items(releases)
             }
-            Self::Listed { releases } => within(releases.len(), LIST_MAX_ITEMS),
-            Self::Busy { artists, .. } => {
-                within(artists.len(), BUSY_MAX_ARTISTS)?;
-                require(unique(artists))
+            Self::Listed { releases, next } => check_page(releases.len(), PAGE_MAX_ITEMS, *next),
+            Self::Busy { positions, .. } => {
+                within(positions.len(), BUSY_MAX_ARTISTS)?;
+                require(unique(positions) && positions.iter().all(|&at| usize::from(at) < BUSY_MAX_ARTISTS))
             }
-            Self::Pending { albums } => {
-                within(albums.len(), LIST_MAX_ITEMS)?;
-                require(albums.iter().all(PendingView::valid))
+            Self::Pending { albums, next } => {
+                check_page(albums.len(), PAGE_MAX_ITEMS, *next)?;
+                require(albums.iter().all(PendingView::valid))?;
+                check_items(albums)
             }
             _ => Ok(()),
         }
     }
 
-    fn limit(&self) -> usize {
+    fn list_fields(&self) -> &[&str] {
         match self {
-            Self::FoundReleases { .. } | Self::FoundAny { .. } | Self::FoundArtists { .. }
-            | Self::Tracked { .. } | Self::AlbumsOf { .. } | Self::ReleasesOf { .. }
-            | Self::Listed { .. } | Self::Busy { .. } | Self::Pending { .. } => LIST_REPLY_MAX_BYTES,
-            _ => SMALL_REPLY_MAX_BYTES,
+            Self::FoundReleases { .. } => &["albums", "singles"],
+            Self::FoundAny { .. } | Self::AlbumsOf { .. } | Self::Pending { .. } => &["albums"],
+            Self::FoundArtists { .. } | Self::Tracked { .. } | Self::ArtistNumbers { .. } => &["artists"],
+            Self::ReleasesOf { .. } | Self::Listed { .. } => &["releases"],
+            _ => &[],
         }
+    }
+}
+
+impl wire::Value for Answer {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let answer: Self = object_json(raw)?;
+        // Count unknown fields and whitespace inside each item's original JSON, too.
+        let fields = Fields::read(raw)?;
+        for key in answer.list_fields() {
+            let items: Vec<&RawValue> = wire::plain_json(raw_member(&fields, key)?.get())?;
+            if items.iter().any(|item| item.get().len() > ITEM_MAX_BYTES) {
+                return Err(BadMessage::TooLarge);
+            }
+        }
+        answer.check().map_err(BadMessage::from)?;
+        Ok(answer)
+    }
+}
+
+pub type Reply = account::Reply<Answer>;
+
+impl account::ReplyResult for Answer {
+    const MAX_DONE_BYTES: usize = LIST_REPLY_MAX_BYTES;
+
+    fn agrees(&self, _: &Receipt) -> bool {
+        self.check().is_ok()
     }
 }
 
@@ -572,128 +739,63 @@ impl fmt::Display for WireError {
     }
 }
 
-/// The transport must hand in the complete body, with its declared length confirmed.
-/// A sliced prefix of a larger body must never be passed here.
-pub fn read_call(body: &[u8]) -> Result<Message, WireError> {
-    let message: Message = decode(body, CALL_MAX_BYTES)?;
-    message.check()?;
-    Ok(message)
-}
-
-pub fn write_call(message: &Message) -> Result<Vec<u8>, WireError> {
-    message.check()?;
-    encode(message, CALL_MAX_BYTES)
-}
-
-// the design does not say which HTTP status to use for each typed answer. Follow
-// the account contract: read a typed answer only at 200; never follow a redirect.
-pub const REPLY_STATUS: u16 = 200;
-
-pub fn read_answer(status: u16, body: &[u8]) -> Result<Answer, WireError> {
-    if status != REPLY_STATUS {
-        return Err(WireError::Status);
+impl From<BadMessage> for WireError {
+    fn from(error: BadMessage) -> Self {
+        match error {
+            BadMessage::TooLarge => Self::TooLarge,
+            BadMessage::Form => Self::Form,
+            BadMessage::Status(_) => Self::Status,
+        }
     }
-    let answer: Answer = decode(body, LIST_REPLY_MAX_BYTES)?;
-    within_body(body.len(), answer.limit())?;
-    answer.check()?;
-    Ok(answer)
 }
 
-pub fn write_answer(answer: &Answer) -> Result<Vec<u8>, WireError> {
-    answer.check()?;
-    encode(answer, answer.limit())
+impl From<WireError> for BadMessage {
+    fn from(error: WireError) -> Self {
+        match error {
+            WireError::TooLarge => Self::TooLarge,
+            _ => Self::Form,
+        }
+    }
+}
+
+/// The transport must hand in the complete body, with its declared length confirmed.
+pub fn read_call(body: &[u8]) -> Result<Message, WireError> {
+    wire::read(body).map_err(Into::into)
+}
+
+pub fn write_call(message: &Message) -> Result<WireBody, WireError> {
+    message.call.check()?;
+    wire::encode(message).map_err(Into::into)
+}
+
+pub fn read_reply(status: u16, body: &[u8]) -> Result<Reply, WireError> {
+    let reply: Reply = account::read_reply(status, body)?;
+    within_body(body.len(), reply_limit(&reply))?;
+    Ok(reply)
+}
+
+pub fn write_reply(reply: &Reply) -> Result<WireBody, WireError> {
+    if let Reply::Done { result, .. } = reply {
+        result.check()?;
+    }
+    let bytes = wire::encode(reply)?;
+    within_body(bytes.bytes().len(), reply_limit(reply))?;
+    Ok(bytes)
+}
+
+fn reply_limit(reply: &Reply) -> usize {
+    match reply {
+        Reply::Done { result, .. } if !result.list_fields().is_empty() => LIST_REPLY_MAX_BYTES,
+        _ => SMALL_REPLY_MAX_BYTES,
+    }
 }
 
 fn within_body(size: usize, limit: usize) -> Result<(), WireError> {
     if size <= limit { Ok(()) } else { Err(WireError::TooLarge) }
 }
 
-fn decode<T: de::DeserializeOwned>(body: &[u8], limit: usize) -> Result<T, WireError> {
-    within_body(body.len(), limit)?;
-    let text = std::str::from_utf8(body).map_err(|_| WireError::Form)?;
-    let mut input = serde_json::Deserializer::from_str(text);
-    // Read the whole tree, including fields the typed reader will pass over.
-    de::DeserializeSeed::deserialize(Json(0), &mut input).map_err(|_| WireError::Form)?;
-    input.end().map_err(|_| WireError::Form)?;
-    let mut input = serde_json::Deserializer::from_str(text);
-    let value = object(&mut input).map_err(|_| WireError::Form)?;
-    input.end().map_err(|_| WireError::Form)?;
-    Ok(value)
-}
-
-fn encode(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, WireError> {
-    struct Bounded {
-        bytes: Vec<u8>,
-        limit: usize,
-        full: bool,
-    }
-
-    impl Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-                self.full = true;
-                return Err(io::ErrorKind::FileTooLarge.into());
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut out = Bounded { bytes: Vec::new(), limit, full: false };
-    serde_json::to_writer(&mut out, value).map_err(|_| if out.full { WireError::TooLarge } else { WireError::Form })?;
-    Ok(out.bytes)
-}
-
-/// A first pass, like hello's, checking the structure without keeping its values.
-struct Json(usize);
-
-impl<'de> de::DeserializeSeed<'de> for Json {
-    type Value = ();
-
-    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        deserializer.deserialize_any(self)
-    }
-}
-
-impl<'de> de::Visitor<'de> for Json {
-    type Value = ();
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a JSON value")
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<(), E> { Ok(()) }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> { Ok(()) }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> { Ok(()) }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> { Ok(()) }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> { Ok(()) }
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> { Ok(()) }
-
-    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        if self.0 >= HELLO_MAX_DEPTH {
-            return Err(de::Error::custom("nested too deep"));
-        }
-        while seq.next_element_seed(Json(self.0 + 1))?.is_some() {}
-        Ok(())
-    }
-
-    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        if self.0 >= HELLO_MAX_DEPTH {
-            return Err(de::Error::custom("nested too deep"));
-        }
-        let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key) {
-                return Err(de::Error::custom("a key given twice"));
-            }
-            map.next_value_seed(Json(self.0 + 1))?;
-        }
-        Ok(())
-    }
+fn object_json<T: de::DeserializeOwned>(raw: &RawValue) -> Result<T, BadMessage> {
+    object(&mut serde_json::Deserializer::from_str(raw.get())).map_err(|_| BadMessage::Form)
 }
 
 // Serde's struct reader also accepts an array of positional fields. Require JSON
@@ -750,12 +852,13 @@ impl RequestsAccess {
 }
 
 /// The caller supplies the authenticated account and role and the ownership recorded
-/// for this album. the design does not say who may cancel an unowned album or what
-/// happens if several accounts asked for it. Admin may act regardless; a member must
-/// appear among the album's recorded requesters. Apply the switch first for every call.
-pub fn may_cancel<Account: Eq>(access: RequestsAccess, account: &Account, admin: bool, requesters: &[Account]) -> Result<(), Refusal> {
+/// for this album. Apply the switch first for every call. the design does not say
+/// what happens if several accounts asked for it. A member may cancel only when
+/// every recorded requester is that member, so the removal cannot affect another
+/// account's request. An admin can cancel any album.
+pub fn may_cancel(access: RequestsAccess, account: AccountId, admin: bool, requesters: &[AccountId]) -> Result<(), Refusal> {
     access.check()?;
-    if admin || requesters.contains(account) { Ok(()) } else { Err(Refusal::NotAllowed) }
+    if admin || (!requesters.is_empty() && requesters.iter().all(|&requester| requester == account)) { Ok(()) } else { Err(Refusal::NotAllowed) }
 }
 
 /// One book per authenticated session, discarded when that session ends. S13 must
@@ -793,11 +896,13 @@ fn resolve<'a, T>(book: &'a VecDeque<Timed<T>>, id: &MusicBrainzId, now: i64) ->
 }
 
 impl SessionOffers {
-    /// Record exactly what was returned in a successfully encoded answer, with any
-    /// missing artist ID filled from backend records before making it actionable.
-    /// Time is monotonic seconds supplied by the server.
+    /// Record an offer from a successfully encoded answer, with any missing artist
+    /// ID filled from backend records before making it actionable. Resolve and copy
+    /// the offer into the queued job at begin so expiration cannot invalidate work
+    /// already accepted. Time is monotonic seconds supplied by the server.
     pub fn remember_album(&mut self, album: AlbumView, now: i64) -> Result<(), WireError> {
         require(album.valid() && album.artist_id.is_some())?;
+        check_items(std::slice::from_ref(&album))?;
         let id = album.album.0.clone();
         remember(&mut self.albums, KEPT_ALBUMS, id, album, now);
         Ok(())
@@ -805,6 +910,7 @@ impl SessionOffers {
 
     pub fn remember_artist(&mut self, artist: ArtistView, now: i64) -> Result<(), WireError> {
         require(artist.valid())?;
+        check_items(std::slice::from_ref(&artist))?;
         remember(&mut self.artists, KEPT_ARTISTS, artist.id.clone(), artist, now);
         Ok(())
     }
@@ -884,14 +990,14 @@ impl TryFrom<Single> for SingleView {
     type Error = WireError;
 
     fn try_from(single: Single) -> Result<Self, WireError> {
-        require(safe_text(&single.title, NAME_MAX_BYTES))?;
-        Ok(Self { title: single.title, artist_id: single.artist_id.try_into()?, votes: u64::try_from(single.votes).map_err(|_| WireError::Bounds)? })
+        require(safe_text(&single.title, NAME_MAX_BYTES) && single.votes >= 0)?;
+        Ok(Self { title: single.title, artist_id: single.artist_id.try_into()?, votes: single.votes })
     }
 }
 
 impl From<SingleView> for Single {
     fn from(view: SingleView) -> Self {
-        Self { title: view.title, artist_id: view.artist_id.into(), votes: i64::try_from(view.votes).unwrap_or(i64::MAX) }
+        Self { title: view.title, artist_id: view.artist_id.into(), votes: view.votes }
     }
 }
 
@@ -974,15 +1080,19 @@ pub struct TransportReply {
 }
 
 type SendCall<'a> = dyn Fn(&str, &[u8]) -> Result<TransportReply, TransportError> + Send + Sync + 'a;
+type SeeReceipt<'a> = dyn Fn(&Receipt) -> Result<(), RequestError> + Send + Sync + 'a;
 type Pause<'a> = dyn Fn(Duration) -> Result<(), TransportError> + Send + Sync + 'a;
 type NewId<'a> = dyn Fn() -> Result<RequestId, TransportError> + Send + Sync + 'a;
 
 /// The app supplies a POST transport, a cancellable wait and a source of action IDs.
 /// The transport pins the backend to the established origin and ID, supplies the
-/// session independently of the message, and returns only complete bodies.
+/// session independently of the message, and returns only complete bodies. Give
+/// every authenticated reply's receipt to the app's session/stamp rules before using
+/// its result (including for every page and every job poll).
 pub struct BackendLidarr<'a> {
-    head: Head,
+    head: RequestHead,
     send: Box<SendCall<'a>>,
+    see_receipt: Box<SeeReceipt<'a>>,
     pause: Box<Pause<'a>>,
     new_id: Box<NewId<'a>>,
 }
@@ -993,20 +1103,68 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 impl<'a> BackendLidarr<'a> {
     pub fn new(
-        head: Head,
+        head: RequestHead,
         send: impl Fn(&str, &[u8]) -> Result<TransportReply, TransportError> + Send + Sync + 'a,
+        see_receipt: impl Fn(&Receipt) -> Result<(), RequestError> + Send + Sync + 'a,
         pause: impl Fn(Duration) -> Result<(), TransportError> + Send + Sync + 'a,
         new_id: impl Fn() -> Result<RequestId, TransportError> + Send + Sync + 'a,
     ) -> Self {
-        Self { head, send: Box::new(send), pause: Box::new(pause), new_id: Box::new(new_id) }
+        Self { head, send: Box::new(send), see_receipt: Box::new(see_receipt), pause: Box::new(pause), new_id: Box::new(new_id) }
     }
 
     fn ask<T>(&self, call: Call, take: impl FnOnce(Answer) -> Option<T>) -> Result<T, RequestError> {
-        let body = write_call(&Message { head: self.head, call })?;
-        let answer = (self.send)(REQUESTS, &body)?;
-        match read_answer(answer.status, &answer.body)? {
-            Answer::Refused { reason } => Err(RequestError::Refused(reason)),
-            answer => take(answer).ok_or(RequestError::UnexpectedAnswer),
+        let head = RequestHead { speaks: self.head.speaks, restore: self.head.restore };
+        let body = write_call(&Message { head, call })?;
+        let answer = (self.send)(REQUESTS, body.bytes())?;
+        match read_reply(answer.status, &answer.body)? {
+            Reply::Done { result, receipt } => {
+                self.accept(&receipt)?;
+                match result {
+                    Answer::Refused { reason } => Err(RequestError::Refused(reason)),
+                    answer => take(answer).ok_or(RequestError::UnexpectedAnswer),
+                }
+            }
+            Reply::Refused(reason) => Err(account_refusal(&reason)),
+            Reply::RefusedWithReceipt(refused) => {
+                self.accept(refused.receipt())?;
+                Err(account_refusal(refused.reason()))
+            }
+        }
+    }
+
+    fn accept(&self, receipt: &Receipt) -> Result<(), RequestError> {
+        (self.see_receipt)(receipt)?;
+        if receipt.stamp.restore != self.head.restore {
+            return Err(RequestError::Refused(Refusal::StartAgain));
+        }
+        Ok(())
+    }
+
+    fn pages<T>(
+        &self,
+        call: impl Fn(Option<PageCursor>) -> Call,
+        take: impl Fn(Answer) -> Option<(Vec<T>, Option<PageCursor>)>,
+    ) -> Result<Vec<T>, RequestError> {
+        let mut all = Vec::new();
+        let mut after: Option<PageCursor> = None;
+        loop {
+            let (page, next) = self.ask(call(after), &take)?;
+            let count = all.len().saturating_add(page.len());
+            if count > LIST_MAX_ITEMS {
+                return Err(WireError::Bounds.into());
+            }
+            if let Some(next) = next {
+                if u32::try_from(count) != Ok(next.offset())
+                    || after.is_some_and(|old| old.snapshot() != next.snapshot())
+                {
+                    return Err(RequestError::UnexpectedAnswer);
+                }
+            }
+            all.extend(page);
+            match next {
+                None => return Ok(all),
+                Some(next) => after = Some(next),
+            }
         }
     }
 
@@ -1018,24 +1176,33 @@ impl<'a> BackendLidarr<'a> {
     }
 
     pub fn albums_of(&self, artist: LidarrNumber) -> Result<Vec<ReleaseView>, RequestError> {
-        self.ask(Call::AlbumsOf { artist }, |answer| match answer {
-            Answer::AlbumsOf { albums } => Some(albums),
+        self.pages(|after| Call::AlbumsOf { artist, after }, |answer| match answer {
+            Answer::AlbumsOf { albums, next } => Some((albums, next)),
             _ => None,
         })
     }
 
     pub fn listed(&self, artist: LidarrNumber) -> Result<Vec<ListedView>, RequestError> {
-        self.ask(Call::Listed { artist }, |answer| match answer {
-            Answer::Listed { releases } => Some(releases),
+        self.pages(|after| Call::Listed { artist, after }, |answer| match answer {
+            Answer::Listed { releases, next } => Some((releases, next)),
+            _ => None,
+        })
+    }
+
+    pub fn artist_numbers(&self) -> Result<Vec<(MusicBrainzId, LidarrNumber)>, RequestError> {
+        self.pages(|after| Call::ArtistNumbers { after }, |answer| match answer {
+            Answer::ArtistNumbers { artists, next } => Some((artists, next)),
             _ => None,
         })
     }
 
     pub fn busy(&self, artists: Vec<LidarrNumber>) -> Result<(Vec<LidarrNumber>, u64), RequestError> {
-        self.ask(Call::Busy { artists }, |answer| match answer {
-            Answer::Busy { artists, stamp } => Some((artists, stamp)),
+        let (positions, stamp) = self.ask(Call::Busy { artists: artists.clone() }, |answer| match answer {
+            Answer::Busy { positions, stamp } => Some((positions, stamp)),
             _ => None,
-        })
+        })?;
+        let busy = positions.into_iter().map(|at| artists.get(usize::from(at)).copied()).collect::<Option<Vec<_>>>();
+        Ok((busy.ok_or(RequestError::UnexpectedAnswer)?, stamp))
     }
 
     /// The same ID and change may be sent again after an ambiguous transport failure.
@@ -1083,36 +1250,65 @@ impl Completed {
     }
 }
 
+fn account_refusal(reason: &account::Refusal) -> RequestError {
+    let reason = match reason {
+        account::Refusal::Busy { .. } => Refusal::Busy,
+        account::Refusal::NotSignedIn(account::NotSignedIn::DataPutBack) => Refusal::StartAgain,
+        account::Refusal::NotSignedIn(account::NotSignedIn::SessionEnded) => Refusal::NotSignedIn,
+        account::Refusal::Malformed => Refusal::Malformed,
+        account::Refusal::NotAllowed(account::NotAllowed::Incompatible { .. }) => Refusal::Incompatible,
+        account::Refusal::NotAllowed(_) => Refusal::NotAllowed,
+        account::Refusal::NotDealtWith => Refusal::NotDealtWith,
+    };
+    RequestError::Refused(reason)
+}
+
 impl RequestLidarr for BackendLidarr<'_> {
     fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<Single>), String> {
+        enum Found {
+            Album(Offer),
+            Single(Single),
+        }
         let search = Search::new(term).ok_or_else(|| WireError::Bounds.to_string())?;
-        self.ask(Call::FindReleases { search }, |answer| match answer {
-            Answer::FoundReleases { albums, singles } => Some((albums.into_iter().map(Offer::from).collect(), singles.into_iter().map(Single::from).collect())),
+        let all = self.pages(|after| Call::FindReleases { search: search.clone(), after }, |answer| match answer {
+            Answer::FoundReleases { albums, singles, next } => {
+                let found = albums.into_iter().map(|album| Found::Album(album.into()))
+                    .chain(singles.into_iter().map(|single| Found::Single(single.into()))).collect();
+                Some((found, next))
+            }
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map_err(|error| error.to_string())?;
+        let (mut albums, mut singles) = (Vec::new(), Vec::new());
+        for found in all {
+            match found {
+                Found::Album(album) => albums.push(album),
+                Found::Single(single) => singles.push(single),
+            }
+        }
+        Ok((albums, singles))
     }
 
     fn find_any(&self, term: &str) -> Result<Vec<Offer>, String> {
         let search = Search::new(term).ok_or_else(|| WireError::Bounds.to_string())?;
-        self.ask(Call::FindAny { search }, |answer| match answer {
-            Answer::FoundAny { albums } => Some(albums.into_iter().map(Offer::from).collect()),
+        self.pages(|after| Call::FindAny { search: search.clone(), after }, |answer| match answer {
+            Answer::FoundAny { albums, next } => Some((albums, next)),
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map(|items| items.into_iter().map(Offer::from).collect()).map_err(|error| error.to_string())
     }
 
     fn find_artists(&self, term: &str) -> Result<Vec<ArtistOffer>, String> {
         let search = Search::new(term).ok_or_else(|| WireError::Bounds.to_string())?;
-        self.ask(Call::FindArtists { search }, |answer| match answer {
-            Answer::FoundArtists { artists } => Some(artists.into_iter().map(ArtistOffer::from).collect()),
+        self.pages(|after| Call::FindArtists { search: search.clone(), after }, |answer| match answer {
+            Answer::FoundArtists { artists, next } => Some((artists, next)),
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map(|items| items.into_iter().map(ArtistOffer::from).collect()).map_err(|error| error.to_string())
     }
 
     fn tracked(&self) -> Result<HashSet<String>, String> {
-        self.ask(Call::Tracked, |answer| match answer {
-            Answer::Tracked { artists } => Some(artists.into_iter().map(String::from).collect()),
+        self.pages(|after| Call::Tracked { after }, |answer| match answer {
+            Answer::Tracked { artists, next } => Some((artists, next)),
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map(|items| items.into_iter().map(String::from).collect()).map_err(|error| error.to_string())
     }
 
     fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String> {
@@ -1125,15 +1321,15 @@ impl RequestLidarr for BackendLidarr<'_> {
 
     fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
         let artist = LidarrNumber::try_from(artist).map_err(|error| error.to_string())?;
-        self.ask(Call::ReleasesOf { artist }, |answer| match answer {
-            Answer::ReleasesOf { releases } => Some(releases.into_iter().map(|release| {
-                let mut album = Offer::from(release.album);
-                // Like the direct implementation, use the artist page's display name.
-                album.artist = name.to_owned();
-                (album, release.have)
-            }).collect()),
+        self.pages(|after| Call::ReleasesOf { artist, after }, |answer| match answer {
+            Answer::ReleasesOf { releases, next } => Some((releases, next)),
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map(|items| items.into_iter().map(|release| {
+            let mut album = Offer::from(release.album);
+            // Like the direct implementation, use the artist page's display name.
+            album.artist = name.to_owned();
+            (album, release.have)
+        }).collect()).map_err(|error| error.to_string())
     }
 
     fn request(&self, wanted: &Offer, _: &dyn WayBack) -> Result<(), String> {
@@ -1145,9 +1341,433 @@ impl RequestLidarr for BackendLidarr<'_> {
     }
 
     fn pending(&self) -> Result<Vec<Pending>, String> {
-        self.ask(Call::Pending, |answer| match answer {
-            Answer::Pending { albums } => Some(albums.into_iter().map(Pending::from).collect()),
+        self.pages(|after| Call::Pending { after }, |answer| match answer {
+            Answer::Pending { albums, next } => Some((albums, next)),
             _ => None,
-        }).map_err(|error| error.to_string())
+        }).map(|items| items.into_iter().map(Pending::from).collect()).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nexus::account::{Stamp, StampTag};
+    use crate::nexus::proto::{BackendId, SPEAKS};
+    use std::sync::{Arc, Mutex};
+
+    fn id(number: u32) -> MusicBrainzId {
+        MusicBrainzId::new(&format!("c9110000-0000-4000-a000-{number:012x}")).unwrap()
+    }
+
+    fn cursor(offset: u32) -> Option<PageCursor> { PageCursor::new(NonZeroU64::new(5).unwrap(), offset) }
+
+    fn one() -> LidarrNumber { LidarrNumber::new(1).unwrap() }
+    fn request_id() -> RequestId { RequestId::new(6).unwrap() }
+    fn job() -> JobId { JobId(NonZeroU64::new(8).unwrap()) }
+
+    fn message(call: Call) -> Message {
+        Message { head: RequestHead { speaks: SPEAKS, restore: 2 }, call }
+    }
+
+    fn receipt() -> Receipt {
+        Receipt {
+            stamp: Stamp { backend: BackendId::from_bytes([9; 16]), restore: 2, account: AccountId::new(4).unwrap(), life: 3, change: 1, tag: StampTag::from_bytes([7; 32]) },
+            music_login_count: 5,
+        }
+    }
+
+    fn reply(result: Answer) -> Reply { Reply::Done { result, receipt: receipt() } }
+
+    fn album(number: u32) -> AlbumView {
+        AlbumView {
+            album: OfferName(id(number)), title: "Étoiles et Poussière".into(), artist_id: Some(id(1)), artist: "Marrow Lake".into(),
+            year: "2024".into(), cover: "https://art.example.test/album".into(), requested: false, kind: Kind::Album, soundtrack: false,
+        }
+    }
+
+    fn artist(number: u32) -> ArtistView {
+        ArtistView { id: id(number), name: "Marrow Lake".into(), about: "A band".into(), cover: String::new() }
+    }
+
+    #[test]
+    fn every_call_round_trips_in_the_account_head() {
+        let search = Search::new("Étoiles et Poussière").unwrap();
+        let line = BatchLine { artist: "Marrow Lake".into(), album: String::new(), song: "At Dawn".into() };
+        let offer = OfferName(id(2));
+        let changes = [
+            Change::Request { offer: offer.clone() },
+            Change::AddArtist { artist: id(1) },
+            Change::AddWanting { offers: vec![offer.clone()] },
+            Change::Want { artist: one(), albums: vec![one()] },
+            Change::ListSingles { artist: one(), offer },
+            Change::Cancel { album: one() },
+            Change::Batch { lines: vec![line] },
+        ];
+        let calls = [
+            Call::Status, Call::FindReleases { search: search.clone(), after: None }, Call::FindAny { search: search.clone(), after: cursor(1) },
+            Call::FindArtists { search, after: cursor(2) }, Call::Tracked { after: cursor(3) }, Call::ArtistNumbers { after: cursor(5_000) },
+            Call::KnownArtist { artist: id(1) }, Call::AlbumsOf { artist: one(), after: cursor(4) }, Call::ReleasesOf { artist: one(), after: cursor(5) },
+            Call::Listed { artist: one(), after: cursor(6) }, Call::Busy { artists: vec![one()] }, Call::Pending { after: cursor(7) }, Call::After { job: job() },
+        ];
+        for call in calls.into_iter().chain(changes.into_iter().map(|change| Call::Begin { request_id: request_id(), change })) {
+            let sent = message(call);
+            assert_eq!(read_call(write_call(&sent).unwrap().bytes()), Ok(sent));
+        }
+        assert_eq!(crate::nexus::proto::plain(REQUESTS), Ok(()));
+    }
+
+    #[test]
+    fn every_answer_round_trips_with_the_c7_stamp() {
+        let album = album(2);
+        let release = ReleaseView { album: album.clone(), have: true };
+        let single = SingleView { title: "At Dawn".into(), artist_id: id(1), votes: i64::MAX };
+        let pending = PendingView { id: one(), album: id(2), title: album.title.clone(), artist: album.artist.clone(), progress: Some(100) };
+        let done = [
+            Completed::Requested, Completed::ArtistAdded { count: u32::MAX }, Completed::AddedWanting { artist: one() },
+            Completed::Wanted, Completed::ListedSingles, Completed::Cancelled, Completed::Batch,
+        ];
+        let answers = [
+            Answer::Status { lidarr: Availability::Ready },
+            Answer::FoundReleases { albums: vec![album.clone()], singles: vec![single], next: None },
+            Answer::FoundAny { albums: vec![album], next: cursor(1) },
+            Answer::FoundArtists { artists: vec![artist(1)], next: None },
+            Answer::Tracked { artists: vec![id(1)], next: None },
+            Answer::ArtistNumbers { artists: vec![(id(1), LidarrNumber::new(i64::MAX).unwrap())], next: None },
+            Answer::KnownArtist { artist: Some((one(), "Marrow Lake".into())) }, Answer::KnownArtist { artist: None },
+            Answer::AlbumsOf { albums: vec![release.clone()], next: None }, Answer::ReleasesOf { releases: vec![release], next: None },
+            Answer::Listed { releases: vec![ListedView { album: id(2), id: one(), wanted: true, have: false }], next: None },
+            Answer::Busy { positions: vec![0, 499], stamp: u64::MAX },
+            Answer::Pending { albums: vec![pending], next: None }, Answer::Begun { job: job() }, Answer::Working,
+            Answer::Failed { reason: Refusal::LidarrRefused }, Answer::Refused { reason: Refusal::SwitchedOff },
+        ];
+        let replies = answers.into_iter().chain(done.into_iter().map(|result| Answer::Done { result })).map(reply)
+            .chain([
+                Reply::Refused(account::Refusal::NotSignedIn(account::NotSignedIn::SessionEnded)),
+                Reply::RefusedWithReceipt(account::RefusedWithReceipt::new(account::Refusal::Busy { retry_after_seconds: None }, receipt()).unwrap()),
+            ]);
+        for sent in replies {
+            let bytes = write_reply(&sent).unwrap();
+            assert_eq!(read_reply(sent.status(), bytes.bytes()), Ok(sent));
+            assert_eq!(read_reply(302, bytes.bytes()), Err(WireError::Status));
+        }
+    }
+
+    #[test]
+    fn the_whole_tree_uses_the_shared_strict_reader() {
+        fn read(call: &str) -> Result<Message, WireError> {
+            read_call(format!(r#"{{"head":{{"speaks":[1,1],"restore":2}},"call":{call}}}"#).as_bytes())
+        }
+        assert_eq!(read(r#"{"ask":"status","future":{"band":["Étoiles"]}}"#), Ok(message(Call::Status)));
+        for call in [
+            r#"{"ask":"status","ask":"status"}"#,
+            r#"{"ask":"status","future":{"word":0,"w\u006frd":1}}"#,
+            r#"{"ask":"status","future":"\uD800"}"#,
+            r#"{"ask":"find_any","after":null,"search":7}"#,
+            r#"{"ask":"find_any","search":"Marrow Lake"}"#,
+            r#"{"ask":"find_any","after":null,"search":"lidarr:one"}"#,
+            r#"{"ask":"releases_of","after":null,"artist":-3}"#,
+            r#"{"ask":"releases_of","after":null,"artist":0}"#,
+            r#"{"ask":"releases_of","after":null,"artist":1.0}"#,
+            r#"{"ask":"releases_of","after":null,"artist":"5"}"#,
+            r#"{"ask":"tracked","after":[0,1]}"#,
+            r#"{"ask":"tracked","after":[2,0]}"#,
+            r#"{"ask":"tracked","after":[2,50000]}"#,
+            r#"{"ask":"begin","request_id":0,"change":{"change":"cancel","album":5}}"#,
+            r#"{"ask":"after","job":0}"#,
+            r#"{"ask":"begin","request_id":1,"change":{"change":"batch","lines":[["B","A","S"]]}}"#,
+            r#"{"ask":"begin","request_id":1,"change":{"change":"request","offer":{"title":"At Dawn"}}}"#,
+            r#"{"ask":"begin","request_id":1,"change":{"change":"set_new_releases","setting":"all"}}"#,
+        ] {
+            assert!(read(call).is_err(), "{call}");
+        }
+        let nested = |depth| format!(r#"{{"ask":"status","future":{}0{}}}"#, "[".repeat(depth), "]".repeat(depth));
+        assert!(read(&nested(14)).is_ok());
+        assert!(read(&nested(15)).is_err());
+        let mut bad = br#"{"head":{"speaks":[1,1],"restore":2},"call":{"ask":"status"},"future":""#.to_vec();
+        bad.extend_from_slice(&[0xff, b'"', b'}']);
+        assert!(read_call(&bad).is_err());
+        let good = write_call(&message(Call::Status)).unwrap();
+        let mut tail = good.bytes().to_vec();
+        tail.extend_from_slice(b"{}");
+        assert!(read_call(&tail).is_err());
+        assert!(read_call(good.bytes().get(..good.bytes().len() - 1).unwrap()).is_err());
+        assert!(read_call(br#"{"head":[[1,1],2],"call":{"ask":"status"}}"#).is_err());
+
+        let encoded = write_reply(&reply(Answer::Refused { reason: Refusal::Busy })).unwrap();
+        let text = std::str::from_utf8(encoded.bytes()).unwrap();
+        assert!(read_reply(200, text.replace(r#""busy""#, r#""surprise""#).as_bytes()).is_err());
+        assert!(read_reply(200, text.replace(r#""busy""#, "7").as_bytes()).is_err());
+        assert!(read_reply(200, text.replace(r#""busy""#, r#""busy","future":{"a":1,"a":2}"#).as_bytes()).is_err());
+        assert!(read_reply(200, text.replace(r#""busy""#, r#""busy","future":{"a":1}"#).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn messages_pages_and_each_list_item_have_their_own_limits() {
+        fn padded(bytes: &WireBody, length: usize) -> Vec<u8> {
+            let mut bytes = bytes.bytes().to_vec();
+            bytes.resize(length, b' ');
+            bytes
+        }
+        let call = write_call(&message(Call::Status)).unwrap();
+        assert!(read_call(&padded(&call, CALL_MAX_BYTES)).is_ok());
+        assert_eq!(read_call(&padded(&call, CALL_MAX_BYTES + 1)), Err(WireError::TooLarge));
+        for answer in [Answer::Status { lidarr: Availability::Ready }, Answer::Working, Answer::Refused { reason: Refusal::Busy }] {
+            let small = write_reply(&reply(answer)).unwrap();
+            assert!(read_reply(200, &padded(&small, SMALL_REPLY_MAX_BYTES)).is_ok());
+            assert_eq!(read_reply(200, &padded(&small, SMALL_REPLY_MAX_BYTES + 1)), Err(WireError::TooLarge));
+        }
+        let list = write_reply(&reply(Answer::Pending { albums: vec![], next: None })).unwrap();
+        assert!(read_reply(200, &padded(&list, LIST_REPLY_MAX_BYTES)).is_ok());
+        assert_eq!(read_reply(200, &padded(&list, LIST_REPLY_MAX_BYTES + 1)), Err(WireError::TooLarge));
+        assert_eq!(write_reply(&reply(Answer::Tracked { artists: vec![], next: cursor(1) })).map(drop), Err(WireError::Bounds));
+
+        let artists = (0..=PAGE_MAX_ITEMS).map(|at| id(at as u32)).collect::<Vec<_>>();
+        assert!(write_reply(&reply(Answer::Tracked { artists: artists.iter().take(PAGE_MAX_ITEMS).cloned().collect(), next: cursor(PAGE_MAX_ITEMS as u32) })).is_ok());
+        assert_eq!(write_reply(&reply(Answer::Tracked { artists, next: None })).map(drop), Err(WireError::Bounds));
+        let artists = (0..=NUMBER_PAGE_MAX_ITEMS).map(|at| (id(at as u32), one())).collect::<Vec<_>>();
+        assert!(write_reply(&reply(Answer::ArtistNumbers { artists: artists.iter().take(NUMBER_PAGE_MAX_ITEMS).cloned().collect(), next: cursor(NUMBER_PAGE_MAX_ITEMS as u32) })).is_ok());
+        assert_eq!(write_reply(&reply(Answer::ArtistNumbers { artists, next: None })).map(drop), Err(WireError::Bounds));
+
+        let mut album = album(1);
+        album.title.clear();
+        let base = serde_json::to_vec(&album).unwrap().len();
+        album.title = "x".repeat(ITEM_MAX_BYTES - base);
+        let exact = write_reply(&reply(Answer::FoundAny { albums: vec![album.clone()], next: None })).unwrap();
+        assert!(read_reply(200, exact.bytes()).is_ok());
+        let over = std::str::from_utf8(exact.bytes()).unwrap().replace(r#""soundtrack":false"#, r#""soundtrack":false,"future":0"#);
+        assert_eq!(read_reply(200, over.as_bytes()), Err(WireError::TooLarge));
+        album.title.push('x');
+        assert_eq!(write_reply(&reply(Answer::FoundAny { albums: vec![album], next: None })).map(drop), Err(WireError::TooLarge));
+    }
+
+    #[test]
+    fn selections_searches_and_batch_fields_are_bounded() {
+        assert!(Search::new(&"🎵".repeat(SEARCH_MAX_CHARS)).is_some());
+        for term in ["", "   ", "hi\u{0000}there", "lidarr:", "lidarr:44", " Lidarr:44", "lidarr:44?album=1"] {
+            assert!(Search::new(term).is_none(), "{term}");
+        }
+        assert!(Search::new(&"🎵".repeat(SEARCH_MAX_CHARS + 1)).is_none());
+        assert!(Search::new(&format!("lidarr:{}", id(1).as_str())).is_some());
+        assert!(MusicBrainzId::new(&id(1).as_str().to_uppercase()).is_none());
+
+        let musicians = (1..=BUSY_MAX_ARTISTS + 1).map(|n| LidarrNumber::new(n as i64).unwrap()).collect::<Vec<_>>();
+        assert!(write_call(&message(Call::Busy { artists: musicians.iter().take(BUSY_MAX_ARTISTS).copied().collect() })).is_ok());
+        assert_eq!(write_call(&message(Call::Busy { artists: musicians })).map(drop), Err(WireError::Bounds));
+        let busy = reply(Answer::Busy { positions: (0..BUSY_MAX_ARTISTS as u16).collect(), stamp: u64::MAX });
+        assert!(write_reply(&busy).unwrap().bytes().len() <= SMALL_REPLY_MAX_BYTES);
+
+        let change = |change| write_call(&message(Call::Begin { request_id: request_id(), change })).map(drop);
+        let line = BatchLine { artist: "Marrow Lake".into(), album: "".into(), song: "x".repeat(SEARCH_MAX_CHARS) };
+        assert_eq!(change(Change::Batch { lines: vec![line.clone(); BATCH_MAX_LINES] }), Ok(()));
+        assert_eq!(change(Change::Batch { lines: vec![line.clone(); BATCH_MAX_LINES + 1] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::Batch { lines: vec![BatchLine { album: "a".repeat(SEARCH_MAX_CHARS + 1), ..line.clone() }] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::Batch { lines: vec![BatchLine { album: "(mix) lidarr:7".into(), ..line.clone() }] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::Batch { lines: vec![BatchLine { artist: "a".repeat(SEARCH_MAX_CHARS + 1), ..line }] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::Want { artist: one(), albums: vec![one(); 2] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::AddWanting { offers: vec![] }), Err(WireError::Bounds));
+        assert_eq!(cursor(LIST_MAX_ITEMS as u32), None);
+    }
+
+    #[test]
+    fn the_session_only_keeps_its_recent_offers_with_both_limits() {
+        let mut book = SessionOffers::default();
+        let other = SessionOffers::default();
+        for at in 0..=KEPT_ALBUMS {
+            book.remember_album(album(at as u32), 0).unwrap();
+        }
+        for at in 0..=KEPT_ARTISTS {
+            book.remember_artist(artist(at as u32), 0).unwrap();
+        }
+        assert_eq!(book.album(&OfferName(id(0)), 0), Err(Refusal::SearchAgain));
+        assert_eq!(book.artist(&id(0), 0), Err(Refusal::SearchAgain));
+        assert_eq!(other.album(&OfferName(id(1)), 0), Err(Refusal::SearchAgain));
+        assert_eq!(other.artist(&id(1), 0), Err(Refusal::SearchAgain));
+        assert_eq!(book.album(&OfferName(id(1)), OFFER_LIFETIME_SECONDS - 1), Ok(&album(1)));
+        assert_eq!(book.artist(&id(1), OFFER_LIFETIME_SECONDS), Err(Refusal::SearchAgain));
+        assert_eq!(book.album(&OfferName(id(1)), i64::MAX), Err(Refusal::SearchAgain));
+
+        book.remember_album(album(1), 10).unwrap();
+        assert_eq!(book.album(&OfferName(id(1)), OFFER_LIFETIME_SECONDS), Ok(&album(1)));
+        assert_eq!(book.album(&OfferName(id(1)), 9), Err(Refusal::SearchAgain));
+        assert_eq!(book.album(&OfferName(id(1)), OFFER_LIFETIME_SECONDS + 10), Err(Refusal::SearchAgain));
+        assert_eq!(book.remember_album(AlbumView { artist_id: None, ..album(1) }, 0), Err(WireError::Bounds));
+    }
+
+    #[test]
+    fn only_the_requesting_account_or_an_admin_may_take_it_off() {
+        let on = RequestsAccess::default();
+        assert_eq!(on, RequestsAccess::On);
+        let me = AccountId::new(1).unwrap();
+        let other = AccountId::new(2).unwrap();
+        assert_eq!(may_cancel(on, me, false, &[me]), Ok(()));
+        assert_eq!(may_cancel(on, me, false, &[other]), Err(Refusal::NotAllowed));
+        assert_eq!(may_cancel(on, me, false, &[]), Err(Refusal::NotAllowed));
+        assert_eq!(may_cancel(on, me, false, &[me, other]), Err(Refusal::NotAllowed));
+        assert_eq!(may_cancel(on, me, true, &[other]), Ok(()));
+        assert_eq!(may_cancel(on, me, true, &[]), Ok(()));
+        assert_eq!(may_cancel(RequestsAccess::Off, me, true, &[me]), Err(Refusal::SwitchedOff));
+    }
+
+    #[test]
+    fn the_client_pages_and_waits_for_a_change_with_only_an_offer_name() {
+        let steps = Mutex::new(Vec::new());
+        let polls = Mutex::new(0usize);
+        let client = BackendLidarr::new(
+            message(Call::Status).head,
+            |path, body| {
+                assert_eq!(path, REQUESTS);
+                let message = read_call(body).unwrap();
+                assert_eq!(message.head.restore, 2);
+                let mut steps = steps.lock().unwrap();
+                let answer = match message.call {
+                    Call::Tracked { after: None } => Answer::Tracked { artists: vec![id(1)], next: cursor(1) },
+                    Call::Tracked { after } if after == cursor(1) => Answer::Tracked { artists: vec![id(2)], next: None },
+                    Call::Begin { request_id: got, change: Change::Request { offer } } => {
+                        assert_eq!(got, request_id());
+                        assert_eq!(offer, OfferName(id(3)));
+                        Answer::Begun { job: job() }
+                    }
+                    Call::After { job: got } => {
+                        assert_eq!(got, job());
+                        let mut polls = polls.lock().unwrap();
+                        *polls += 1;
+                        if *polls == 1 { Answer::Working } else { Answer::Done { result: Completed::Requested } }
+                    }
+                    call => panic!("unexpected {call:?}"),
+                };
+                steps.push(match &answer {
+                    Answer::Tracked { .. } => "page", Answer::Begun { .. } => "begin",
+                    Answer::Working => "working", Answer::Done { .. } => "done",
+                    _ => panic!("unexpected answer"),
+                });
+                let body = write_reply(&reply(answer)).unwrap();
+                Ok(TransportReply { status: 200, body: body.bytes().to_vec() })
+            },
+            |seen| { assert_eq!(*seen, receipt()); steps.lock().unwrap().push("stamp"); Ok(()) },
+            |wait| { assert_eq!(wait, POLL_INTERVAL); steps.lock().unwrap().push("wait"); Ok(()) },
+            || Ok(request_id()),
+        );
+        assert_eq!(client.tracked(), Ok(HashSet::from([id(1).into(), id(2).into()])));
+        let offer = Offer { title: "tampered".into(), artist: "caller-supplied".into(), kind: "not a kind".into(), ..album(3).into() };
+        assert_eq!(client.request(&offer, &crate::lidarr::tests::Noted::default()), Ok(()));
+        assert_eq!(*steps.lock().unwrap(), ["page", "stamp", "page", "stamp", "begin", "stamp", "working", "stamp", "wait", "done", "stamp"]);
+    }
+
+    #[test]
+    fn a_page_cannot_skip_a_place_or_move_to_another_snapshot() {
+        let reply_with = |cursor_for_second_page| {
+            BackendLidarr::new(
+                message(Call::Status).head,
+                move |_, body| {
+                    let answer = match read_call(body).unwrap().call {
+                        Call::Tracked { after: None } => Answer::Tracked { artists: vec![id(1)], next: cursor(1) },
+                        Call::Tracked { after } if after == cursor(1) => Answer::Tracked { artists: vec![id(2)], next: cursor_for_second_page },
+                        _ => panic!("an inconsistent cursor was followed"),
+                    };
+                    let bytes = write_reply(&reply(answer)).unwrap();
+                    Ok(TransportReply { status: 200, body: bytes.bytes().to_vec() })
+                },
+                |_| Ok(()), |_| panic!("a read waited"), || panic!("a read wanted a change ID"),
+            ).tracked()
+        };
+        let different = PageCursor::new(NonZeroU64::new(6).unwrap(), 2);
+        let expected = Err(RequestError::UnexpectedAnswer.to_string());
+        assert_eq!(reply_with(cursor(3)), expected);
+        assert_eq!(reply_with(different), expected);
+    }
+
+    #[test]
+    fn stamp_checks_and_a_local_stop_happen_before_a_result_is_used() {
+        let client = BackendLidarr::new(
+            message(Call::Status).head,
+            |_, body| {
+                assert_eq!(read_call(body).unwrap().call, Call::Status);
+                let mut receipt = receipt();
+                receipt.stamp.restore = 3;
+                let reply = Reply::Done { result: Answer::Status { lidarr: Availability::Ready }, receipt };
+                Ok(TransportReply { status: 200, body: write_reply(&reply).unwrap().bytes().to_vec() })
+            },
+            |seen| { assert_eq!(seen.stamp.restore, 3); Ok(()) },
+            |_| panic!("status waited"), || panic!("status wanted a change ID"),
+        );
+        assert_eq!(client.status(), Err(RequestError::Refused(Refusal::StartAgain)));
+
+        let waits = Mutex::new(0);
+        let client = BackendLidarr::new(
+            message(Call::Status).head,
+            |_, body| {
+                let answer = match read_call(body).unwrap().call {
+                    Call::Begin { change: Change::Request { .. }, .. } => Answer::Begun { job: job() },
+                    Call::After { job: got } if got == job() => {
+                        assert_eq!(*waits.lock().unwrap(), 0);
+                        Answer::Working
+                    }
+                    _ => panic!("unexpected call"),
+                };
+                Ok(TransportReply { status: 200, body: write_reply(&reply(answer)).unwrap().bytes().to_vec() })
+            },
+            |_| Ok(()),
+            |_| { *waits.lock().unwrap() += 1; Err(TransportError::Stopped) },
+            || Ok(request_id()),
+        );
+        assert_eq!(client.request(&album(3).into(), &crate::lidarr::tests::Noted::default()), Err(crate::http::STOPPED.into()));
+        assert_eq!(*waits.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_standin_only_feeds_decoded_searches_to_the_existing_lidarr_address_builders() {
+        use crate::http::{Failure, Http, Request, Response};
+        use crate::lidarr::Lidarr;
+        struct Record(Mutex<Vec<String>>);
+        impl Http for Record {
+            fn send(&self, request: &Request) -> Result<Response, Failure> {
+                self.0.lock().unwrap().push(request.url.to_owned());
+                Ok(Response::new(200, Vec::new(), || Ok("[]".into())))
+            }
+        }
+        let http = Arc::new(Record(Mutex::new(Vec::new())));
+        let lidarr = Lidarr::new("https://lidarr.example.test/local", "made-up-key", None, http.clone());
+        let text = "Étoiles https://example.test/x?extra=1&next=/api#part %2F";
+        let client = BackendLidarr::new(
+            message(Call::Status).head,
+            |path, body| {
+                assert_eq!(path, REQUESTS);
+                // An unknown caller-supplied URL/headers cannot survive the typed read.
+                let mut body = std::str::from_utf8(body).unwrap().to_owned();
+                body.pop();
+                body.push_str(r#","url":"https://example.test/","headers":{"Authorization":"fake-token"}}"#);
+                let answer = match read_call(body.as_bytes()).unwrap().call {
+                    Call::FindReleases { search, after: None } => {
+                        assert_eq!(lidarr.find_releases(search.as_str()), Ok((vec![], vec![])));
+                        Answer::FoundReleases { albums: vec![], singles: vec![], next: None }
+                    }
+                    Call::FindAny { search, after: None } => {
+                        assert_eq!(lidarr.find_any(search.as_str()), Ok(vec![]));
+                        Answer::FoundAny { albums: vec![], next: None }
+                    }
+                    Call::FindArtists { search, after: None } => {
+                        assert_eq!(lidarr.find_artists(search.as_str()), Ok(vec![]));
+                        Answer::FoundArtists { artists: vec![], next: None }
+                    }
+                    call => panic!("unexpected {call:?}"),
+                };
+                Ok(TransportReply { status: 200, body: write_reply(&reply(answer)).unwrap().bytes().to_vec() })
+            },
+            |_| Ok(()), |_| panic!("lookup waited"), || panic!("lookup issued a change ID"),
+        );
+        assert!(client.find_releases(text).is_ok());
+        assert!(client.find_any(text).is_ok());
+        assert!(client.find_artists(text).is_ok());
+        let urls = http.0.lock().unwrap();
+        assert_eq!(urls.len(), 3);
+        for (url, path) in urls.iter().zip(["album/lookup", "album/lookup", "artist/lookup"]) {
+            let url = url::Url::parse(url).unwrap();
+            assert_eq!(url.scheme(), "https");
+            assert_eq!(url.host_str(), Some("lidarr.example.test"));
+            assert_eq!(url.path(), format!("/local/api/v1/{path}"));
+            assert_eq!(url.fragment(), None);
+            assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("term".into(), text.into())]);
+        }
+        assert!(client.find_any("lidarr:bad").is_err());
     }
 }

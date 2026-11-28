@@ -928,6 +928,8 @@ pub fn count(n: usize, noun: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::lidarr::Lidarr;
+
     #[test]
     fn a_request_by_itself_writes_its_way_back_down_before_lidarr_is_changed() {
         use crate::lidarr::tests::{KilledAfterChange, Noted, Stopping, single};
