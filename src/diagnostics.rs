@@ -10,7 +10,7 @@ use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 use chrono::Utc;
-use nexus_core::nexus::{account::DeviceKind, diag, events::LossCounts, proto::Version};
+use nexus_core::nexus::{account::DeviceKind, diag, proto::Version};
 use slint::ComponentHandle;
 
 pub(crate) use diag::{FaultPlace, FaultShape, Line, Note, SoundOutput};
@@ -95,6 +95,19 @@ pub fn observe(line: diag::Line) {
 }
 
 pub(crate) fn fault(place: FaultPlace, shape: FaultShape) {
+    use crate::journal::FaultPlace as JournalPlace;
+    let journal_place = match place {
+        FaultPlace::Playback => JournalPlace::Playback,
+        FaultPlace::AudioOutput => JournalPlace::AudioOutput,
+        FaultPlace::Library => JournalPlace::Library,
+        FaultPlace::Downloads => JournalPlace::Downloads,
+        FaultPlace::Foreground => JournalPlace::Foreground,
+        FaultPlace::MusicServer => JournalPlace::MusicServer,
+        FaultPlace::NexusServer => JournalPlace::NexusServer,
+        FaultPlace::Journal => JournalPlace::Journal,
+        FaultPlace::Updates | FaultPlace::App => JournalPlace::App,
+    };
+    crate::journal::fault(crate::journal::Fault { place: journal_place, shape });
     observe(Line::Fault(diag::Fault::new(place, shape)));
 }
 
@@ -210,8 +223,7 @@ impl Session {
                 offline: self.offline,
                 local_permission: None,
                 android_auto: None,
-                // The Windows journal will supply its totals when W8 exists.
-                loss: LossCounts::default(),
+                loss: crate::journal::losses(),
                 pc: Some(self.pc),
             },
             record,
@@ -341,6 +353,7 @@ mod windows_observations {
             Some(SourceFile::Downloads | SourceFile::Songcache) => FaultPlace::Downloads,
             Some(SourceFile::Subsonic | SourceFile::Offline) => FaultPlace::MusicServer,
             Some(SourceFile::Nexus) => FaultPlace::NexusServer,
+            Some(SourceFile::Journal | SourceFile::JournalReader | SourceFile::JournalWriter) => FaultPlace::Journal,
             Some(SourceFile::Actions | SourceFile::Pages | SourceFile::Search | SourceFile::Playlists | SourceFile::Covers) => FaultPlace::Library,
             _ => FaultPlace::App,
         };

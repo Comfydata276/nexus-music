@@ -270,6 +270,9 @@ source_files! {
     Import => "src/import.rs", "import.rs";
     Instance => "src/instance.rs", "instance.rs";
     Jam => "src/jam.rs", "jam.rs";
+    Journal => "src/journal.rs", "journal.rs";
+    JournalReader => "src/journal/reader.rs", "reader.rs";
+    JournalWriter => "src/journal/writer.rs", "writer.rs";
     Keep => "src/keep.rs", "keep.rs";
     Lidarr => "src/lidarr.rs", "lidarr.rs";
     Link => "src/link.rs", "link.rs";
