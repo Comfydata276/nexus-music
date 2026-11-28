@@ -1465,19 +1465,19 @@ impl Requests {
             endpoint: endpoint.clone(), runtime: runtime.clone(), within: UPSTREAM_TIMEOUT,
             deadline: None, before_write: Some(pre_write),
         }));
-        let _mutation = (!matches!(job.change, Change::Batch { .. })).then(|| lock(&self.mutation));
-        let result = if let Change::Batch { singles, lines } = &job.change {
-            match self.run_batch(&job, &journal, &lidarr, *singles, lines) {
-                Ok(Some(asked)) => Ok((Completed::Batch, asked, None)),
-                Ok(None) => return,
-                Err(reason) => Err(reason),
+        if let Change::Batch { singles, lines } = &job.change {
+            if let Err(reason) = self.run_batch(&job, &journal, &lidarr, *singles, lines) {
+                let _ = journal.ask(move |keeper, now, row| {
+                    finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)
+                });
             }
-        } else {
-            let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, credential.key.expose(), None));
-            cleaned.and_then(|()| {
-                if job.recovering { job.recover(&lidarr) } else { job.run(&journal, &lidarr) }
-            })
-        };
+            return;
+        }
+        let _mutation = lock(&self.mutation);
+        let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, credential.key.expose(), None));
+        let result = cleaned.and_then(|()| {
+            if job.recovering { job.recover(&lidarr) } else { job.run(&journal, &lidarr) }
+        });
         let account = job.account;
         let binding = job.plan.binding;
         let (result, adds, removed) = match result {
@@ -1858,7 +1858,7 @@ fn pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId)
 impl Requests {
     fn run_batch(
         &self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine],
-    ) -> Result<Option<Vec<AskedRelease>>, Refusal> {
+    ) -> Result<(), Refusal> {
         let desk = BatchDesk { journal: journal.clone(), singles };
         let batch = if let Some(payload) = &job.plan.prepared_batch {
             loaded_bulk(payload, desk)?
@@ -1872,7 +1872,7 @@ impl Requests {
                 }
             }
             if waiting {
-                return Ok(None);
+                return Ok(());
             }
             let batch = bulk::Job::new(desk);
             lidarr_result(batch.start_indexed(wants), None)?;
@@ -1901,15 +1901,15 @@ impl Requests {
             matches!(line.state, bulk::State::Asked | bulk::State::Done).then_some(line.offer).flatten()
         }));
         let asked = views.iter().map(asked_release).collect::<Result<Vec<_>, _>>()?;
-        if let Err(reason) = worked {
-            let account = job.account;
-            let binding = job.plan.binding;
-            journal.ask(move |keeper, now, row| {
-                finish_job(keeper, now, row, &JobResult::Failed(reason), &asked, Some((binding, account, None)))
-            })?;
-            return Err(reason);
-        }
-        Ok(Some(asked))
+        let result = match worked {
+            Ok(()) => JobResult::Done(Completed::Batch),
+            Err(reason) => JobResult::Failed(reason),
+        };
+        let account = job.account;
+        let binding = job.plan.binding;
+        journal.ask(move |keeper, now, row| {
+            finish_job(keeper, now, row, &result, &asked, Some((binding, account, None)))
+        })
     }
 }
 

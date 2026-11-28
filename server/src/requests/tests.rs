@@ -592,8 +592,15 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     let first = server.redeem(first_code, 2, "");
     let other = server.redeem(other_code, 3, "");
 
-    let unauthenticated = server.socket(wire::REQUESTS, None, "", 4096);
-    assert_eq!(read_http(unauthenticated).0, 401, "the listener waited for a stranger's body");
+    let unknown = account::Session::from_bytes([17; 32]);
+    let forged = format!("Authorization: {}\r\n", unknown.authorization().as_str());
+    for headers in ["", forged.as_str()] {
+        let unauthenticated = server.socket(wire::REQUESTS, None, headers, 4096);
+        let (status, body) = read_http(unauthenticated);
+        assert_eq!(status, 401, "the listener waited for a stranger's body");
+        assert!(matches!(wire::read_reply(status, &body).unwrap(),
+            account::Reply::Refused(account::Refusal::NotSignedIn(NotSignedIn::SessionEnded))));
+    }
     assert!(lidarr.take_calls().is_empty());
 
     let offer = server.offer(&first);
@@ -755,6 +762,8 @@ fn only_the_admin_page_can_configure_a_key_for_the_read_only_address() {
         key_change(TEST_KEY), 20, grant()), admin::Reply::Refused(_)));
     assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
         key_change(unrelated), 20, grant()), admin::Reply::Refused(_)));
+    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(TEST_KEY), 21, grant()), admin::Reply::Refused(_)));
     assert!(!setting());
     assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
         key_change(TEST_KEY), 20, grant()), admin::Reply::Done(_)));
