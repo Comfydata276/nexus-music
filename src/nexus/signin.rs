@@ -503,10 +503,13 @@ fn worker(paths: config::Paths, jobs: Receiver<Job>) {
             return;
         }
         match job {
-            Job::Legacy(legacy) => {
-                if let Err(why) = config::keep_legacy(&paths, &legacy) {
+            Job::Legacy(captured) => {
+                // What the settings said at this start is kept, once; until it is, this run
+                // goes by what was captured (and the next start tries again).
+                if let Err(why) = config::keep_legacy(&paths, &captured) {
                     note(format_args!("legacy sign-in not kept: {why}"));
                 }
+                *legacy_now() = Some(config::load_legacy(&paths).unwrap_or(captured));
             }
             Job::Start => {
                 // The start's own list, before any list given after it.
@@ -611,6 +614,7 @@ fn start_machine(paths: &config::Paths) -> Option<Batch> {
             }
         }
     };
+    record_decision_kept_before(paths, &view.record);
     *VIEW.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
     let batch = {
         let mut machine = machine();
@@ -772,18 +776,24 @@ fn keep_saved(paths: &config::Paths, epoch: u64, saved: Saved, cause: &Cause) ->
         _ if music.is_some() => before.handed_at.clone(),
         _ => String::new(),
     };
-    let folder = match music {
+    let (folder, decided) = match music {
         Some(login) => match folder_for(paths, &saved, login) {
-            Some(folder) => folder,
+            Some(found) => found,
             None => return false,
         },
-        None => String::new(),
+        None => (String::new(), None),
     };
     let record = SignedIn { saved: Some(value), folder, handed_at };
     let Ok(text) = serde_json::to_string(&record).map(Zeroizing::new) else { return false };
     if !vault::write(paths, SIGNED_IN, &text) {
+        // The sign-in did not complete: the folder's decision is not made (W7c item 7).
         return false;
     }
+    // Kept: the decision is this sign-in's, made with it.
+    if let Some(decided) = decided {
+        *legacy_now() = Some(decided);
+    }
+    record_decision(paths);
     note(format_args!("kept session={} music={}", saved.session.is_some(), saved.music.is_some()));
     view().record = record;
     on_window(epoch, move || crate::journal::publish_account(Some(&saved)));
@@ -817,29 +827,70 @@ fn forget_note(paths: &config::Paths, backend_id: &str, session: u64) -> bool {
     true
 }
 
-/// The folder for the person signed in (design 11, and the review's MUST 14): **the folder
-/// this PC had before the Nexus server becomes theirs, once**, if the core says the login
-/// they are handed names that same music server and user (`client::carries_over`), and
-/// only if that has not been decided already: **the decision is made at the first music
-/// login kept on this PC, recorded before anything that follows it, and never made again**,
-/// whoever signs in later and whatever the settings say by then. Everyone else's folder is
+/// The folder this PC had before and its fate, as this run knows it: what was kept, or, if
+/// that could not be written yet, what this run captured or decided (W7c item 7).
+static LEGACY: Mutex<Option<config::Legacy>> = Mutex::new(None);
+
+fn legacy_now() -> MutexGuard<'static, Option<config::Legacy>> {
+    LEGACY.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The folder for the person signed in (design 11, the review's MUST 14, W7c item 7): **the
+/// folder this PC had before becomes theirs, once**, if the core says the login they are
+/// handed names that same music server and user (`client::carries_over`), and only if that
+/// has not been decided already. **The decision is made with the first sign-in that keeps a
+/// music login here**: given back (the second part) to be recorded once that sign-in is
+/// kept, so that a sign-in that did not complete never makes it. Everyone else's folder is
 /// named by who they are to the backend, the same at every sign-in. `None` if the decision
-/// could not be kept.
-fn folder_for(paths: &config::Paths, saved: &Saved, login: &MusicLogin) -> Option<String> {
+/// could not be read.
+fn folder_for(paths: &config::Paths, saved: &Saved, login: &MusicLogin) -> Option<(String, Option<config::Legacy>)> {
     let who = config::Legacy::who(&saved.backend_id, saved.account.get());
-    let mut legacy = config::load_legacy(paths).ok()?;
-    if !legacy.decided {
-        legacy.decided = true;
-        if !legacy.server.is_empty() && !legacy.username.is_empty() && core::carries_over(&legacy.server, &legacy.username, login) {
-            legacy.carried_to = Some(who.clone());
+    let known = legacy_now().clone();
+    let legacy = match known {
+        Some(legacy) => legacy,
+        None => config::load_legacy(paths).ok()?,
+    };
+    let (legacy, decided) = if legacy.decided {
+        (legacy, None)
+    } else {
+        let mut decided = legacy;
+        decided.decided = true;
+        if !decided.server.is_empty() && !decided.username.is_empty() && core::carries_over(&decided.server, &decided.username, login) {
+            decided.carried_to = Some(who.clone());
         }
-        config::save_legacy(paths, &legacy).ok()?;
-        note(format_args!("folder decided, carried over {}", legacy.carried_to.is_some()));
-    }
-    Some(match &legacy.carried_to {
+        (decided.clone(), Some(decided))
+    };
+    let folder = match &legacy.carried_to {
         Some(owner) if *owner == who => legacy.stem(),
         _ => config::person_folder(&saved.backend_id, saved.account.get()),
-    })
+    };
+    Some((folder, decided))
+}
+
+/// The decision this run made, written if it is not yet: after the sign-in it came with is
+/// kept, and again at each later one until it holds (and at the next start).
+fn record_decision(paths: &config::Paths) {
+    let Some(decided) = legacy_now().clone().filter(|legacy| legacy.decided) else { return };
+    if config::load_legacy(paths).is_ok_and(|kept| kept == decided) {
+        return;
+    }
+    match config::save_legacy(paths, &decided) {
+        Ok(()) => note(format_args!("folder decided, carried over {}", decided.carried_to.is_some())),
+        Err(why) => note(format_args!("folder decision not kept yet ({why}): written at the next sign-in or start")),
+    }
+}
+
+/// At a start: a decision made with a sign-in that is kept, whose own write did not hold, is
+/// recorded now, from that kept sign-in (its folder says whether it was carried over).
+fn record_decision_kept_before(paths: &config::Paths, record: &SignedIn) {
+    let Some(legacy) = legacy_now().clone() else { return };
+    let who = record.saved.as_ref().and_then(|saved| Some(config::Legacy::who(saved.get("backend_id")?.as_str()?, saved.get("account")?.as_u64()?)));
+    let Some(who) = who.filter(|_| !legacy.decided && !record.folder.is_empty()) else { return };
+    let mut decided = legacy;
+    decided.decided = true;
+    decided.carried_to = (record.folder == decided.stem()).then_some(who);
+    *legacy_now() = Some(decided);
+    record_decision(paths);
 }
 
 // ---- asking ------------------------------------------------------------------------------------
@@ -1073,6 +1124,7 @@ mod tests {
         let one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *view() = View { slots: vec![None; NOTE_SLOTS], ..View::default() };
         NOT_KEPT.store(false, Ordering::SeqCst);
+        *legacy_now() = None;
         let dir = std::env::temp_dir().join(format!("nexus-signin-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = config::Paths::in_dir(&dir);
@@ -1163,6 +1215,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The folder for `saved`, as a sign-in that is kept records it.
+    fn decide(paths: &config::Paths, saved: &Saved) -> String {
+        let (folder, decided) = folder_for(paths, saved, saved.music.as_ref().unwrap()).unwrap();
+        if let Some(decided) = decided {
+            *legacy_now() = Some(decided);
+            record_decision(paths);
+        }
+        folder
+    }
+
+    /// W7c item 7: the carry-over is decided with the first sign-in that is kept. One whose
+    /// own keep fails decides nothing; one kept whose decision cannot be written goes by it
+    /// for the rest of the run, and the next start records it from what was kept.
+    #[test]
+    fn the_carry_over_is_recorded_with_the_first_sign_in_that_is_kept() {
+        let (_one, dir, paths) = profile("decision");
+        *legacy_now() = None;
+        let legacy = config::Legacy { server: "https://music.example.org".into(), username: "ada".into(), decided: false, carried_to: None };
+        config::keep_legacy(&paths, &legacy).unwrap();
+        *legacy_now() = Some(legacy.clone());
+        let ada = saved();
+        // Its keep fails: nothing decided, on disk or in this run.
+        vault::fail_writes(Some(SIGNED_IN));
+        assert!(!keep_saved(&paths, epoch_now(), saved(), &Cause::Other));
+        vault::fail_writes(None);
+        assert!(!config::load_legacy(&paths).unwrap().decided);
+        assert!(!legacy_now().as_ref().unwrap().decided);
+        // Kept, and the decision's own write fails (its file made a folder): this run goes by
+        // it; the next start records it from the sign-in kept.
+        let file = paths.settings.with_file_name("nexus-legacy.json");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        assert!(keep_saved(&paths, epoch_now(), saved(), &Cause::Other));
+        assert!(legacy_now().as_ref().unwrap().carried_to.is_some());
+        std::fs::remove_dir_all(&file).unwrap();
+        config::keep_legacy(&paths, &legacy).unwrap();
+        *legacy_now() = Some(config::load_legacy(&paths).unwrap());
+        let (_, view) = read_kept(&paths).unwrap();
+        record_decision_kept_before(&paths, &view.record);
+        let kept = config::load_legacy(&paths).unwrap();
+        assert!(kept.decided);
+        assert_eq!(kept.carried_to, Some(config::Legacy::who(&ada.backend_id, 7)));
+        *legacy_now() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MUST 14: the folder this PC had before is carried over once, at the first music login
     /// kept here, and the decision is never made again: not after a sign-out, not for a
     /// later account, whatever the settings name by then.
@@ -1179,21 +1277,22 @@ mod tests {
             br#"{"address":"https://music.example.org","name":"bob","salt":"0101010101010101010101010101010101010101010101010101010101010101","token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","count":1}"#,
         ).unwrap());
         // Bob first: not Ada's music user, so the folder before goes to nobody, for good.
-        let first = folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap();
+        let first = decide(&paths, &bob);
         assert_eq!(first, config::person_folder(&bob.backend_id, 8));
         let ada = saved();
-        let later = folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap();
+        let later = decide(&paths, &ada);
         assert_eq!(later, config::person_folder(&ada.backend_id, 7), "decided once: never carried over later");
         // And Bob's again after a sign-out (nothing of the sign-in kept): the same folder.
-        assert_eq!(folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap(), first);
+        assert_eq!(decide(&paths, &bob), first);
         // Had Ada come first, it would have been hers, and hers alone, at every sign-in.
         let _ = std::fs::remove_dir_all(&dir);
         let paths = config::Paths::in_dir(&dir);
         config::keep_legacy(&paths, &legacy).unwrap();
-        let carried = folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap();
+        *legacy_now() = None;
+        let carried = decide(&paths, &ada);
         assert_eq!(carried, legacy.stem());
-        assert_eq!(folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap(), carried);
-        assert_eq!(folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap(), config::person_folder(&bob.backend_id, 8));
+        assert_eq!(decide(&paths, &ada), carried);
+        assert_eq!(decide(&paths, &bob), config::person_folder(&bob.backend_id, 8));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
