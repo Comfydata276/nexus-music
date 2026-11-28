@@ -1232,6 +1232,48 @@ fn lidarr_check_status_survives_restart_and_updates_when_the_same_key_is_checked
 }
 
 #[test]
+fn an_unreadable_saved_key_never_enables_direct_fallback() {
+    use crate::store::apart::{self, Reading};
+    use wire::{AppRoute, RequestError};
+
+    let lidarr = MockLidarr::start();
+    let (mut server, [admin, member, _]) = TestServer::start_child("unreadable-lidarr-key", lidarr.address);
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    let member = server.redeem(member, 2, "");
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    assert!(server.lidarr_setting(&page).checked);
+    assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+    lidarr.take_calls();
+
+    server.kill_child();
+    let state = server.root.join("state");
+    let Reading::Found(mut store) = apart::read(&state) else { panic!("missing saved state") };
+    let mut sealed = store.lidarr.sealed.clone().unwrap();
+    sealed[0] ^= 1;
+    for unreadable in [sealed, vec![0]] {
+        store.lidarr.sealed = Some(unreadable);
+        apart::write(&state, &store).unwrap();
+        server.launch(lidarr.address);
+
+        let Answer::Refused { reason } = server.call(&member, Call::Status) else {
+            panic!("expected a refusal for the saved key")
+        };
+        assert_eq!(reason, Refusal::LidarrUnavailable);
+        assert_eq!(wire::app_route(&Err(RequestError::Refused(reason))), AppRoute::Unavailable);
+        assert_eq!(server.lidarr_setting(&page), admin::LidarrSetting {
+            address: Some(endpoint(lidarr.address).address), configured: true, checked: false,
+        });
+        assert!(lidarr.take_calls().is_empty());
+        server.kill_child();
+    }
+
+    server.launch(lidarr.address);
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    assert!(server.lidarr_setting(&page).checked);
+    assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
 fn attribution_marks_the_exact_release_arrived_only_after_positive_lidarr_evidence() {
     let lidarr = MockLidarr::start();
     let (server, [admin, member, _]) = TestServer::start("attribution-arrival", Some(endpoint(lidarr.address)));

@@ -2784,11 +2784,15 @@ fn update_work(
 
 fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credential>, Refusal> {
     let saved = keeper.lidarr(Some(&endpoint.address)).map_err(|_| Refusal::NotDealtWith)?;
-    let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else { return Ok(None) };
+    if !saved.has_saved_key {
+        return Ok(None);
+    }
+    let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else {
+        return Err(Refusal::LidarrUnavailable);
+    };
     let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
-    Ok(sealing.open(&binding, &sealed).map(|key| Credential {
-        revision: binding.revision, key, check_stamp: sealed.check_stamp(),
-    }))
+    let key = sealing.open(&binding, &sealed).ok_or(Refusal::LidarrUnavailable)?;
+    Ok(Some(Credential { revision: binding.revision, key, check_stamp: sealed.check_stamp() }))
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -2917,15 +2921,17 @@ async fn get_lidarr(
     let address = service.accounts.lidarr.clone();
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        let key = match endpoint {
-            None => None,
-            Some(endpoint) => credential(keeper, &endpoint).map_err(|_| admin::Refusal::NotDealtWith)?,
+        let (configured, checked) = match endpoint.as_ref().map(|endpoint| credential(keeper, endpoint)) {
+            Some(Ok(Some(key))) => {
+                let checked = keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?;
+                (true, checked)
+            }
+            // Use the existing unchecked setting so the page asks for the key again.
+            Some(Err(Refusal::LidarrUnavailable)) => (true, false),
+            Some(Err(_)) => return Err(admin::Refusal::NotDealtWith),
+            None | Some(Ok(None)) => (false, false),
         };
-        let checked = match &key {
-            Some(key) => keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?,
-            None => false,
-        };
-        Ok(admin::LidarrSetting { address, configured: key.is_some(), checked })
+        Ok(admin::LidarrSetting { address, configured, checked })
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
     admin_reply(configured)
 }
@@ -3043,7 +3049,11 @@ async fn read_attributed(
         let (rows, key) = if let Some(endpoint) = &state.endpoint {
             let rows = attributed_requests(keeper.data().connection(), &binding(endpoint))
                 .map_err(|_| admin::Refusal::NotDealtWith)?;
-            let key = credential(keeper, endpoint).map_err(|_| admin::Refusal::NotDealtWith)?;
+            let key = match credential(keeper, endpoint) {
+                Ok(key) => key,
+                Err(Refusal::LidarrUnavailable) => None,
+                Err(_) => return Err(admin::Refusal::NotDealtWith),
+            };
             (rows, key)
         } else {
             (Vec::new(), None)
