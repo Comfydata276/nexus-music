@@ -96,6 +96,7 @@ dd { margin: 0 0 .65rem; }
 dd, li { overflow-wrap: anywhere; }
 .account-links { display: flex; flex-wrap: wrap; gap: .6rem; }
 #requests-panel { grid-column: 1 / -1; }
+#lidarr-key { -webkit-text-security: disc; }
 #requests-panel h3 { margin: .85rem 0 0; font-size: 1rem; }
 #request-history { border-top: 1px solid var(--line); margin-top: .85rem; }
 #listening-panel { grid-column: 1 / -1; }
@@ -234,7 +235,8 @@ dd, li { overflow-wrap: anywhere; }
               <details id="lidarr-details">
                 <summary id="lidarr-setup-label">Set up Lidarr</summary>
                 <form id="lidarr-form" method="post" autocomplete="off">
-                  <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
+                  <label>Lidarr key <input id="lidarr-key" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="512" required></label>
+                  <p>In Lidarr, look under Settings, General, API Key.</p>
                   <button type="submit">Review Lidarr key</button>
                 </form>
               </details>
@@ -411,8 +413,22 @@ dd, li { overflow-wrap: anywhere; }
   let approval = null;
   let approvalTimer;
 
-  function writeText(element, value) {
-    element.textContent = value;
+  function writeText(element, ...parts) {
+    element.replaceChildren(...parts);
+  }
+
+  function displayText(value) {
+    return value.replace(/[\u2028\u2029]/gu, " ");
+  }
+
+  function outside(value) {
+    const span = document.createElement("bdi");
+    writeText(span, displayText(value));
+    return span;
+  }
+
+  function personParts({ name, email }) {
+    return [outside(name), " (", outside(email), ")"];
   }
 
   function newSecret() {
@@ -528,7 +544,7 @@ dd, li { overflow-wrap: anywhere; }
     no_such_account: "That account is no longer here. Refresh the accounts and try again.",
     no_such_session: "That device has signed out or signed in again. Refresh the devices first.",
     music_login_refused: "That music server username or password is not right. Check both and try again.",
-    lidarr_login_refused: "Lidarr refused that key. Check it and try again.",
+    lidarr_login_refused: "Lidarr refused that key, so it wasn’t saved. Any previous key is still in use.",
     conflict: "Someone changed these settings already. Refresh them and try again.",
   };
 
@@ -585,9 +601,9 @@ dd, li { overflow-wrap: anywhere; }
     };
   }
 
-  function appendRow(list, value) {
+  function appendRow(list, ...parts) {
     const row = document.createElement("li");
-    writeText(row, value);
+    writeText(row, ...parts);
     list.append(row);
     return row;
   }
@@ -605,10 +621,10 @@ dd, li { overflow-wrap: anywhere; }
     return {
       after: id(row.id), name: row.name, email: row.email, enabled: row.enabled,
       admin: row.admin, requestsEnabled: row.requests_enabled,
-      label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
+      label: [outside(row.name), " · ", outside(row.email), (row.admin ? " · Administrator" : "") +
         (row.enabled ? "" : " · Switched off") +
         (row.music === "type_again" ? " · Enter their music sign-in again" :
-          row.music === "none_set" ? " · Music sign-in not set" : " · Music sign-in set"),
+          row.music === "none_set" ? " · Music sign-in not set" : " · Music sign-in set")],
     };
   }
 
@@ -622,10 +638,10 @@ dd, li { overflow-wrap: anywhere; }
     const heard = lastSeen ? "Last heard " + lastSeen : "Last-heard time unavailable";
     const name = row.page ? "Admin page" : row.name;
     const label = row.page
-      ? name + (row.session === session.id ? " · This tab" : " · Signed in") +
-        (lastSeen ? " · Last used " + lastSeen : "")
-      : name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
-        " · " + (row.last_seen_ms === 0n ? "Never heard from" : heard) + (row.session === null ? " · Signed out" : "");
+      ? [name + (row.session === session.id ? " · This tab" : " · Signed in") +
+        (lastSeen ? " · Last used " + lastSeen : "")]
+      : [outside(name), row.kind === "pc" ? " · PC · " : " · Phone · ", outside(row.app_version),
+        " · " + (row.last_seen_ms === 0n ? "Never heard from" : heard) + (row.session === null ? " · Signed out" : "")];
     return {
       after: { account: id(row.account), device: id(row.device) }, name, session: row.session, page: row.page, label,
     };
@@ -694,12 +710,14 @@ dd, li { overflow-wrap: anywhere; }
   };
   let listening = null;
 
-  function listenPerson(account, name) {
+  function listenPerson(account, name, email) {
     const key = account.toString();
     if (!listeningOptions.has(key)) {
       const option = document.createElement("option");
       option.value = key;
-      writeText(option, name);
+      /* Options have plain labels. Strip supplied controls before inserting isolates. */
+      const isolate = value => "\u2068" + displayText(value).replace(/\p{Bidi_Control}/gu, "") + "\u2069";
+      writeText(option, isolate(name) + (email ? " (" + isolate(email) + ")" : ""));
       listeningPerson.append(option);
       listeningOptions.set(key, option);
     }
@@ -755,7 +773,7 @@ dd, li { overflow-wrap: anywhere; }
   function listeningTrack(row, names) {
     if (!isU64(row.starts) || row.starts === 0n) throw new Error();
     const labels = names.map(name => listeningText(row[name], 200));
-    return { title: labels[0], detail: labels.slice(1).filter(Boolean).join(" · "), starts: row.starts };
+    return { title: labels[0], detail: labels.slice(1), starts: row.starts };
   }
 
   function listeningRows(result, kind, accountScope) {
@@ -794,9 +812,9 @@ dd, li { overflow-wrap: anywhere; }
     const item = document.createElement("li");
     const line = document.createElement("div");
     line.className = "listening-row";
-    const title = action ? makeButton(label, action) : document.createElement("span");
+    const title = action ? makeButton(outside(label), action) : document.createElement("span");
     if (action) title.className = "listening-person";
-    else writeText(title, label);
+    else writeText(title, outside(label));
     line.append(title);
     if (number) {
       const count = document.createElement("strong");
@@ -805,9 +823,10 @@ dd, li { overflow-wrap: anywhere; }
       line.append(count);
     }
     item.append(line);
-    if (detail) {
+    const values = detail.filter(Boolean);
+    if (values.length) {
       const note = document.createElement("p");
-      writeText(note, detail);
+      writeText(note, ...values.flatMap((value, index) => index ? [" · ", outside(value)] : [outside(value)]));
       item.append(note);
     }
     list.append(item);
@@ -836,13 +855,13 @@ dd, li { overflow-wrap: anywhere; }
     const format = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "numeric" });
     for (const row of result.rows) {
       if (kind === "people") {
-        listeningLine(list, row.name, startsLabel(row.starts), "", () => {
+        listeningLine(list, row.name, startsLabel(row.starts), [], () => {
           listeningPerson.value = listenPerson(row.account, row.name);
           void loadListening();
           listeningPerson.focus();
         });
       } else {
-        const detail = [row.artist, row.album, row.name, format.format(row.when)].filter(Boolean).join(" · ");
+        const detail = [row.artist, row.album, row.name, format.format(row.when)];
         listeningLine(list, row.title || "Unknown song", "", detail);
       }
     }
@@ -965,8 +984,8 @@ dd, li { overflow-wrap: anywhere; }
           (result.public !== null && typeof result.public !== "string")) throw new Error();
       musicAddress = result;
       addressForm.hidden = false;
-      writeText(internalAddress, result.internal);
-      writeText(publicAddress, result.public ?? "Unset");
+      writeText(internalAddress, outside(result.internal));
+      writeText(publicAddress, result.public === null ? "Unset" : outside(result.public));
       writeText(musicStatus, "");
     } catch {
       if (session === current) writeText(musicStatus, "Could not load the addresses. Sign out and back in to try again.");
@@ -1003,11 +1022,10 @@ dd, li { overflow-wrap: anywhere; }
 
   function renderAccount(row) {
     const account = row.after;
-    const person = row.name + " (" + row.email + ")";
     accountNames.set(account, row.name);
-    listenPerson(account, person);
-    for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
-    const entry = appendRow(accountPage.list, row.label);
+    listenPerson(account, row.name, row.email);
+    for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · ", outside(row.name));
+    const entry = appendRow(accountPage.list, ...row.label);
     const menu = document.createElement("details");
     const summary = document.createElement("summary");
     writeText(summary, "Manage account");
@@ -1025,16 +1043,17 @@ dd, li { overflow-wrap: anywhere; }
       buttons.append(makeButton(switchLabel, () => {
         const body = { account, enabled };
         reviewChange("set-account-enabled", body, body, switchLabel,
-          enabled ? "Let " + person + " sign in again." : "Sign out " + person + " on all devices and stop them signing in.",
+          [enabled ? "Let " : "Sign out ", ...personParts(row),
+            enabled ? " sign in again." : " on all devices and stop them signing in."],
           { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.",
             refresh: "accounts-and-devices" });
       }));
     }
     buttons.append(
-      makeButton("Set music sign-in", () => openLogin(account, person)),
+      makeButton("Set music sign-in", () => openLogin(account, row)),
       makeButton("Reset password", () => reviewChange("reset-password", { account }, account, "Reset password",
-        "Reset the password for " + person + ". They’ll need the new code to sign in again.",
-        { codeFor: person, saved: "Password reset.", refresh: "accounts" })),
+        ["Reset the password for ", ...personParts(row), ". They’ll need the new code to sign in again."],
+        { codeFor: row, saved: "Password reset.", refresh: "accounts" })),
     );
     if (!own) {
       const admin = !row.admin;
@@ -1043,11 +1062,11 @@ dd, li { overflow-wrap: anywhere; }
         makeButton(roleLabel, () => {
           const body = { account, admin };
           reviewChange("set-admin", body, body, roleLabel,
-            (admin ? "Let " : "Stop ") + person + (admin ? " manage this server." : " from managing this server."),
+            [admin ? "Let " : "Stop ", ...personParts(row), admin ? " manage this server." : " from managing this server."],
             { saved: admin ? "Administrator access added." : "Administrator access removed.", refresh: "accounts" });
         }),
         makeButton("Remove account", () => reviewChange("delete-account", { account }, account, "Remove account",
-          "Remove " + person + " and their listening history from Nexus.",
+          ["Remove ", ...personParts(row), " and their listening history from Nexus."],
           { note: "Any copy already downloaded stays where it was saved. You can’t undo this here.",
             saved: "Account removed.", refresh: "accounts-and-devices" }), true),
       );
@@ -1055,7 +1074,8 @@ dd, li { overflow-wrap: anywhere; }
     menu.append(summary, buttons);
     entry.append(menu);
 
-    const requestRow = appendRow(requests, row.name + (row.requestsEnabled ? " can request music." : " can’t request music."));
+    const requestRow = appendRow(requests, outside(row.name),
+      row.requestsEnabled ? " can request music." : " can’t request music.");
     const requestButtons = document.createElement("div");
     requestButtons.className = "row-actions";
     const mayRequest = !row.requestsEnabled;
@@ -1063,7 +1083,7 @@ dd, li { overflow-wrap: anywhere; }
     requestButtons.append(makeButton(requestLabel, () => {
       const body = { account, enabled: mayRequest };
       reviewChange("set-requests-enabled", body, body, requestLabel,
-        (mayRequest ? "Let " : "Stop ") + person + (mayRequest ? " request music." : " from requesting music."),
+        [mayRequest ? "Let " : "Stop ", ...personParts(row), mayRequest ? " request music." : " from requesting music."],
         { saved: mayRequest ? "Requests turned on." : "Requests turned off.", refresh: "accounts" });
     }));
     requestRow.append(requestButtons);
@@ -1072,10 +1092,10 @@ dd, li { overflow-wrap: anywhere; }
   function renderDevice(row) {
     const account = row.after.account;
     deviceNames.set(row.after.device, row.name);
-    const entry = appendRow(devicePage.list, row.label);
+    const entry = appendRow(devicePage.list, ...row.label);
     const owner = document.createElement("span");
     const known = accountNames.get(account);
-    if (known) writeText(owner, " · " + known);
+    if (known) writeText(owner, " · ", outside(known));
     entry.append(owner);
     if (!deviceOwners.has(account)) deviceOwners.set(account, []);
     deviceOwners.get(account).push(owner);
@@ -1086,9 +1106,9 @@ dd, li { overflow-wrap: anywhere; }
     buttons.append(makeButton(label, () => {
       const body = { ...row.after, session: row.session };
       const owner = accountNames.get(row.after.account);
-      const person = owner ? " (" + owner + ")" : "";
-      const summary = row.page ? "End the other admin page session" + person + "." :
-        "Sign out " + row.name + person + " from Nexus Music.";
+      const person = owner ? [" (", outside(owner), ")"] : [];
+      const summary = row.page ? ["End the other admin page session", ...person, "."] :
+        ["Sign out ", outside(row.name), ...person, " from Nexus Music."];
       const note = row.page ? "This tab will stay signed in." :
         "It can still reach your music server until you change that person’s music server password. Downloaded music stays on the device.";
       reviewChange("force-out", body, body, label, summary,
@@ -1108,7 +1128,7 @@ dd, li { overflow-wrap: anywhere; }
     if (!session || changing || draft || codeDialog.open) return;
     loginForm.reset();
     loginAccount = { account, person };
-    writeText(byId("music-login-account"), person);
+    writeText(byId("music-login-account"), ...personParts(person));
     loginDialog.showModal();
     byId("music-user").focus();
   }
@@ -1150,7 +1170,7 @@ dd, li { overflow-wrap: anywhere; }
     draft = { path, change, action: { [path.replaceAll("-", "_")]: target }, options };
     writeText(byId("grant-title"), label);
     writeText(byId("grant-commit"), label);
-    writeText(byId("grant-summary"), summary);
+    writeText(byId("grant-summary"), ...[summary].flat());
     writeText(byId("grant-note"), options.note ?? "");
     message("");
     const ask = !approvedPassword();
@@ -1174,9 +1194,9 @@ dd, li { overflow-wrap: anywhere; }
     if (typeof code?.issued !== "string" || !/^[0-9A-HJKMNP-TV-Z]{12}$/.test(code.issued)) {
       throw new Error();
     }
-    writeText(codePerson, "Code for " + person);
+    writeText(codePerson, "Code for ", ...personParts(person));
     /* Sign-in accepted this exact browser origin as NEXUS_PUBLIC_ORIGIN. */
-    writeText(codeOrigin, window.location.origin);
+    writeText(codeOrigin, outside(window.location.origin));
     writeText(codeValue, code.issued);
     codeDialog.showModal();
     byId("code-done").focus();
@@ -1257,6 +1277,7 @@ dd, li { overflow-wrap: anywhere; }
     } catch (error) {
       if (session !== current) return;
       if (!sentChange || error.reason === "grant_required") clearApproval();
+      if (proposed.path === "set-lidarr") refreshAfter(current, "lidarr");
       if (proposed.path === "set-requests-enabled" && sentChange) {
         refreshAfter(current, "accounts");
         if (error.reason === "grant_required" || error.reason === "conflict") {
@@ -1301,8 +1322,8 @@ dd, li { overflow-wrap: anywhere; }
       return message("Check the email address and try again.", true);
     }
     reviewChange("create-account", { name, email }, email, "Add account",
-      "Add " + name + " (" + email + "). They’ll be able to request music.",
-      { codeFor: name + " (" + email + ")", saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
+      ["Add ", ...personParts({ name, email }), ". They’ll be able to request music."],
+      { codeFor: { name, email }, saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
   });
 
   function addressInput(value) {
@@ -1326,7 +1347,7 @@ dd, li { overflow-wrap: anywhere; }
     const address = addressInput(field("new-address"));
     if (!address) return message("Enter the full secure address people will use, then try again.", true);
     reviewChange("set-music-server", { public: address }, address, "Save music server address",
-      "Check both addresses. Nexus uses " + musicAddress.internal + ". People will use " + address + ".",
+      ["Check both addresses. Nexus uses ", outside(musicAddress.internal), ". People will use ", outside(address), "."],
       { saved: "Music server address saved.", refresh: "address", done: () => addressForm.reset() });
   });
 
@@ -1343,7 +1364,7 @@ dd, li { overflow-wrap: anywhere; }
     }
     closeLogin();
     reviewChange("set-music-login", { account: selected.account, name, password }, selected.account,
-      "Check music sign-in", "Check and save the music sign-in you entered for " + selected.person + ".",
+      "Check music sign-in", ["Check and save the music sign-in you entered for ", ...personParts(selected.person), "."],
       { saved: "The music sign-in works.", refresh: "accounts" });
   });
 
@@ -1351,7 +1372,7 @@ dd, li { overflow-wrap: anywhere; }
     const unchecked = configured && lidarrAddress !== null && lidarrAddress === uncheckedLidarrAddress;
     writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
       unchecked ? "Lidarr key is saved but hasn’t been checked." :
-      configured ? "Lidarr key is set." : "Lidarr key is not set.");
+      configured ? "Lidarr key is saved." : "Lidarr key is not set.");
     writeText(byId("lidarr-setup-label"), unchecked ? "Set the Lidarr key again to check it" : "Set up Lidarr");
   }
 
@@ -1360,12 +1381,16 @@ dd, li { overflow-wrap: anywhere; }
       const result = await readAdmin(current, "/nexus/api/admin/lidarr", {}, 4096);
       if (session !== current) return;
       if (typeof result.configured !== "boolean" ||
-          (result.address !== null && typeof result.address !== "string")) throw new Error();
+          (result.address !== null && typeof result.address !== "string") ||
+          (result.checked != null && typeof result.checked !== "boolean")) throw new Error();
       lidarrAddress = result.address;
-      if (!result.configured || lidarrAddress !== uncheckedLidarrAddress) uncheckedLidarrAddress = null;
+      if (!result.configured || result.checked === true || lidarrAddress !== uncheckedLidarrAddress) {
+        uncheckedLidarrAddress = null;
+      }
+      if (result.configured && result.checked === false) uncheckedLidarrAddress = lidarrAddress;
       lidarrSettings.hidden = !lidarrAddress;
       requestsAvailability.hidden = Boolean(lidarrAddress);
-      writeText(byId("lidarr-address"), lidarrAddress ?? "");
+      writeText(byId("lidarr-address"), lidarrAddress === null ? "" : outside(lidarrAddress));
       showLidarrKeyStatus(result.configured);
       if (!lidarrAddress) {
         lidarrDetails.open = false;
@@ -1394,9 +1419,9 @@ dd, li { overflow-wrap: anywhere; }
         (row.arrived != null && typeof row.arrived !== "boolean")) throw new Error();
     const item = document.createElement("li");
     const title = document.createElement("strong");
-    writeText(title, (asked.title || "Unknown title") + (asked.artist ? " — " + asked.artist : ""));
+    writeText(title, outside(asked.title || "Unknown title"), ...(asked.artist ? [" — ", outside(asked.artist)] : []));
     const by = document.createElement("p");
-    writeText(by, "Requested by " + row.name + " on " + requestDate.format(Number(asked.asked_ms)));
+    writeText(by, "Requested by ", outside(row.name), " on ", outside(requestDate.format(Number(asked.asked_ms))));
     const arrival = document.createElement("p");
     writeText(arrival, row.arrived === true ? "Arrived" : "Asked");
     item.append(title, by, arrival);
@@ -1455,7 +1480,7 @@ dd, li { overflow-wrap: anywhere; }
     uncheckedLidarrAddress = check === "unreachable" ? lidarrAddress : null;
     showLidarrKeyStatus(true);
     return check === "works" ? "The Lidarr key works and is set." :
-      "Nexus saved the key without checking it because Lidarr could not be reached.";
+      "Lidarr could not be reached, so Nexus saved the key unchecked. Check that Lidarr is running, then set the key again to check it.";
   }
 
   lidarrForm.addEventListener("submit", event => {
@@ -1468,7 +1493,7 @@ dd, li { overflow-wrap: anywhere; }
     }
     const change = { key };
     reviewChange("set-lidarr", change, change, "Save Lidarr key",
-      "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".",
+      ["Save the key for the Lidarr address Nexus uses, ", outside(lidarrAddress), "."],
       { saved: lidarrKeySaved, refresh: "lidarr" });
   });
 
@@ -1628,9 +1653,10 @@ dd, li { overflow-wrap: anywhere; }
         if (typeof report.text !== "string" || !isU64(report.received_ms) ||
             (result.next !== null && result.next !== reportId)) throw new Error();
         const time = new Date(Number(report.received_ms));
-        const who = [deviceNames.get(device) ?? "Device " + device, accountNames.get(owner)].filter(Boolean).join(" · ");
-        writeText(byId("reports-status"), who + " · " + time.toLocaleString());
-        writeText(byId("report-text"), report.text);
+        const who = accountNames.get(owner);
+        writeText(byId("reports-status"), outside(deviceNames.get(device) ?? "Device " + device),
+          ...(who ? [" · ", outside(who)] : []), " · ", outside(time.toLocaleString()));
+        writeText(byId("report-text"), outside(report.text));
       }
       reportCursor = result.next;
       reportsMore.hidden = reportCursor === null;
@@ -1720,7 +1746,7 @@ dd, li { overflow-wrap: anywhere; }
       form.reset();
       form.hidden = true;
       admin.hidden = document.hidden;
-      writeText(identity, signedIn.person.email);
+      writeText(identity, outside(signedIn.person.email));
       writeText(status, "");
       signout.focus();
     } catch {
