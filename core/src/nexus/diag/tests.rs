@@ -15,6 +15,7 @@ fn report(record: Record) -> Report {
             offline: false,
             local_permission: Some(false),
             android_auto: Some(true),
+            loss: LossCounts::default(),
         },
         record,
     }
@@ -187,28 +188,16 @@ fn last_attempt_and_last_failure_replace_separately_across_restart() {
 fn the_record_keeps_200_bounded_lines_and_reserves_its_latest_traces() {
     let mut record = Record::default();
     record.note_attempt(AT, trace(Reach::None), true);
-    for n in 0..500 {
-        record.note(AT + u64::from(n), Line::ForegroundAfterMs(n));
+    for n in 0..=255u8 {
+        record.note(AT + u64::from(n) * 1000, Line::DownloadJobStopped(n));
     }
     record.note(AT, Line::ForegroundAfterMs(MAX_FOREGROUND_MS + 1));
     record.note(AT, Line::ForegroundAfterMs(MAX_FOREGROUND_MS));
     assert_eq!(record.entries().len(), MAX_ENTRIES);
-    assert_eq!(
-        record.entries().front().unwrap().line,
-        Line::LastAttempt(trace(Reach::None))
-    );
-    assert_eq!(
-        record.entries().get(1).unwrap().line,
-        Line::LastFailure(trace(Reach::None))
-    );
-    assert_eq!(
-        record.entries().get(2).unwrap().line,
-        Line::ForegroundAfterMs(303)
-    );
-    assert_eq!(
-        record.entries().back().unwrap().line,
-        Line::ForegroundAfterMs(MAX_FOREGROUND_MS)
-    );
+    assert_eq!(record.entries().front().unwrap().line, Line::LastAttempt(trace(Reach::None)));
+    assert_eq!(record.entries().get(1).unwrap().line, Line::LastFailure(trace(Reach::None)));
+    assert_eq!(record.entries().get(2).unwrap().line, Line::DownloadJobStopped(59));
+    assert_eq!(record.entries().back().unwrap().line, Line::ForegroundAfterMs(MAX_FOREGROUND_MS));
     let report = report(record);
     let text = report.text().unwrap();
     assert!(
@@ -235,7 +224,7 @@ fn the_report_says_when_and_how_often_and_is_the_only_text_uploaded() {
     let report = report(record);
     let shown = report.text().unwrap();
     assert!(shown.ends_with(
-        "  2027-01-15 08:01:01.000  Player started  (2 times since 2027-01-15 08:00:00.000)"
+        "  2027-01-15 08:01:01  Player started  (2 times since 2027-01-15 08:00:00)"
     ));
     assert!(!shown.contains('\t'));
     let upload = Upload::new(&report).unwrap();
@@ -268,6 +257,11 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
         "https://music.example.test/api",
         "mira@example.test",
         "192.0.2.1",
+        "2001:db8::1",
+        "https://music.example.test/api?q=made-up-secret",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "Mira’s Playlist",
+        "L’été à Québec 音楽",
         "secret_api_key=1a2b3c",
         "Bearer made-up-token",
         "Player started\nMira Bell",
@@ -373,4 +367,51 @@ fn the_server_keeps_at_most_31_reports_and_none_older_than_30_days() {
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
+}
+
+#[test]
+fn journal_loss_totals_are_separate_and_cannot_age_out() {
+    let mut report = report(Record::default());
+    report.about.loss = LossCounts { line_full: 2, files_full: 3, refused: u64::MAX };
+    for n in 0..=255 {
+        report.record.note(AT, Line::DownloadJobStopped(n));
+    }
+    let text = report.text().unwrap();
+    assert!(text.lines().any(|line| line == format!("{LINE_FULL}2")));
+    assert!(text.lines().any(|line| line == format!("{FILES_FULL}3")));
+    assert!(text.lines().any(|line| line == format!("{REFUSED_FOR_GOOD}{}", u64::MAX)));
+    assert_eq!(Report::read(&text).unwrap().about.loss, report.about.loss);
+    report.record.clear();
+    assert_eq!(Report::read(&report.text().unwrap()).unwrap().about.loss, report.about.loss);
+}
+
+#[test]
+fn repeated_startup_timings_replace_one_line_and_leave_faults_visible() {
+    let mut record = Record::default();
+    let fault = Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused });
+    record.note(AT, fault);
+    for ms in 0..500 {
+        record.note(AT, Line::ForegroundAfterMs(ms));
+    }
+    assert_eq!(record.entries().len(), 2);
+    assert_eq!(record.entries().front().unwrap().line, fault);
+    assert_eq!(record.entries().back().unwrap().line, Line::ForegroundAfterMs(499));
+    assert_eq!(record.entries().back().unwrap().count, 1);
+}
+
+#[test]
+fn phone_notifications_and_new_session_endings_have_fixed_wording() {
+    for line in [
+        Line::DownloadJobStopped(4),
+        Line::Note(Note::MediaButtonStarted),
+        Line::Note(Note::MediaButtonNothingToResume),
+        Line::Note(Note::MediaButtonStartRefused),
+        Line::Note(Note::SharedLibraryUnavailable),
+        Line::SessionEnded(SessionEnded::PasswordReset),
+        Line::SessionEnded(SessionEnded::DataPutBack),
+    ] {
+        assert_eq!(clean_line(&line.to_string()), Some(line));
+    }
+    assert_eq!(clean_line("Android stopped the download job (reason 256)"), None);
+    assert_eq!(clean_line("Shared library could not be loaded: /private/path"), None);
 }

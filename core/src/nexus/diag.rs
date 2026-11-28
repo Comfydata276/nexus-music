@@ -2,13 +2,14 @@
 //! The app supplies observations and time. Storage, transport and the device switch
 //! itself belong to the caller.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Write};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
 
-use super::events::{DeviceKind, TIME_MAX_MS, read_json};
+use super::account::DeviceKind;
+use super::events::{LossCounts, TIME_MAX_MS, read_json};
 use super::proto::Version;
 
 pub use super::events::{Fault, FaultPlace, FaultShape, Wrong};
@@ -171,6 +172,7 @@ pub fn reports_to_keep(received: &[u64], now_ms: u64) -> impl Iterator<Item = us
 pub struct About {
     pub version: Version,
     pub device: DeviceKind,
+    /// Use zero for a component the OS omits. Android 14 is written as 14.0.0.
     pub os: Version,
     pub signed_in: bool,
     pub https: bool,
@@ -178,6 +180,7 @@ pub struct About {
     /// Whether local network permission is held. PCs have no such setting.
     pub local_permission: Option<bool>,
     pub android_auto: Option<bool>,
+    pub loss: LossCounts,
 }
 
 macro_rules! words {
@@ -227,13 +230,18 @@ words!(Note {
     StartAgain => "Nexus asked to start again",
     EventsSent => "Events sent",
     EventsRefused => "Events refused",
-    EventsDropped => "Events dropped",
+    MediaButtonStarted => "Media button started the player",
+    MediaButtonNothingToResume => "Media button had nothing to resume",
+    MediaButtonStartRefused => "Android refused to start the player from a media button",
+    SharedLibraryUnavailable => "Shared library could not be loaded",
 });
 words!(SessionEnded {
     SignedOut => "signed out",
     ForcedOut => "forced out",
     Expired => "expired",
     PasswordChanged => "password changed",
+    PasswordReset => "password reset",
+    DataPutBack => "data put back",
     AccountSwitchedOff => "account switched off",
     AccountDeleted => "account deleted",
     Other => "other",
@@ -280,6 +288,7 @@ pub enum Line {
     Fault(Fault),
     SessionEnded(SessionEnded),
     ForegroundAfterMs(u32),
+    DownloadJobStopped(u8),
     LastAttempt(Trace),
     LastFailure(Trace),
 }
@@ -342,6 +351,7 @@ impl fmt::Display for Line {
             ),
             Self::SessionEnded(why) => write!(f, "Nexus session ended: {}", why.text()),
             Self::ForegroundAfterMs(ms) => write!(f, "Foreground entered after {ms} ms"),
+            Self::DownloadJobStopped(reason) => write!(f, "Android stopped the download job (reason {reason})"),
             Self::LastAttempt(trace) => write!(f, "Nexus last attempt: {trace}"),
             Self::LastFailure(trace) => write!(f, "Nexus last failure: {trace}"),
         }
@@ -370,6 +380,9 @@ impl Line {
             let ms = number(ms)?;
             return (ms <= MAX_FOREGROUND_MS).then_some(Self::ForegroundAfterMs(ms));
         }
+        if let Some(reason) = text.strip_prefix("Android stopped the download job (reason ").and_then(|reason| reason.strip_suffix(')')) {
+            return Some(Self::DownloadJobStopped(u8::try_from(number(reason)?).ok()?));
+        }
         if let Some(trace) = text.strip_prefix("Nexus last attempt: ") {
             return Trace::read(trace).map(Self::LastAttempt);
         }
@@ -378,19 +391,29 @@ impl Line {
             .map(Self::LastFailure)
     }
 
-    fn trace_slot(self) -> Option<bool> {
+    fn latest_slot(self) -> Option<LatestSlot> {
         match self {
-            Self::LastAttempt(_) => Some(false),
-            Self::LastFailure(_) => Some(true),
+            Self::LastAttempt(_) => Some(LatestSlot::Attempt),
+            Self::LastFailure(_) => Some(LatestSlot::Failure),
+            Self::ForegroundAfterMs(_) => Some(LatestSlot::Foreground),
             _ => None,
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LatestSlot {
+    Attempt,
+    Failure,
+    Foreground,
+}
+
 fn number(text: &str) -> Option<u32> {
-    if text.is_empty()
-        || text.len() > 10
-        || !text.bytes().all(|b| b.is_ascii_digit())
+    u32::try_from(decimal(text)?).ok()
+}
+
+fn decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 20 || !text.bytes().all(|b| b.is_ascii_digit())
         || (text.len() > 1 && text.starts_with('0'))
     {
         return None;
@@ -438,7 +461,7 @@ impl Record {
         {
             return;
         }
-        let count = if line.trace_slot().is_some() {
+        let count = if line.latest_slot().is_some() {
             1
         } else {
             count
@@ -476,10 +499,10 @@ impl Record {
     }
 
     fn add(&mut self, mut entry: Entry) {
-        let slot = entry.line.trace_slot();
+        let slot = entry.line.latest_slot();
         let index = self.entries.iter().position(|old| {
             if slot.is_some() {
-                old.line.trace_slot() == slot
+                old.line.latest_slot() == slot
             } else {
                 old.line == entry.line
             }
@@ -499,7 +522,7 @@ impl Record {
             if let Some(index) = self
                 .entries
                 .iter()
-                .position(|entry| entry.line.trace_slot().is_none())
+                .position(|entry| !matches!(entry.line.latest_slot(), Some(LatestSlot::Attempt | LatestSlot::Failure)))
             {
                 self.entries.remove(index);
             }
@@ -509,7 +532,12 @@ impl Record {
 
 const HEADING: &str = "What the player has met (times in UTC):";
 const EMPTY: &str = "  (nothing yet)";
-const DATE: &str = "%Y-%m-%d %H:%M:%S%.3f";
+// Use the phone's whole-second display. The file/report can only restore this
+// precision. In-memory observations keep the supplied millisecond times.
+const DATE: &str = "%Y-%m-%d %H:%M:%S";
+const LINE_FULL: &str = "Events dropped because the journal queue was full: ";
+const FILES_FULL: &str = "Events lost because the waiting files were full: ";
+const REFUSED_FOR_GOOD: &str = "Events refused for good: ";
 
 fn yes(on: bool) -> &'static str {
     if on { "yes" } else { "no" }
@@ -570,8 +598,8 @@ impl Report {
             return Err(Wrong::Field);
         }
         write!(text,
-            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n\n{HEADING}",
-            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto),
+            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
+            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto), a.loss.line_full, a.loss.files_full, a.loss.refused,
         ).map_err(|_| Wrong::Form)?;
         if self.record.entries.is_empty() {
             write!(text, "\n{EMPTY}").map_err(|_| Wrong::Form)?;
@@ -633,6 +661,11 @@ impl Report {
                 lines.next()?.strip_prefix("Local network permission: ")?,
             )?,
             android_auto: read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            loss: LossCounts {
+                line_full: decimal(lines.next()?.strip_prefix(LINE_FULL)?)?,
+                files_full: decimal(lines.next()?.strip_prefix(FILES_FULL)?)?,
+                refused: decimal(lines.next()?.strip_prefix(REFUSED_FOR_GOOD)?)?,
+            },
         };
         if lines.next()? != "" || lines.next()? != HEADING {
             return None;
@@ -642,8 +675,8 @@ impl Report {
         if first == EMPTY {
             return lines.next().is_none().then_some(Self { about, record });
         }
-        let mut seen = HashSet::new();
-        let mut slots = [false; 2];
+        let mut seen = BTreeSet::new();
+        let mut slots = BTreeSet::new();
         for line in std::iter::once(first).chain(lines) {
             if record.entries.len() == MAX_ENTRIES || line.len() > MAX_LINE_CHARS {
                 return None;
@@ -663,12 +696,10 @@ impl Report {
             if first_ms > last_ms || count == 0 || (count == 1 && first_ms != last_ms) {
                 return None;
             }
-            if let Some(slot) = line.trace_slot() {
-                let exists = slots.get_mut(usize::from(slot))?;
-                if *exists || count != 1 {
+            if let Some(slot) = line.latest_slot() {
+                if !slots.insert(slot) || count != 1 {
                     return None;
                 }
-                *exists = true;
             }
             // Line's text is entirely fixed or a bounded number, and is the identity
             // used by the phone to count repeated observations.
