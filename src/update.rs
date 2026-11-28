@@ -1,5 +1,6 @@
 //! Looks for a newer release on GitHub, and downloads and runs its installer.
 
+use crate::diagnostics::FaultShape;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -102,6 +103,35 @@ pub enum CheckError {
     InvalidRelease,
 }
 
+impl CheckError {
+    pub fn fault_shape(&self) -> FaultShape {
+        match self {
+            Self::Refused | Self::Status(_) => FaultShape::Refused,
+            Self::TimedOut => FaultShape::Timeout,
+            Self::Request => FaultShape::Connection,
+            Self::InvalidRelease => FaultShape::UnexpectedAnswer,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadError {
+    pub shape: FaultShape,
+    reason: String,
+}
+
+impl DownloadError {
+    fn new(shape: FaultShape, reason: impl ToString) -> Self {
+        Self { shape, reason: reason.to_string() }
+    }
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 impl std::fmt::Display for CheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -196,7 +226,7 @@ const NO_CHECKSUM: &str =
 
 /// Downloads the installer to the temporary folder, checking it against the size and
 /// checksum GitHub published. `progress` is called with the fraction done.
-pub fn download(installer: &Installer, progress: impl FnMut(f32)) -> Result<PathBuf, String> {
+pub fn download(installer: &Installer, progress: impl FnMut(f32)) -> Result<PathBuf, DownloadError> {
     let agent = agent_config(RootCerts::PlatformVerifier)
         .timeout_recv_response(Some(Duration::from_secs(12))).build().into();
     download_with(installer, progress, || get(&agent, INSTALLER, &installer.url, None))
@@ -207,20 +237,20 @@ fn download_with(
     installer: &Installer,
     progress: impl FnMut(f32),
     fetch: impl FnOnce() -> Result<ureq::http::Response<ureq::Body>, CheckError>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, DownloadError> {
     if installer.sha256.is_none() {
-        return Err(NO_CHECKSUM.into());
+        return Err(DownloadError::new(FaultShape::Refused, NO_CHECKSUM));
     }
-    let response = fetch().map_err(|e| e.to_string())?;
+    let response = fetch().map_err(|e| DownloadError::new(e.fault_shape(), e))?;
     if !response.status().is_success() {
-        return Err(format!("The download failed with status {}.", response.status().as_u16()));
+        return Err(DownloadError::new(FaultShape::Refused, format!("The download failed with status {}.", response.status().as_u16())));
     }
     let name: String =
         installer.name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
     let name = if name.is_empty() { "NexusMusic-Setup.exe" } else { &name };
     // Another attempt cannot truncate this one's verified file or delete it on failure.
     let path = std::env::temp_dir().join(format!("{:016x}-{name}", fastrand::u64(..)));
-    let file = File::create_new(&path).map_err(|e| e.to_string())?;
+    let file = File::create_new(&path).map_err(|e| DownloadError::new(FaultShape::Write, e))?;
     let verified = write_installer(file, response.into_body(), installer.size, progress)
         .and_then(|()| verify(installer, &path));
     if verified.is_err() {
@@ -229,32 +259,32 @@ fn download_with(
     verified.map(|()| path)
 }
 
-fn write_installer(mut file: File, body: ureq::Body, size: u64, mut progress: impl FnMut(f32)) -> Result<(), String> {
+fn write_installer(mut file: File, body: ureq::Body, size: u64, mut progress: impl FnMut(f32)) -> Result<(), DownloadError> {
     let mut body = body.into_reader();
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = 0;
     loop {
-        let n = body.read(&mut buf).map_err(|_| "The download was interrupted.")?;
+        let n = body.read(&mut buf).map_err(|_| DownloadError::new(FaultShape::Read, "The download was interrupted."))?;
         if n == 0 {
             return Ok(());
         }
         if n as u64 > size - done {
-            return Err("The download is larger than the release says it should be.".into());
+            return Err(DownloadError::new(FaultShape::UnexpectedAnswer, "The download is larger than the release says it should be."));
         }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        file.write_all(&buf[..n]).map_err(|e| DownloadError::new(FaultShape::Write, e))?;
         done += n as u64;
         progress(done as f32 / size as f32);
     }
 }
 
 /// Checks a downloaded file against the size and checksum the release published.
-fn verify(installer: &Installer, path: &std::path::Path) -> Result<(), String> {
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
+fn verify(installer: &Installer, path: &std::path::Path) -> Result<(), DownloadError> {
+    let mut file = File::open(path).map_err(|e| DownloadError::new(FaultShape::Read, e))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut size: u64 = 0;
     loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = file.read(&mut buf).map_err(|e| DownloadError::new(FaultShape::Read, e))?;
         if n == 0 {
             break;
         }
@@ -264,7 +294,7 @@ fn verify(installer: &Installer, path: &std::path::Path) -> Result<(), String> {
     let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
     // No published checksum means nothing to check against, and that isn't a pass.
     let intact = size == installer.size && installer.sha256.as_ref().is_some_and(|expected| *expected == digest);
-    if intact { Ok(()) } else { Err("The download didn't match the published file, so it wasn't installed.".into()) }
+    if intact { Ok(()) } else { Err(DownloadError::new(FaultShape::UnexpectedAnswer, "The download didn't match the published file, so it wasn't installed.")) }
 }
 
 /// Whether this copy was put in place by the installer (and so can be replaced by one).
@@ -349,7 +379,9 @@ mod checksum_tests {
 
     #[test]
     fn will_not_fetch_an_update_with_no_checksum() {
-        assert_eq!(download(&installer(b"", None), |_| {}).unwrap_err(), NO_CHECKSUM);
+        let error = download(&installer(b"", None), |_| {}).unwrap_err();
+        assert_eq!(error.shape, FaultShape::Refused);
+        assert_eq!(error.to_string(), NO_CHECKSUM);
     }
 }
 

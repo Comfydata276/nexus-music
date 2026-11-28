@@ -1198,14 +1198,7 @@ impl Controller {
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
                 if let Err(reason) = &result {
-                    use crate::update::CheckError;
-                    let shape = match reason {
-                        CheckError::Refused | CheckError::Status(_) => FaultShape::Refused,
-                        CheckError::TimedOut => FaultShape::Timeout,
-                        CheckError::Request => FaultShape::Connection,
-                        CheckError::InvalidRelease => FaultShape::UnexpectedAnswer,
-                    };
-                    diagnostics::fault(FaultPlace::Updates, shape);
+                    diagnostics::fault(FaultPlace::Updates, reason.fault_shape());
                 }
                 match result {
                     Ok(Some(release)) => {
@@ -1272,13 +1265,16 @@ impl Controller {
             });
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
-                let Ok(path) = result else {
-                    diagnostics::fault(FaultPlace::Updates, FaultShape::Other);
-                    ctl.update_busy.set(false);
-                    page.set_update_busy(false);
-                    page.set_update_download_failed(true);
-                    page.set_update_status("The update couldn't be downloaded. Get it from the release page.".into());
-                    return;
+                let path = match result {
+                    Ok(path) => path,
+                    Err(error) => {
+                        diagnostics::fault(FaultPlace::Updates, error.shape);
+                        ctl.update_busy.set(false);
+                        page.set_update_busy(false);
+                        page.set_update_download_failed(true);
+                        page.set_update_status("The update couldn't be downloaded. Get it from the release page.".into());
+                        return;
+                    }
                 };
                 // The installer closes the app as it starts, maybe before the save at the
                 // end of `main`: the settings are on the disk first, as 0.40.10 had them.
@@ -1342,6 +1338,7 @@ impl Controller {
                         }
                         ctl.save_settings_in_passing();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
+                            diagnostics::fault(FaultPlace::App, FaultShape::Write);
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
                         ctl.covers.reset();

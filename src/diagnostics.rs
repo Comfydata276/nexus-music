@@ -67,7 +67,10 @@ pub fn save(ctl: &Controller) {
             let _ = std::process::Command::new(program).arg(&path).spawn();
             post(|ctl| ctl.toast("Diagnostics saved."));
         } else {
-            post(|ctl| ctl.toast("Couldn't save diagnostics."));
+            post(|ctl| {
+                fault(FaultPlace::App, FaultShape::Write);
+                ctl.toast("Couldn't save diagnostics.");
+            });
         }
     });
 }
