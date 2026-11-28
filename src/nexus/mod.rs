@@ -102,10 +102,6 @@ const NO_ANSWER: i32 = 12;
 /// What the row under Settings says.
 const NONE_FOUND: &str = "None found";
 
-/// The deadline over a call made in the background (`call`): a music login asked for, the
-/// session checked, the backend told of a sign-out.
-pub const CALL_DEADLINE: Duration = DEADLINE;
-
 /// What one look found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {

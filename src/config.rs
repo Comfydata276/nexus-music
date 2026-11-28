@@ -1046,6 +1046,7 @@ fn sync_folder(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 const KEYRING_SERVICE: &str = "Nexus Music";
 
 /// How 0.40 and before named the music-server password it kept: removed at the first start of
@@ -1104,14 +1105,14 @@ impl std::fmt::Debug for MusicLogin {
 /// (design 6.1). The device's own secret is kept beside it; the password typed, nowhere.
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SignedIn {
-    /// The session, as hex.
+    /// What the shared library's client said to keep, whole (`nexus_core::nexus::client::Saved`,
+    /// as it serialises it): the Nexus origin, the backend's id, who the person is to it,
+    /// the session and the note that can end it, and the music login with its number.
     #[serde(default)]
-    pub session: Option<String>,
+    pub saved: Option<serde_json::Value>,
+    /// The music login in it, as a cold start reads it (written with it, in the same step).
     #[serde(default)]
     pub music: Option<MusicLogin>,
-    /// The account, as the shared library keeps it (nothing secret in it).
-    #[serde(default)]
-    pub account: Option<serde_json::Value>,
     /// The name of the folder this person's things are kept under on this PC (downloads,
     /// the changes waiting for the music server): decided once, at the sign-in that made it
     /// (`folder_for`), and from then on tied to who they are to the backend, never to the
@@ -1122,7 +1123,7 @@ pub struct SignedIn {
 
 impl std::fmt::Debug for SignedIn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SignedIn {{ session: {}, music: {:?}, account: {}, folder: {:?} }}", self.session.is_some(), self.music, self.account.is_some(), self.folder)
+        write!(f, "SignedIn {{ saved: {}, music: {:?}, folder: {:?} }}", self.saved.is_some(), self.music, self.folder)
     }
 }
 
@@ -1145,7 +1146,7 @@ pub fn load_sign_in(paths: &Paths) -> Option<SignedIn> {
 /// Puts what a sign-in left in place, whole, in one step; nothing kept, if it holds nothing.
 /// Says whether it was done.
 pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
-    if kept.session.is_none() && kept.music.is_none() && kept.account.is_none() {
+    if kept.saved.is_none() {
         return write_kept(paths, SIGNED_IN, "");
     }
     serde_json::to_string(kept).is_ok_and(|text| write_kept(paths, SIGNED_IN, &text))
@@ -1154,39 +1155,45 @@ pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
 /// The folder a person's things are kept under, decided at their first sign-in on this PC
 /// (design 11). **What is carried over, exactly:** the folder of the sign-in this PC had
 /// before the Nexus server (named by the music server and user, `account_stem`) becomes
-/// the person's, **once**, if the music login they are handed names that same music server
-/// and that same user. Every other person, and anyone handed that music user later, gets a
-/// folder named by who they are to the backend: its id and their account. The carry-over is
-/// written down (`Settings::carried_over`) by whoever calls this, so that it happens once.
-pub fn folder_for(settings: &Settings, backend: &str, account: &str, music_server: &str, music_user: &str) -> (String, bool) {
-    if let Some((owner, folder)) = &settings.carried_over
-        && owner == &format!("{backend}\n{account}")
-    {
-        return (folder.clone(), false);
-    }
-    let before = !settings.server.is_empty() && !settings.username.is_empty();
-    if settings.carried_over.is_none() && before && settings.server == music_server && settings.username == music_user {
-        return (crate::controller::account_stem(music_server, music_user), true);
+/// the person's, **once**, when the shared library says the music login they are handed
+/// names that same music server and user (`nexus_core::nexus::client::carries_over`, which
+/// the caller asks and passes as `same`). Every other person, and anyone handed that music
+/// user later, gets a folder named by who they are to the backend: its id and their
+/// account's number. Whoever calls this writes the carry-over down
+/// (`Settings::carried_over`) when it says one was made, so that it happens once.
+pub fn folder_for(settings: &Settings, backend: &str, account: u64, same: bool) -> (String, bool) {
+    let who = format!("{backend}\n{account}");
+    if let Some((owner, folder)) = &settings.carried_over {
+        if owner == &who {
+            return (folder.clone(), false);
+        }
+    } else if same && !settings.server.is_empty() && !settings.username.is_empty() {
+        return (crate::controller::account_stem(&settings.server, &settings.username), true);
     }
     (person_folder(backend, account), false)
 }
 
-/// A folder named by who a person is to the backend: as much of their account as reads
-/// easily, and a short hash of exactly that and the backend's id, so that no two share one
-/// on a disk that ignores case either.
-pub fn person_folder(backend: &str, account: &str) -> String {
+/// A folder named by who a person is to the backend: its id and their account's number.
+pub fn person_folder(backend: &str, account: u64) -> String {
     use sha2::{Digest, Sha256};
-    let mut readable = String::new();
-    for c in account.chars() {
-        match c.to_ascii_lowercase() {
-            c if c.is_ascii_lowercase() || c.is_ascii_digit() => readable.push(c),
-            _ if readable.ends_with('-') || readable.is_empty() => {}
-            _ => readable.push('-'),
-        }
-    }
-    let readable: String = readable.chars().take(32).collect();
     let hash: String = Sha256::digest(format!("{backend}\n{account}").as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
-    format!("nexus-{}-{hash}", readable.trim_end_matches('-'))
+    format!("nexus-{account}-{hash}")
+}
+
+/// The sign-outs the Nexus server has not taken yet (the shared library's notes, as it
+/// serialises them, each ending one session and nothing else), kept beside the sign-in.
+const NOTES: &str = "nexus-sign-out-notes";
+
+pub fn load_notes(paths: &Paths) -> Vec<serde_json::Value> {
+    read_kept(paths, NOTES).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+/// Puts the notes in place, whole, in one step; says whether it was done.
+pub fn save_notes(paths: &Paths, notes: &[serde_json::Value]) -> bool {
+    if notes.is_empty() {
+        return write_kept(paths, NOTES, "");
+    }
+    serde_json::to_string(notes).is_ok_and(|text| write_kept(paths, NOTES, &text))
 }
 
 /// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this

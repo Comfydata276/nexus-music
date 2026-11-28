@@ -2830,22 +2830,28 @@ export component SettingsPage inherits Rectangle {
     }
 }
 
-// The sign-in screen: the Nexus server's address, and an email and password, or the one-time
-// code the admin gave; then, after a code, choosing a password. Signing in is to the Nexus
-// server alone, which hands this PC what it needs to play. What is typed as a password goes
-// once, and the field is emptied when it is sent.
+// The sign-in screen: the Nexus server's address, and an email and password; or, the first
+// time, the one-time code the admin gave and the password chosen. Signing in is to the
+// Nexus server alone, which hands this PC what it needs to play. What is typed is held by
+// this form while it is up (for the one retry the Nexus server may ask for), and goes when
+// it closes.
 export component LoginPage inherits Rectangle {
     background: Theme.base;
     property <bool> code: false;
-    // What is typed, held here so that the button can read it whichever fields are showing.
+    // Small windows: less space around the form, and a smaller heading.
+    property <bool> short: self.height < 640px;
+    // What is typed, held here so that the button (and the retry) can read it whichever
+    // fields are showing.
     property <string> address-in: App.nexus-address;
     property <string> email-in: App.nexus-email;
     property <string> password-in;
     property <string> code-in;
-    property <string> new-in;
     property <string> again-in;
-    // Small windows: less space around the form, and a smaller heading.
-    property <bool> short: self.height < 640px;
+
+    // The Nexus server asked to come back in a few seconds, and that time has passed: the
+    // form presses again, as it is.
+    property <int> send-again: App.send-again;
+    changed send-again => { root.go(true); }
 
     // A wash of the brand colour behind the form.
     Rectangle {
@@ -2875,12 +2881,10 @@ export component LoginPage inherits Rectangle {
 
                 VerticalLayout {
                     width: min(380px, form-scroll.visible-width - 32px);
-                    spacing: root.short ? 8px : 12px;
+                    spacing: root.short ? 7px : 12px;
 
-                    HorizontalLayout {
+                    if !root.short: HorizontalLayout {
                         alignment: start;
-                        visible: !root.short;
-                        height: root.short ? 0px : 48px;
                         Rectangle {
                             width: 48px;
                             height: 48px;
@@ -2895,7 +2899,7 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Text {
-                        text: App.choosing-password ? "Choose your password" : "Sign in to Nexus Music";
+                        text: root.code ? "Your first sign-in" : "Sign in to Nexus Music";
                         color: Theme.text;
                         font-family: Theme.display;
                         font-size: root.short ? 26px : 34px;
@@ -2904,96 +2908,81 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Text {
-                        text: App.choosing-password
-                            ? "You signed in with a one-time code. Choose the password you'll sign in with from now on: at least 10 characters."
-                            : root.code ? "Type the address of your Nexus server, and the one-time code its admin gave you."
-                            : "Type the address of your Nexus server, and the email and password of your account there.";
+                        text: root.code
+                            ? "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on: at least 15 characters."
+                            : "Type your Nexus server's address, and the email and password of your account there.";
                         color: Theme.muted;
                         font-size: 14px;
                         wrap: word-wrap;
                     }
 
-                    if !App.choosing-password: Text {
+                    Text {
                         text: "Nexus server";
                         color: Theme.text;
                         font-size: 13px;
                         font-weight: 600;
                     }
 
-                    if !App.choosing-password: Field {
+                    Field {
                         text <=> root.address-in;
                         placeholder: "nexus.example.org";
                         label: "Nexus server";
-                        accepted => { root.go(); }
+                        accepted => { root.go(false); }
                     }
 
-                    if !App.choosing-password && !root.code: Text {
+                    if !root.code: Text {
                         text: "Email";
                         color: Theme.text;
                         font-size: 13px;
                         font-weight: 600;
                     }
 
-                    if !App.choosing-password && !root.code: Field {
+                    if !root.code: Field {
                         text <=> root.email-in;
                         label: "Email";
-                        accepted => { root.go(); }
+                        accepted => { root.go(false); }
                     }
 
-                    if !App.choosing-password && !root.code: Text {
-                        text: "Password";
-                        color: Theme.text;
-                        font-size: 13px;
-                        font-weight: 600;
-                    }
-
-                    if !App.choosing-password && !root.code: Field {
-                        text <=> root.password-in;
-                        input-type: InputType.password;
-                        label: "Password";
-                        accepted => { root.go(); }
-                    }
-
-                    if !App.choosing-password && root.code: Text {
+                    if root.code: Text {
                         text: "One-time code";
                         color: Theme.text;
                         font-size: 13px;
                         font-weight: 600;
                     }
 
-                    if !App.choosing-password && root.code: Field {
+                    if root.code: Field {
                         text <=> root.code-in;
                         label: "One-time code";
-                        placeholder: "ABCD EFGH 3479";
-                        accepted => { root.go(); }
+                        placeholder: "ABCD EFGH JKMN";
+                        accepted => { root.go(false); }
                     }
 
-                    if App.choosing-password: Text {
-                        text: "New password";
+                    Text {
+                        text: root.code ? "Choose a password" : "Password";
                         color: Theme.text;
                         font-size: 13px;
                         font-weight: 600;
                     }
 
-                    if App.choosing-password: Field {
-                        text <=> root.new-in;
+                    Field {
+                        text <=> root.password-in;
                         input-type: InputType.password;
-                        label: "New password";
-                        accepted => { root.go(); }
+                        label: root.code ? "Choose a password" : "Password";
+                        accepted => { root.go(false); }
                     }
 
-                    if App.choosing-password: Text {
+                    if root.code: Text {
                         text: "The same again";
                         color: Theme.text;
                         font-size: 13px;
                         font-weight: 600;
                     }
 
-                    if App.choosing-password: Field {
+                    if root.code: Field {
                         text <=> root.again-in;
                         input-type: InputType.password;
                         label: "The same again";
-                        accepted => { root.go(); }
+                        accepted => { root.go(false); }
                     }
 
                     if App.login-error != "": Text {
@@ -3004,41 +2993,44 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Rectangle {
-                        height: 4px;
+                        height: 2px;
                     }
 
                     TextButton {
-                        text: App.login-busy ? (App.choosing-password ? "Saving…" : "Signing in…") : (App.choosing-password ? "Save password" : "Sign in");
+                        text: App.login-busy ? "Signing in…" : "Sign in";
                         primary: true;
                         enabled: !App.login-busy;
                         height: 46px;
-                        clicked => { root.go(); }
+                        clicked => { root.go(false); }
                     }
 
                     HorizontalLayout {
                         spacing: 16px;
                         alignment: start;
 
-                        if !App.choosing-password: LinkText {
-                            text: root.code ? "Sign in with a password instead" : "I have a one-time code";
+                        LinkText {
+                            text: root.code ? "Sign in with my password instead" : "I have a one-time code";
                             enabled: !App.login-busy;
                             clicked => {
                                 root.code = !root.code;
+                                root.password-in = "";
+                                root.code-in = "";
+                                root.again-in = "";
                                 App.login-error = "";
+                                App.form-closed();
                             }
                         }
-                        if App.choosing-password: LinkText {
-                            text: "Cancel";
-                            clicked => { App.cancel-choose(); }
-                        }
-                        if !App.choosing-password && App.signed-in: LinkText {
+                        if App.signed-in: LinkText {
                             text: "Back";
-                            clicked => { App.show-sign-in = false; }
+                            clicked => {
+                                App.show-sign-in = false;
+                                App.form-closed();
+                            }
                         }
                     }
 
                     Text {
-                        text: "Your password is sent once to your Nexus server, and kept nowhere on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
+                        text: "Your password goes only to your Nexus server, and is never kept on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
                         color: Theme.faint;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -3048,19 +3040,13 @@ export component LoginPage inherits Rectangle {
         }
     }
 
-    // What the button does. The secret fields are emptied as they are sent.
-    function go() {
-        if App.login-busy { return; }
-        if App.choosing-password {
-            App.choose-password(root.new-in, root.again-in);
-        } else if root.code {
-            App.sign-in-code(root.address-in, root.code-in);
+    // What the button does, and the retry: what the form holds, as it is.
+    function go(retry: bool) {
+        if App.login-busy && !retry { return; }
+        if root.code {
+            App.sign-in-code(root.address-in, root.code-in, root.password-in, root.again-in, retry);
         } else {
-            App.sign-in(root.address-in, root.email-in, root.password-in);
+            App.sign-in(root.address-in, root.email-in, root.password-in, retry);
         }
-        root.password-in = "";
-        root.code-in = "";
-        root.new-in = "";
-        root.again-in = "";
     }
 }

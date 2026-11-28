@@ -99,7 +99,7 @@ pub struct Client {
 
 // How a typed address is tidied, which addresses are tried for it and when plain HTTP
 // matters are the library's.
-pub use nexus_core::address::{addresses_to_try, https_only, normalize_server_url, unencrypted_beyond_home};
+pub use nexus_core::address::normalize_server_url;
 
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
@@ -561,11 +561,6 @@ impl Client {
             .map_err(|e| ApiError::Network(network_hint(&e)))
     }
 
-    /// Whether the person has put the app in offline mode: nothing is asked of the server.
-    pub fn is_offline(&self) -> bool {
-        self.check_online().is_err()
-    }
-
     /// Opens connections ahead of need, so the first clicks don't pay for setting them up.
     pub fn warm_up(&self, connections: usize) {
         std::thread::scope(|scope| {
@@ -598,12 +593,6 @@ impl Client {
         let started = std::time::Instant::now();
         fresh.ping()?;
         Ok((cold, started.elapsed().as_millis()))
-    }
-
-    /// Whether anything at all answers at this address within `limit`. For trying an address
-    /// that's only a guess without waiting long on it.
-    pub fn answers_within(&self, limit: Duration) -> bool {
-        self.get(&self.url_as(CLIENT_NAME, "ping", &[]), Some(limit)).is_ok()
     }
 
     pub fn ping(&self) -> ApiResult<ServerInfo> {

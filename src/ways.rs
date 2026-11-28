@@ -65,17 +65,6 @@ impl Choices {
         (WayIn { ways: &self.0 }, owed, ways.whose())
     }
 
-    /// Somebody else's choice is about to be carried out.
-    pub fn begin(&self, who: Who, counted: bool) -> WayIn<'_> {
-        self.0.borrow_mut().begin(who, counted);
-        WayIn { ways: &self.0 }
-    }
-
-    /// Whether the choice under way has taken any way in: whether carrying it out has
-    /// changed anything.
-    pub fn taken(&self) -> bool {
-        self.0.borrow().taken()
-    }
 }
 
 impl Controller {
@@ -93,14 +82,6 @@ impl Controller {
     /// the volume).
     pub fn came_in(&self, who: Who, what: What) {
         let _way = self.way_in(who, what);
-    }
-
-    /// Somebody else's choice is about to be carried out, by the functions a press runs:
-    /// until this is dropped, what they do is that one's choice. `counted`: it is counted
-    /// by whoever carries it out (a command the rule let through, counted once if the
-    /// player changes anything), and what the player does for it is not counted again.
-    pub fn for_another(&self, who: Who, counted: bool) -> WayIn<'_> {
-        self.ways.begin(who, counted)
     }
 
     fn owe(&self, owed: Owed, whose: Option<Who>) {

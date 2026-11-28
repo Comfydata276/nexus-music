@@ -11,19 +11,22 @@
 //!
 //! - **The transport** (`call`): each ask sent once, in a process of its own under the
 //!   component's deadline, HTTPS only, to the backend's own paths only, nothing followed.
-//! - **Where secrets are kept** (`config::write_kept`: Windows' Credential Manager). **What
-//!   the core says to keep and forget after one thing that happened is put in place as one
-//!   item, in one step** (`config::SignedIn`: the session, the music login with its number,
-//!   the account, and the folder the person's things are under), so that a write cut short
-//!   leaves the one before it whole (design 11). This device's own secret is kept beside it,
-//!   and a sign-out the backend was not yet told of is kept beside it too (the core's
-//!   `ToTell`), to end that session and nothing else. **The password typed is kept nowhere:**
-//!   it goes from the field to the core as `Typed` (wiped when let go of), into the ask's
-//!   request, through the ask's own process, once, over HTTPS, to the address typed; the
-//!   window empties the field when it is sent.
+//! - **Where secrets are kept** (`config::write_kept`: Windows' Credential Manager). What
+//!   the core says to keep is kept as it says, **each in one step**: what signing in left
+//!   (`Keep::Saved`, whole, with the folder the person's things are under and a plain copy
+//!   of the music login for a cold start, in one item: `config::SignedIn`); this device's
+//!   own secret beside it; and the sign-outs the backend has not taken yet (`Keep::Note`,
+//!   by the session each ends), in an item of their own, written **before** anything that
+//!   follows them in the same list (the core puts a sign-out's note before the forgetting
+//!   of what signing in left). **The password typed is kept nowhere:** it goes from the
+//!   form to the core as `Typed` (wiped when let go of), into the ask's request, through the
+//!   ask's own process, once, over HTTPS, to the address typed. The form holds what was
+//!   typed while it is up (the core's one retry after "come back in N seconds" is the
+//!   form pressing again), and lets go of it when it closes.
 //! - **The person's folder** (design 11): decided once, when a sign-in first leaves both an
-//!   account and a music login (`config::folder_for`), by who they are to the backend, with
-//!   the narrow carry-over of the folder this PC had before.
+//!   account and a music login (`config::folder_for`), by who they are to the backend (its
+//!   id and the account's number), with the core's narrow carry-over of the folder this PC
+//!   had before (`client::carries_over`).
 //! - **The window**: the sign-in screen, choosing a password, the Account rows, the list of
 //!   devices, changing the password; and the player, handed a music login (the controller's
 //!   `signed_in_with`, `music_login_renewed`, `music_set_aside`, `sign_out`).
@@ -35,13 +38,12 @@
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
-use nexus_core::nexus::account::{self, DeviceKind, DeviceSecret, MusicAddress, MusicSalt, MusicToken, Name, Session};
+use nexus_core::nexus::account::{self, AccountId, DeviceKind, DeviceSecret, MusicLogin, Name, Session, SessionId, SignOutNote, SignOutSecret};
 use nexus_core::nexus::client::{
-    self as core, AccountFile, AnswerBody, App, Ask, Client, Do, Failure, Forget, Given, Hand, Happened, Keep, Kept, ListState, Method, PasswordState, Press, Random, Screen,
-    Shown, SignInState, ToTell, Typed,
+    self as core, AnswerBody, App, Ask, Client, Do, Failure, Forget, Given, Hand, Happened, Keep, Kept, ListState, Look, Method, Note, PasswordState, Press, Random, Saved,
+    Screen, Shown, SignInState, Typed,
 };
 use nexus_core::nexus::proto::Version;
-use nexus_core::origin::{Address, HandoverSource, MusicBase};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use zeroize::Zeroizing;
 
@@ -51,8 +53,6 @@ use crate::ui;
 
 /// Where this device's own secret is kept.
 const DEVICE: &str = "nexus-device";
-/// Where a sign-out the backend was not yet told of is kept.
-const TO_TELL: &str = "nexus-sign-out-note";
 /// The core is started this long after the window's first turn, so that nothing it asks is
 /// on the way to the first page (as the component's look was).
 const START_AFTER: Duration = Duration::from_secs(5);
@@ -62,6 +62,11 @@ thread_local! {
     static STARTED: Cell<bool> = const { Cell::new(false) };
     static OFFLINE: Cell<bool> = const { Cell::new(false) };
     static TIMERS: RefCell<Vec<slint::Timer>> = const { RefCell::new(Vec::new()) };
+    /// The timer for the core's "come back in N seconds".
+    static WAIT: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+    /// The generation the music login in the player was handed under: what a refusal of it
+    /// carries back.
+    static HANDED: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
     /// The notice of what this server records, as last shown: shown once.
     static NOTICE: RefCell<String> = const { RefCell::new(String::new()) };
     /// The words about the music login, as last said.
@@ -93,18 +98,7 @@ fn app() -> App {
 
 // ---- what is kept, read back --------------------------------------------------------------------
 
-/// The core's music login from the one kept.
-fn core_music(music: &config::MusicLogin) -> Option<account::MusicLogin> {
-    Some(account::MusicLogin {
-        address: MusicAddress::new(&music.server)?,
-        name: Name::new(&music.username)?,
-        salt: MusicSalt::new(&music.salt)?,
-        token: MusicToken::from_hex(&music.token)?,
-        count: music.count,
-    })
-}
-
-fn kept_music(music: &account::MusicLogin) -> config::MusicLogin {
+fn kept_music(music: &MusicLogin) -> config::MusicLogin {
     config::MusicLogin {
         server: music.address.as_str().to_string(),
         username: music.name.as_str().to_string(),
@@ -114,20 +108,52 @@ fn kept_music(music: &account::MusicLogin) -> config::MusicLogin {
     }
 }
 
+// C10: reading back what `Keep` gave, as the phone's binding reads it (`client::json`'s
+// `kept`), is to be the core's own (asked of C10 in the bulletin); until then it is read
+// here, field for field, as that reader reads it.
+fn revoke(value: &serde_json::Value) -> Option<SignOutNote> {
+    Some(SignOutNote { session: SessionId::new(value.get("session")?.as_u64()?)?, secret: SignOutSecret::from_hex(value.get("secret")?.as_str()?)? })
+}
+
+fn read_saved(value: &serde_json::Value) -> Option<Saved> {
+    let text = |key: &str| value.get(key).and_then(|field| field.as_str()).map(str::to_string);
+    let number = |key: &str| value.get(key).and_then(|field| field.as_u64());
+    let music = value.get("music").filter(|music| !music.is_null()).and_then(|music| account::read::<MusicLogin>(music.to_string().as_bytes()).ok());
+    Some(Saved {
+        nexus: text("nexus")?,
+        backend_id: text("backend_id")?,
+        account: AccountId::new(number("account")?)?,
+        email: text("email")?,
+        name: text("name")?,
+        device: number("device")?,
+        restore: number("restore")?,
+        life: number("life")?,
+        change: number("change")?,
+        notice: text("notice"),
+        session: text("session").and_then(|hex| Session::from_hex(&hex)),
+        sign_out: value.get("sign_out").and_then(revoke),
+        music,
+    })
+}
+
+fn read_note(value: &serde_json::Value) -> Option<Note> {
+    Some(Note {
+        request: value.get("request")?.as_u64()?,
+        revoke: revoke(value.get("revoke")?)?,
+        nexus: value.get("nexus")?.as_str()?.to_string(),
+        backend_id: value.get("backend_id")?.as_str()?.to_string(),
+        restore: value.get("restore")?.as_u64()?,
+        made_ms: value.get("made_ms")?.as_u64()?,
+    })
+}
+
 /// What the core is started with: everything kept, read back.
 fn read_kept(paths: &config::Paths) -> Kept {
     let record = config::load_sign_in(paths).unwrap_or_default();
-    let device_secret = config::read_kept(paths, DEVICE).ok().flatten().and_then(|hex| DeviceSecret::from_hex(hex.trim()));
-    let to_tell = config::read_kept(paths, TO_TELL).ok().flatten().and_then(|text| {
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        Some(ToTell { session: Session::from_hex(value.get("session")?.as_str()?)?, backend: value.get("backend")?.as_str()?.to_string(), restore: value.get("restore")?.as_u64()? })
-    });
     Kept {
-        device_secret,
-        session: record.session.as_deref().and_then(Session::from_hex),
-        music: record.music.as_ref().and_then(core_music),
-        account: record.account.and_then(|value| serde_json::from_value::<AccountFile>(value).ok()),
-        to_tell,
+        device_secret: config::read_kept(paths, DEVICE).ok().flatten().and_then(|hex| DeviceSecret::from_hex(hex.trim())),
+        saved: record.saved.as_ref().and_then(read_saved),
+        notes: config::load_notes(paths).iter().filter_map(read_note).collect(),
         offline: offline_now(),
     }
 }
@@ -137,8 +163,8 @@ fn read_kept(paths: &config::Paths) -> Kept {
 pub fn backend_for(server: &str, name: &str) -> Option<String> {
     let record = config::load_sign_in(&paths())?;
     let music = record.music.as_ref()?;
-    let account: AccountFile = serde_json::from_value(record.account?).ok()?;
-    (crate::subsonic::normalize_server_url(&music.server) == server && music.username == name).then_some(account.backend)
+    let nexus = record.saved.as_ref()?.get("nexus")?.as_str()?.to_string();
+    (crate::subsonic::normalize_server_url(&music.server) == server && music.username == name).then_some(nexus)
 }
 
 // ---- installed with the component ---------------------------------------------------------------
@@ -148,17 +174,29 @@ pub fn backend_for(server: &str, name: &str) -> Option<String> {
 pub fn install(ui: &ui::MainWindow) {
     let app_global = ui.global::<ui::App>();
     let weak = ui.as_weak();
-    app_global.on_sign_in(move |address, email, password| {
-        let press = Press::SignIn { address: address.to_string(), email: email.to_string(), password: Typed::new(&password) };
+    app_global.on_sign_in(move |address, email, password, retry| {
+        let press = Press::SignIn { address: address.to_string(), email: email.to_string(), password: Typed::new(&password), look: Look::default(), retry };
         press_on(&weak, press);
     });
     let weak = ui.as_weak();
-    app_global.on_sign_in_code(move |address, code| press_on(&weak, Press::SignInWithCode { address: address.to_string(), code: Typed::new(&code) }));
+    app_global.on_sign_in_code(move |address, code, password, again, retry| {
+        let press = Press::SignInWithCode {
+            address: address.to_string(),
+            code: Typed::new(&code),
+            password: Typed::new(&password),
+            again: Typed::new(&again),
+            look: Look::default(),
+            retry,
+        };
+        press_on(&weak, press);
+    });
     let weak = ui.as_weak();
-    app_global.on_choose_password(move |new, again| press_on(&weak, Press::ChoosePassword { password: Typed::new(&new), again: Typed::new(&again) }));
-    // Leaving the choice of a password is signing out of the session that a code gave.
-    let weak = ui.as_weak();
-    app_global.on_cancel_choose(move || press_on(&weak, Press::SignOut));
+    app_global.on_form_closed(move || {
+        WAIT.with(|slot| slot.borrow_mut().take());
+        if let Some(ui) = weak.upgrade() {
+            happened(&ui, Happened::Pressed(Press::FormClosed));
+        }
+    });
     let weak = ui.as_weak();
     app_global.on_sign_out(move || press_on(&weak, Press::SignOut));
     let weak = ui.as_weak();
@@ -166,8 +204,9 @@ pub fn install(ui: &ui::MainWindow) {
         let Some(ui) = weak.upgrade() else { return };
         // A refusal at a cold start, before the core's own start: it is started for it.
         start(&ui);
-        let Some(count) = config::load_sign_in(&paths()).and_then(|record| record.music.map(|music| music.count)) else { return };
-        happened(&ui, Happened::MusicRefused { count });
+        if let Some((count, generation)) = HANDED.with(Cell::get) {
+            happened(&ui, Happened::MusicRefused { count, generation });
+        }
     });
     let settings = ui.global::<ui::Settings>();
     let weak = ui.as_weak();
@@ -261,73 +300,78 @@ pub fn after_look(ui: &ui::MainWindow) {
 
 // ---- doing what the core says -------------------------------------------------------------------
 
-/// Does each thing, in order, except that every keep and forget among them is put in place
-/// first, together, as one item in one step.
+/// Does each thing, in the order given. Each keep and forget is one write, whole.
 fn run(ui: &ui::MainWindow, dos: Vec<Do>) {
-    let paths = paths();
-    if dos.iter().any(|thing| matches!(thing, Do::Keep(_) | Do::Forget(_))) {
-        let mut record = config::load_sign_in(&paths).unwrap_or_default();
-        let before = record.clone();
-        for thing in &dos {
-            match thing {
-                Do::Keep(Keep::DeviceSecret(secret)) => {
-                    config::write_kept(&paths, DEVICE, &secret.expose_hex());
-                }
-                Do::Keep(Keep::Session(session)) => record.session = Some(session.expose_hex().to_string()),
-                Do::Keep(Keep::Music(music)) => record.music = Some(kept_music(music)),
-                Do::Keep(Keep::Account(file)) => record.account = serde_json::to_value(file).ok(),
-                Do::Keep(Keep::ToTell(tell)) => {
-                    let kept = serde_json::to_string(tell).ok().is_some_and(|text| config::write_kept(&paths, TO_TELL, &Zeroizing::new(text)));
-                    note(format_args!("sign-out note kept {kept}"));
-                }
-                Do::Forget(Forget::Session) => record.session = None,
-                Do::Forget(Forget::Music) => record.music = None,
-                Do::Forget(Forget::Account) => record.account = None,
-                Do::Forget(Forget::ToTell) => {
-                    config::write_kept(&paths, TO_TELL, "");
-                }
-                _ => {}
-            }
-        }
-        if record.account.is_none() && record.music.is_none() {
-            record.folder.clear();
-        }
-        if record.folder.is_empty() {
-            record.folder = folder_for(&record);
-        }
-        if record != before {
-            let kept = config::save_sign_in(&paths, &record);
-            note(format_args!("kept {kept} session={} music={} account={}", record.session.is_some(), record.music.is_some(), record.account.is_some()));
-            if !kept {
-                crate::controller::with(|ctl| ctl.toast("This PC couldn't keep your sign-in: you'll need to sign in again next time."));
-            }
-        }
-    }
     for thing in dos {
         match thing {
-            Do::Ask(ask) => dispatch(ui, ask),
-            Do::Hand(hand) => hand_over(hand),
-            Do::Forget(Forget::Music) => {
+            Do::Keep(Keep::DeviceSecret(secret)) => {
+                config::write_kept(&paths(), DEVICE, &secret.expose_hex());
+            }
+            Do::Keep(Keep::Saved(saved)) => keep_saved(&saved),
+            Do::Keep(Keep::Note(kept_note)) => {
+                let paths = paths();
+                let session = kept_note.session();
+                let mut notes = config::load_notes(&paths);
+                notes.retain(|value| value.get("revoke").and_then(|revoke| revoke.get("session")).and_then(|id| id.as_u64()) != Some(session));
+                if let Ok(value) = serde_json::to_value(&kept_note) {
+                    notes.push(value);
+                }
+                let kept = config::save_notes(&paths, &notes);
+                note(format_args!("sign-out note kept {kept}"));
+            }
+            Do::Forget(Forget::Note { session }) => {
+                let paths = paths();
+                let mut notes = config::load_notes(&paths);
+                notes.retain(|value| value.get("revoke").and_then(|revoke| revoke.get("session")).and_then(|id| id.as_u64()) != Some(session));
+                config::save_notes(&paths, &notes);
+                note(format_args!("sign-out note forgotten"));
+            }
+            Do::Forget(Forget::Saved) => {
+                config::save_sign_in(&paths(), &SignedIn::default());
+                HANDED.with(|handed| handed.set(None));
                 // From the player too: what is on this PC is not touched.
-                note(format_args!("music login forgotten"));
+                note(format_args!("sign-in forgotten"));
                 crate::controller::with(|ctl| ctl.sign_out(""));
             }
+            Do::Ask(ask) => dispatch(ui, ask),
+            Do::Hand(hand) => hand_over(hand),
             Do::Show(shown) => show(ui, shown),
-            Do::Keep(_) | Do::Forget(_) => {}
         }
     }
 }
 
-/// The folder for the person a record is for, once it holds both an account and a music
-/// login (design 11): the one this PC had, carried over once, or one of their own.
-fn folder_for(record: &SignedIn) -> String {
-    let (Some(music), Some(account)) = (&record.music, &record.account) else { return String::new() };
-    let Ok(account) = serde_json::from_value::<AccountFile>(account.clone()) else { return String::new() };
-    let server = crate::subsonic::normalize_server_url(&music.server);
+/// What signing in left, put in place whole, in one step, with the folder it is for.
+fn keep_saved(saved: &Saved) {
+    let paths = paths();
+    let before = config::load_sign_in(&paths).unwrap_or_default();
+    let Ok(value) = serde_json::to_value(saved) else { return };
+    let same_person = before.saved.as_ref().is_some_and(|was| was.get("backend_id") == value.get("backend_id") && was.get("account") == value.get("account"));
+    let music = saved.music.as_ref().map(kept_music);
+    let mut folder = if same_person { before.folder.clone() } else { String::new() };
+    if folder.is_empty()
+        && let Some(login) = &saved.music
+    {
+        folder = folder_for(saved, login);
+    }
+    let record = SignedIn { saved: Some(value), music, folder };
+    let kept = config::save_sign_in(&paths, &record);
+    note(format_args!("kept {kept} session={} music={}", saved.session.is_some(), saved.music.is_some()));
+    if !kept {
+        crate::controller::with(|ctl| ctl.toast("This PC couldn't keep your sign-in: you'll need to sign in again next time."));
+    }
+}
+
+/// The folder for the person signed in, the first time a music login is kept for them
+/// (design 11): the one this PC had, carried over once, or one of their own.
+fn folder_for(saved: &Saved, login: &MusicLogin) -> String {
     let decided = crate::controller::with(|ctl| {
-        let (folder, carried) = config::folder_for(&ctl.settings.borrow(), &account.backend_id, &account.email, &server, &music.username);
+        let same = {
+            let settings = ctl.settings.borrow();
+            core::carries_over(&settings.server, &settings.username, login)
+        };
+        let (folder, carried) = config::folder_for(&ctl.settings.borrow(), &saved.backend_id, saved.account.get(), same);
         if carried {
-            ctl.settings.borrow_mut().carried_over = Some((format!("{}\n{}", account.backend_id, account.email), folder.clone()));
+            ctl.settings.borrow_mut().carried_over = Some((format!("{}\n{}", saved.backend_id, saved.account.get()), folder.clone()));
             ctl.save_settings();
         }
         (folder, carried)
@@ -337,17 +381,24 @@ fn folder_for(record: &SignedIn) -> String {
     folder
 }
 
-/// Sends one ask, on a thread of its own, and tells the core what came of it. Dispatched here,
-/// on the window's thread, and only while Offline mode is off; its answer is told only if
-/// the core still waits for it, in the generation it was asked under.
+/// Sends one ask, on a thread of its own, and tells the core what came of it. **The core is
+/// asked whether it still waits for it immediately before it is sent**, here on the
+/// window's thread (which makes every other call), and it is dropped unsent if not; and
+/// nothing is sent while Offline mode is on. Its answer is told only if the core still
+/// waits for it, in the generation it was asked under.
 fn dispatch(ui: &ui::MainWindow, ask: Ask) {
     let (id, generation) = (ask.id, ask.generation);
+    if !CLIENT.with(|client| client.borrow().waits_for(id)) {
+        note(format_args!("ask {id} dropped unsent"));
+        return;
+    }
     if offline_now() {
         note(format_args!("ask {id} not sent: offline"));
         later_failed(ui, id, generation);
         return;
     }
     let deadline = super::test_ms("NEXUS_TEST_DEADLINE_MS").unwrap_or(Duration::from_millis(ask.within_ms));
+    note(format_args!("dispatch ask{id} offline=false"));
     let weak = ui.as_weak();
     let started = std::thread::Builder::new().name("nexus-ask".into()).spawn(move || {
         let request = call::Request {
@@ -361,7 +412,7 @@ fn dispatch(ui: &ui::MainWindow, ask: Ask) {
         drop(ask);
         let _ = weak.upgrade_in_event_loop(move |ui| match answer {
             Ok((status, body)) => {
-                if CLIENT.with(|client| client.borrow().generation() == generation && client.borrow().waits_for(id)) {
+                if CLIENT.with(|client| client.borrow().waits_for(id)) {
                     happened(&ui, Happened::Answered { ask: id, status, body: AnswerBody::new(body.to_vec()) });
                 } else {
                     note(format_args!("ask {id} answer dropped"));
@@ -387,7 +438,8 @@ fn later_failed(ui: &ui::MainWindow, id: u64, generation: u64) {
 }
 
 fn failed(ui: &ui::MainWindow, id: u64, generation: u64, how: core::How) {
-    if CLIENT.with(|client| client.borrow().generation() == generation && client.borrow().waits_for(id)) {
+    let _ = generation;
+    if CLIENT.with(|client| client.borrow().waits_for(id)) {
         happened(ui, Happened::Failed { ask: id, failure: Failure { how, inside: None, permission: None } });
     }
 }
@@ -396,38 +448,37 @@ fn failed(ui: &ui::MainWindow, id: u64, generation: u64, how: core::How) {
 /// with.
 fn hand_over(hand: Hand) {
     match hand {
-        Hand::Login(music) => {
-            let Some(record) = config::load_sign_in(&paths()) else { return };
-            let account = record.account.and_then(|value| serde_json::from_value::<AccountFile>(value).ok());
+        Hand::Login { login, generation } => {
+            let record = config::load_sign_in(&paths()).unwrap_or_default();
+            let nexus = record.saved.as_ref().and_then(|saved| saved.get("nexus")).and_then(|nexus| nexus.as_str()).unwrap_or_default().to_string();
+            let email = record.saved.as_ref().and_then(|saved| saved.get("email")).and_then(|email| email.as_str()).unwrap_or_default().to_string();
             // The music server's address is read as one the backend handed over (design 7.1):
             // one under the Nexus server's own paths is never used, so the music login is
             // never sent to the backend's.
-            if let Some(account) = &account {
-                let checked = Address::parse(&format!("{}{}", account.backend, account::MUSIC_LOGIN))
-                    .map_err(|_| nexus_core::origin::AddressError::HandoverSource)
-                    .and_then(|sent| MusicBase::handed_over(sent.origin(), HandoverSource::DeviceTokenAnswer(&sent), music.address.as_str()));
-                if let Err(why) = checked {
-                    note(format_args!("music address not used: {}", why.reason()));
-                    crate::controller::with(|ctl| ctl.toast(why.handover_words()));
-                    return;
-                }
+            let checked = account::NexusOrigin::typed(&nexus).and_then(|origin| {
+                let sent = origin.call(account::MUSIC_LOGIN)?;
+                login.address.handed_over(&origin, nexus_core::origin::HandoverSource::DeviceTokenAnswer(&sent))
+            });
+            if let Err(why) = checked {
+                note(format_args!("music address not used: {}", why.reason()));
+                crate::controller::with(|ctl| ctl.toast(why.handover_words()));
+                return;
             }
-            let login = kept_music(&music);
+            HANDED.with(|handed| handed.set(Some((login.count, generation))));
+            let music = kept_music(&login);
             let folder = record.folder.clone();
-            let (nexus, email) = account.map(|account| (account.backend, account.email)).unwrap_or_default();
-            note(format_args!("music login handed, number {}", login.count));
+            note(format_args!("music login handed, number {}", music.count));
             crate::controller::with(|ctl| {
                 if ctl.client().is_some() && ctl.account() == folder {
-                    ctl.music_login_renewed(&login);
+                    ctl.music_login_renewed(&music);
                 } else {
-                    ctl.signed_in_with(&login, &folder, &nexus, &email);
+                    ctl.signed_in_with(&music, &folder, &nexus, &email);
                 }
             });
         }
-        Hand::Refused { count } => {
+        Hand::Refused { count, generation } => {
             note(format_args!("music login set aside, number {count}"));
-            let held = config::load_sign_in(&paths()).and_then(|record| record.music.map(|music| music.count));
-            if held == Some(count) {
+            if HANDED.with(Cell::get) == Some((count, generation)) {
                 crate::controller::with(|ctl| ctl.music_set_aside());
             }
         }
@@ -439,7 +490,7 @@ fn show(ui: &ui::MainWindow, shown: Shown) {
     let app = ui.global::<ui::App>();
     let settings = ui.global::<ui::Settings>();
     let form = &shown.sign_in;
-    app.set_login_busy(form.state == SignInState::Working);
+    app.set_login_busy(form.state == SignInState::Working || form.wait_s.is_some());
     app.set_login_error(form.words.as_str().into());
     if !form.address.is_empty() {
         app.set_nexus_address(form.address.as_str().into());
@@ -447,9 +498,30 @@ fn show(ui: &ui::MainWindow, shown: Shown) {
     if !form.email.is_empty() {
         app.set_nexus_email(form.email.as_str().into());
     }
-    app.set_choosing_password(shown.screen == Screen::ChoosePassword);
-    // Signed out with music still held ("start again"): the player goes on, and the Account
-    // row offers the sign-in screen.
+    // "Come back in N seconds": a timer, then the core is told; when it says to send again,
+    // the form presses again with what it holds.
+    match form.wait_s {
+        Some(seconds) if WAIT.with(|slot| slot.borrow().is_none()) => {
+            let weak = ui.as_weak();
+            let timer = slint::Timer::default();
+            timer.start(slint::TimerMode::SingleShot, Duration::from_secs(seconds), move || {
+                WAIT.with(|slot| slot.borrow_mut().take());
+                if let Some(ui) = weak.upgrade() {
+                    happened(&ui, Happened::WaitPassed);
+                }
+            });
+            WAIT.with(|slot| *slot.borrow_mut() = Some(timer));
+        }
+        None => {
+            WAIT.with(|slot| slot.borrow_mut().take());
+        }
+        _ => {}
+    }
+    if form.send_again {
+        app.set_send_again(app.get_send_again() + 1);
+    }
+    // Signed out with music still held ("the server's data was put back"): the player goes
+    // on, and the Account row offers the sign-in screen.
     app.set_nexus_sign_in_wanted(shown.screen == Screen::SignIn && shown.plays);
     if shown.screen != Screen::SignIn {
         app.set_show_sign_in(false);
@@ -499,15 +571,34 @@ fn show(ui: &ui::MainWindow, shown: Shown) {
 mod tests {
     use super::*;
 
-    /// A music login kept and read back is the one the core gave, and its debug form shows
-    /// none of its secret parts.
+    /// What the core gave to keep reads back as it was, and its debug form shows none of the
+    /// music login's secret parts.
     #[test]
-    fn a_music_login_is_kept_as_the_core_gave_it() {
-        let login = config::MusicLogin { server: "https://music.example.org".into(), username: "ada".into(), salt: "abcdefghijklmnop".into(), token: "0f".repeat(16), count: 3 };
-        let back = kept_music(&core_music(&login).unwrap());
-        assert_eq!(back, login);
-        let record = SignedIn { session: Some("ab".repeat(32)), music: Some(login), account: None, folder: "nexus-ada".into() };
+    fn what_is_kept_reads_back_as_the_core_gave_it() {
+        let music = account::read::<MusicLogin>(
+            br#"{"address":"https://music.example.org","name":"ada","salt":"0101010101010101010101010101010101010101010101010101010101010101","token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","count":3}"#,
+        )
+        .unwrap();
+        let saved = Saved {
+            nexus: "https://nexus.example.org".into(),
+            backend_id: "5c".repeat(16),
+            account: AccountId::new(7).unwrap(),
+            email: "ada@example.org".into(),
+            name: "Ada".into(),
+            device: 2,
+            restore: 1,
+            life: 1,
+            change: 1,
+            notice: None,
+            session: Session::from_hex(&"ab".repeat(32)),
+            sign_out: Some(SignOutNote { session: SessionId::new(4).unwrap(), secret: SignOutSecret::from_hex(&"cd".repeat(32)).unwrap() }),
+            music: Some(music),
+        };
+        let value = serde_json::to_value(&saved).unwrap();
+        let back = read_saved(&value).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+        let record = SignedIn { saved: Some(value), music: back.music.as_ref().map(kept_music), folder: "nexus-7-ab".into() };
         let shown = format!("{record:?}");
-        assert!(!shown.contains("abab") && !shown.contains("0f0f") && !shown.contains("abcdefgh"), "{shown}");
+        assert!(!shown.contains("abab") && !shown.contains("0f0f") && !shown.contains("cdcd"), "{shown}");
     }
 }

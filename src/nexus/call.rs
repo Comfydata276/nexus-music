@@ -18,8 +18,8 @@
 //! - **A session only in an `Authorization` header**, never in an address, never with
 //!   `hello` or a sign-in.
 //! - **One request on the wire**: a fresh process has no connection to reuse.
-//! - **A body read whole or not at all**, within the ask's own bound; a status other than 200
-//!   is handed back with no body read.
+//! - **A body read whole or not at all**, within the ask's own bound; for `hello`, a status
+//!   other than 200, and for anything a redirect, is handed back with no body read.
 //!
 //! What it is handed is kept for as long as the ask alone: the request (which may hold a
 //! password or a session) is in memory wiped when it is let go of (`Zeroizing`), and in the
@@ -272,8 +272,11 @@ fn fetch(get: bool, url: &str, authorization: Option<&str>, body: &[u8], max_bod
     };
     let mut response = sent.map_err(|error| failed(&error))?;
     let status = response.status().as_u16();
-    // A status other than 200 is not the backend's answer: its body is never read.
-    if status != 200 {
+    // `hello`'s answer is the backend's only with 200: any other's body is never read. A
+    // call's refusals come with statuses of their own and a small body (design 7.1), read
+    // whole as any answer is. A redirect's body is never read: it is not followed, and it
+    // is not the backend's.
+    if (get && status != 200) || (300..400).contains(&status) {
         return Ok((status, Zeroizing::new(Vec::new())));
     }
     let bytes = response.body_mut().with_config().limit(max_body as u64).read_to_vec().map_err(|error| match failed(&error) {

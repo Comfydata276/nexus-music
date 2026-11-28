@@ -703,24 +703,6 @@ impl Controller {
         }
     }
 
-    /// Pauses this PC's own player, whatever else this PC is steering: what a command from
-    /// another of the person's devices does (see `link`). Unlike `set_playing`, it never
-    /// goes on to a jam this PC has joined.
-    pub fn pause_here(self: &Rc<Self>) {
-        let was_playing = {
-            let mut pb = self.playback.borrow_mut();
-            if pb.current().is_none() {
-                return;
-            }
-            std::mem::replace(&mut pb.playing, false)
-        };
-        if was_playing {
-            self.engine.set_playing(false);
-            self.sync_transport();
-            self.save_queue();
-        }
-    }
-
     /// Likes or unlikes the song that's playing. Used by the taskbar's like button.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn toggle_current_star(self: &Rc<Self>) {
@@ -884,12 +866,6 @@ impl Controller {
         self.shuffle_saving(on, Durable::Flushed);
     }
 
-    /// Shuffle turned on or off by a jam's guest or a linked device: no press here, so the
-    /// settings are written in passing.
-    pub fn set_shuffle_from_afar(self: &Rc<Self>, on: bool) {
-        self.shuffle_saving(on, Durable::InPassing);
-    }
-
     fn shuffle_saving(self: &Rc<Self>, on: bool, durable: Durable) {
         self.came_in(Who::Here, What::Playing);
         let source = {
@@ -955,11 +931,6 @@ impl Controller {
     /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
     pub fn set_repeat(self: &Rc<Self>, mode: u8) {
         self.repeat_saving(mode, Durable::Flushed);
-    }
-
-    /// Repeat set by a jam's guest or a linked device: written in passing.
-    pub fn set_repeat_from_afar(self: &Rc<Self>, mode: u8) {
-        self.repeat_saving(mode, Durable::InPassing);
     }
 
     fn repeat_saving(self: &Rc<Self>, mode: u8, durable: Durable) {
@@ -1090,69 +1061,7 @@ impl Controller {
         self.start_current(0.0);
     }
 
-    /// Takes over a queue handed across from another device: these songs in this order,
-    /// starting with the one at `index`, from `position` seconds into it. Songs marked as
-    /// queued by hand stay so.
-    pub fn load_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, playing: bool, context: &str) {
-        if songs.is_empty() {
-            return;
-        }
-        let _way = self.way_in(Who::Here, What::Playing);
-        self.take_queue(songs, index, position, context);
-        if playing {
-            self.toggle_play();
-        } else {
-            self.save_queue();
-        }
-    }
-
-    /// The same, and played on this PC's own player whatever else this PC is steering: what
-    /// a queue sent by another of the person's devices does (see `link`).
-    pub fn load_queue_here(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
-        if songs.is_empty() {
-            return;
-        }
-        let _way = self.way_in(Who::Here, What::Playing);
-        self.take_queue(songs, index, position, context);
-        self.toggle_play_here();
-    }
-
-    /// Puts a queue in the player in place of what was there, stopped at its place.
-    fn take_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
-        self.engine.set_playing(false);
-        self.engine.stop();
-        let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
-        // Handed over in a song's last moments, it starts from the top instead.
-        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
-        self.replace_queue(songs, index, position);
-        self.playback.borrow_mut().context = context.to_string();
-        self.track_changed();
-    }
-
     // ---- engine events and the clock -----------------------------------------------------------
-
-    /// The song the sound has rolled into by itself, if it has and this thread has not yet
-    /// been told: its token. The engine says so in its own time (`Event::Started`); what
-    /// is sounding can be read at any moment.
-    pub fn rolled_ahead(&self) -> Option<u64> {
-        let pb = self.playback.borrow();
-        self.engine.position().map(|(token, _)| token).filter(|token| *token != 0 && *token == pb.next_token && *token != pb.current_token)
-    }
-
-    /// Where the sound has got to in the song the player holds, if it is playing and the
-    /// engine has reached that song: its place in the song, in seconds.
-    pub fn sounding_at(&self) -> Option<f64> {
-        let pb = self.playback.borrow();
-        if !pb.playing || pb.current_token == 0 {
-            return None;
-        }
-        self.engine.position().filter(|(token, _)| *token == pb.current_token).map(|(_, at)| at)
-    }
-
-    /// What the engine's word that a song has started does, done now.
-    pub fn started(self: &Rc<Self>, token: u64) {
-        self.on_engine_event(Event::Started(token));
-    }
 
     pub fn on_engine_event(self: &Rc<Self>, event: Event) {
         match event {
@@ -2074,15 +1983,6 @@ impl Controller {
         }
         let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_owner.taken() };
         self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
-    }
-
-    /// [`Self::save_queue`], and **not back until it is on disk**: for the mark of a queue
-    /// handed to another device, which the next start of the app must find whatever becomes
-    /// of this run. Whether it is there (false if a write failed, or five seconds went by
-    /// first: it is then written with the next save). Linking only.
-    pub(crate) fn save_queue_surely(&self) -> bool {
-        self.save_queue();
-        self.saver.flush()
     }
 
     /// Brings back the queue from the last run, paused where it stopped.

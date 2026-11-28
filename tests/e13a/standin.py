@@ -24,12 +24,13 @@ or `{"refused":…}`): `hello` names `accounts`; `signin` takes an email and pas
 one-time code, which gives a session for choosing a password) and hands a music login for
 the test Navidrome (a salt it makes and the token for it); `devices`, `force-out`,
 `change-password`, `music-login` and `signout` under the session. Made-up accounts only:
-`tester@example.org` and `guest@example.org`, with the test Navidrome's own passwords.
+`tester@example.org` and `guest@example.org`, and a one-time code `ABCDEFGHJKMN` for the first.
 
 A state file beside the mode file (`<mode file>.state`, JSON) lets a test change what the
 backend holds under a running app: `"ended": true` ends every session ("not_signed_in");
 `"count": n` raises the number of each person's music login; `"bad_token": true` hands a
-token the music server will refuse until the music login is asked for again.
+token the music server will refuse until the music login is asked for again; `"busy_once":
+true` answers the next sign-in "busy, come back in 2 seconds".
 
 Every request is logged, one JSON line each: when, the method, the target exactly as it
 arrived, and the User-Agent; for an account call, the call and, if the body named one, the
@@ -45,12 +46,13 @@ HELLO = json.dumps({"nexus": "0.2.0", "id": BACKEND, "speaks": [1, 1], "has": ["
 # passwords, and the origin their music login names.
 MUSIC = os.environ.get("STANDIN_MUSIC", "https://music.example.org:4681")
 PEOPLE = {
-    "tester@example.org": {"name": "Tester", "password": "nexus-pass-tester", "user": "tester", "music_password": "tester-pass-1"},
-    "guest@example.org": {"name": "Guest", "password": "nexus-pass-guest", "user": "guest", "music_password": "guest-pass-1"},
+    "tester@example.org": {"id": 7, "name": "Tester", "password": "nexus-pass-tester", "user": "tester", "music_password": "tester-pass-1"},
+    "guest@example.org": {"id": 8, "name": "Guest", "password": "nexus-pass-guest", "user": "guest", "music_password": "guest-pass-1"},
 }
-CODE = "ABCDEFGH3479"   # a one-time code, for tester
-SESSIONS = {}           # session hex -> {"email", "device", "setup"}
-DEVICES = {}            # device secret hex -> {"id", "email", "name", "kind", "version", "seen", "session"}
+CODES = {"ABCDEFGHJKMN": "tester@example.org"}   # one-time codes, each good once
+SESSIONS = {}           # session hex -> {"email", "device", "id"}
+DEVICES = {}            # device secret hex -> {"id", "email", "name", "kind", "version", "seen", "session", "sid"}
+NEXT_SID = [100]
 STATE_FILE = mode_file + ".state"
 
 
@@ -63,25 +65,28 @@ def state():
 
 def receipt(email):
     st = state()
-    return {"stamp": {"backend": BACKEND, "restore": 1, "account": email, "life": 1, "change": 1, "tag": "ab" * 32},
+    return {"stamp": {"backend": BACKEND, "restore": 1, "account": PEOPLE[email]["id"], "life": 1, "change": 1, "tag": "ab" * 32},
             "music_login_count": st.get("count", 1)}
 
 
 def music_login(email, good=True):
     person = PEOPLE[email]
-    salt = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+    salt = secrets.token_hex(32)
     secret = person["music_password"] if good else "not-the-password"
     token = hashlib.md5((secret + salt).encode()).hexdigest()
-    return {"address": os.environ.get("STANDIN_MUSIC_" + person["user"].upper(), MUSIC), "name": person["user"], "salt": salt, "token": token,
-            "count": state().get("count", 1)}
+    return {"address": MUSIC, "name": person["user"], "salt": salt, "token": token, "count": state().get("count", 1)}
 
 
 def done(email, result):
-    return json.dumps({"done": {"result": result, "receipt": receipt(email)}}).encode()
+    return 200, json.dumps({"done": {"result": result, "receipt": receipt(email)}}).encode()
 
 
-def refused(why):
-    return json.dumps({"refused": why}).encode()
+STATUS = {"malformed": 400, "not_signed_in": 401, "not_allowed": 403, "busy": 429, "not_dealt_with": 503}
+
+
+def refused(kind, why=None):
+    """A refusal as account.rs writes it, with its own status."""
+    return STATUS[kind], json.dumps({"refused": kind if why is None else {kind: why}}).encode()
 
 
 def mode():
@@ -174,12 +179,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.answer(500, b'{"error":"the stand-in has no such mode"}')
 
     def account(self, call, body):
-        """One account call, answered as the backend answers it."""
+        """One account call, answered as the backend answers it (account.rs's shapes)."""
+        status, answer = self.answer_call(call, body)
+        return self.answer(status, answer)
+
+    def answer_call(self, call, body):
         try:
             asked = json.loads(body or b"{}")
         except ValueError:
             self.note("found", call=call)
-            return self.answer(200, refused("bad_request"))
+            return refused("malformed")
         if call == "signin":
             credential = asked.get("credential", {})
             if "password" in credential:
@@ -187,72 +196,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.note("found", call=call, email=email)
                 person = PEOPLE.get(email)
                 if not person or person["password"] != password:
-                    return self.answer(200, refused("wrong_login"))
-                setup = False
-            elif credential.get("code") == CODE:
-                email, setup = "tester@example.org", True
+                    return refused("not_allowed", "wrong_login")
+            elif "code" in credential:
+                code = credential["code"].get("code", "")
+                email = CODES.pop(code, None)
                 self.note("found", call=call, email=email, code=True)
+                if not email:
+                    return refused("not_allowed", "wrong_login")
+                PEOPLE[email]["password"] = credential["code"].get("new_password", "")
             else:
                 self.note("found", call=call)
-                return self.answer(200, refused("wrong_login"))
+                return refused("malformed")
+            if state().get("busy_once"):
+                st = state(); st.pop("busy_once"); json.dump(st, open(STATE_FILE, "w"))
+                return refused("busy", {"retry_after_seconds": 2})
             secret = asked.get("device_secret", "")
             device = DEVICES.get(secret)
             if device:
                 SESSIONS.pop(device["session"], None)
             else:
                 device = DEVICES[secret] = {"id": len(DEVICES) + 1, "email": email}
-            session = secrets.token_hex(32)
+            session, sid = secrets.token_hex(32), NEXT_SID[0]
+            NEXT_SID[0] += 1
             device.update({"email": email, "name": asked.get("device_name", "PC"), "kind": asked.get("device_kind", "pc"),
-                           "version": asked.get("app_version", "0.0.0"), "seen": int(time.time() * 1000), "session": session})
-            SESSIONS[session] = {"email": email, "device": device["id"], "setup": setup}
-            person = {"email": email, "name": PEOPLE[email]["name"], "admin": False}
-            if setup:
-                return self.answer(200, done(email, {"password_setup": {"session": session, "person": person, "device": device["id"]}}))
+                           "version": asked.get("app_version", "0.0.0"), "seen": int(time.time() * 1000), "session": session, "sid": sid})
+            SESSIONS[session] = {"email": email, "device": device["id"], "id": sid}
+            person = PEOPLE[email]
             good = not state().get("bad_token")
-            return self.answer(200, done(email, {"signed_in": {"session": session, "person": person, "device": device["id"],
-                                                               "music": music_login(email, good), "notice": "This test server records what is played."}}))
+            return done(email, {"session": session, "session_id": sid, "sign_out": {"session": sid, "secret": secrets.token_hex(32)},
+                                "person": {"id": person["id"], "revision": 1, "email": email, "name": person["name"], "admin": False},
+                                "device": device["id"], "restore": 1, "music": {"login": music_login(email, good)},
+                                "notice": "This test server records what is played."})
         auth = self.headers.get("Authorization", "")
         held = auth[7:] if auth.startswith("Bearer ") else ""
         session = SESSIONS.get(held)
         if session is None and held in state().get("sessions", {}):
             # A session the profile was signed in with before the run (the suite seeds it).
             seeded = state()["sessions"][held]
-            session = SESSIONS[held] = {"email": seeded["email"], "device": seeded["device"], "setup": False}
+            session = SESSIONS[held] = {"email": seeded["email"], "device": seeded["device"], "id": seeded.get("id", 99)}
             DEVICES.setdefault("seeded-" + held, {"id": seeded["device"], "email": seeded["email"], "name": "Seeded PC", "kind": "pc",
-                                                   "version": "0.40.13", "seen": int(time.time() * 1000), "session": held})
+                                                   "version": "0.40.13", "seen": int(time.time() * 1000), "session": held, "sid": session["id"]})
+        if call == "signout" and session is None and asked.get("revoke"):
+            # A sign-out note: it ends the one session it names, and nothing else.
+            sid = asked["revoke"].get("session")
+            for key, held_session in list(SESSIONS.items()):
+                if held_session["id"] == sid:
+                    SESSIONS.pop(key)
+                    self.note("found", call=call, email=held_session["email"], note=True)
+                    return done(held_session["email"], {})
+            self.note("found", call=call, note=True)
+            return refused("not_signed_in", "session_ended")
         self.note("found", call=call, email=(session or {}).get("email"))
         if not session or state().get("ended"):
-            return self.answer(200, refused("not_signed_in"))
+            return refused("not_signed_in", "session_ended")
         email = session["email"]
         if call == "music-login":
-            if session["setup"]:
-                return self.answer(200, refused("password_setup_only"))
-            return self.answer(200, done(email, music_login(email)))
+            return done(email, {"login": music_login(email)})
         if call == "devices":
             rows = [{"id": d["id"], "name": d["name"], "kind": d["kind"], "app_version": d["version"], "last_seen_ms": d["seen"],
-                     "signed_in": d["session"] in SESSIONS} for d in sorted(DEVICES.values(), key=lambda d: d["id"]) if d["email"] == email]
-            return self.answer(200, done(email, {"devices": rows, "more": False}))
+                     "session": d["sid"] if d["session"] in SESSIONS else None, "this_device": d["session"] == held}
+                    for d in sorted(DEVICES.values(), key=lambda d: d["id"]) if d["email"] == email]
+            return done(email, {"devices": rows, "more": False})
         if call == "force-out":
             target = next((d for d in DEVICES.values() if d["id"] == asked.get("device") and d["email"] == email), None)
-            if not target:
-                return self.answer(200, refused("no_such_device"))
+            if not target or target["sid"] != asked.get("session"):
+                return refused("not_allowed", "denied")
             SESSIONS.pop(target["session"], None)
-            return self.answer(200, done(email, {"music_cut_off": False}))
+            return done(email, {"music_cut_off": False})
         if call == "change-password":
-            current, new = asked.get("current_password"), asked.get("new_password", "")
-            if session["setup"]:
-                session["setup"] = False
-            elif current != PEOPLE[email]["password"]:
-                return self.answer(200, refused("wrong_login"))
-            PEOPLE[email]["password"] = new
-            for other, held in list(SESSIONS.items()):
-                if held["email"] == email and other != auth[7:]:
+            if asked.get("current_password") != PEOPLE[email]["password"]:
+                return refused("not_allowed", "wrong_login")
+            PEOPLE[email]["password"] = asked.get("new_password", "")
+            for other, held_session in list(SESSIONS.items()):
+                if held_session["email"] == email and other != held:
                     SESSIONS.pop(other)
-            return self.answer(200, done(email, {}))
+            return done(email, {})
         if call == "signout":
-            SESSIONS.pop(auth[7:], None)
-            return self.answer(200, done(email, {}))
-        return self.answer(200, refused("bad_request"))
+            SESSIONS.pop(held, None)
+            return done(email, {})
+        return refused("malformed")
 
     do_GET = do_POST = do_HEAD = do_PUT = do_DELETE = go
 

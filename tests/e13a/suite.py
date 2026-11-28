@@ -385,18 +385,20 @@ def to_signed_in(home, token_of="tester-pass-1", count=1):
     config = os.path.join(A.HOMES, home, "config")
     if os.path.exists(os.path.join(config, "credential")):
         os.remove(os.path.join(config, "credential"))
-    salt = "e13asaltsalt0001"
-    music = {"server": front.SERVER, "username": "tester", "salt": salt, "token": hashlib.md5((token_of + salt).encode()).hexdigest(), "count": count}
-    account = {"backend": front.SERVER, "backend_id": front.BACKEND_A, "email": "tester@example.org", "name": "Tester", "device": 1,
-               "restore": 1, "life": 1, "change": 1, "music_count": count, "notice": None, "password_setup": False}
+    salt = SALT
+    music = {"address": front.SERVER, "name": "tester", "salt": salt, "token": hashlib.md5((token_of + salt).encode()).hexdigest(), "count": count}
+    saved = {"nexus": front.SERVER, "backend_id": front.BACKEND_A, "account": 7, "email": "tester@example.org", "name": "Tester", "device": 1,
+             "restore": 1, "life": 1, "change": 1, "notice": None, "session": front.SEED_SESSION,
+             "sign_out": {"session": 99, "secret": "5f" * 32}, "music": music}
     folder = ACCOUNT_STEM["tester"]
-    record = {"session": front.SEED_SESSION, "music": music, "account": account, "folder": folder}
+    plain = {"server": front.SERVER, "username": "tester", "salt": salt, "token": music["token"], "count": count}
+    record = {"saved": saved, "music": plain, "folder": folder}
     path = os.path.join(config, "secret-nexus-sign-in")
     open(path, "w").write(json.dumps(record))
     os.chmod(path, 0o600)
     settings = os.path.join(config, "settings.json")
     s = json.load(open(settings))
-    s["carried_over"] = [f"{front.BACKEND_A}\ntester@example.org", folder]
+    s["carried_over"] = [f"{front.BACKEND_A}\n7", folder]
     s["sign_in_address"], s["sign_in_email"] = front.SERVER, "tester@example.org"
     json.dump(s, open(settings, "w"))
 
@@ -1645,7 +1647,10 @@ def music_requests(out):
     return rows
 
 
-def token_of(password, salt="e13asaltsalt0001"):
+SALT = "e13a" * 16   # a music login's salt: 64 hex digits
+
+
+def token_of(password, salt=SALT):
     return hashlib.md5((password + salt).encode()).hexdigest()
 
 

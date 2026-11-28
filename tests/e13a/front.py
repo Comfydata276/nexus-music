@@ -188,7 +188,7 @@ class Front:
         except (OSError, ValueError):
             pass
         now.update(state)
-        now.setdefault("sessions", {SEED_SESSION: {"email": "tester@example.org", "device": 1}})
+        now.setdefault("sessions", {SEED_SESSION: {"email": "tester@example.org", "device": 1, "id": 99}})
         json.dump(now, open(self.mode_file + ".state", "w"))
 
     def __enter__(self):
