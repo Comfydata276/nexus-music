@@ -335,3 +335,120 @@ fn a_wrong_password_and_an_unknown_email_take_about_the_same_time() {
     // A loose bound: the same slow work; what is not the same is the look-up of an account.
     assert!((a - b).abs() < a.max(b) * 0.5, "{a} against {b}");
 }
+
+fn list_of(backend: &Serving, session: &account::Session, restore: u64) -> u16 {
+    let list = account::encode(&ListDevices { head: speaks(restore), after: None }).unwrap();
+    backend.post(account::LIST_DEVICES, Some(session), list.bytes()).0
+}
+
+#[test]
+fn while_not_set_up_each_start_says_a_new_set_up_code_once_and_then_never() {
+    let folders = Folders::new("log");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let first = Serving::start(&settings, port).stop().to_string();
+    let second = Serving::start(&settings, port).stop().to_string();
+    let code_in = |written: &str| {
+        let at = written.find("Its set-up code, good for fifteen minutes from now and once, is ").expect("a set-up code") + "Its set-up code, good for fifteen minutes from now and once, is ".len();
+        written[at..at + 13].to_string()
+    };
+    assert_ne!(code_in(&first), code_in(&second), "a restart makes a new code");
+    assert_eq!(first.matches("set-up code").count(), 1);
+    set_up(&settings, EMAIL);
+    let third = Serving::start(&settings, port).stop().to_string();
+    assert!(!third.contains("Its set-up code"), "{third}");
+}
+
+#[test]
+fn recovery_ends_every_session_kills_the_password_and_its_code_signs_in() {
+    let folders = Folders::new("recover");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let code = set_up(&settings, EMAIL);
+    let mut backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    let pc = signed_in(status, &body);
+    backend.stop();
+    // A password forgotten: the owner's command, with no sign-in (8.4).
+    let output = program(&settings, &["recover", EMAIL]).output().unwrap();
+    let said = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.status.success(), "{said}");
+    let at = said.find("one-time code ").unwrap() + "one-time code ".len();
+    let code = OneTimeCode::new(&said[at..at + 13].replace('-', "")).unwrap();
+    let backend = Serving::start(&settings, port);
+    assert_eq!(list_of(&backend, &pc.session, pc.restore), 401, "a session lived through recovery");
+    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 1, "Robin's PC", DeviceKind::Pc));
+    assert_eq!(status, 403, "the old password worked after recovery");
+    let chosen = "another made-up password of robin's";
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(chosen).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    let again = signed_in(status, &body);
+    assert!(again.person.admin);
+    assert_eq!(again.device, pc.device, "the same device, known by its secret");
+    // A recovery for an email with no account makes an admin's.
+    drop(backend);
+    let output = program(&settings, &["recover", "sam@example.org"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("an admin's is made"));
+}
+
+#[test]
+fn a_guess_inside_the_wait_is_told_to_come_back_and_a_changed_password_ends_the_others() {
+    let folders = Folders::new("wait");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let code = set_up(&settings, EMAIL);
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    let pc = signed_in(status, &body);
+
+    // 8.3: after a wrong password at the other door, the next try for that email inside the
+    // wait is answered at once "come back in so many seconds", even with the right password.
+    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, "a guess that is not it"), 9, "A stranger", DeviceKind::Pc));
+    assert_eq!(status, 403);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 2, "Robin's phone", DeviceKind::Phone));
+    assert_eq!(status, 429);
+    assert!(matches!(refusal(account::read_reply::<SignedIn>(status, &body).unwrap()), Refusal::Busy { retry_after_seconds: Some(_) }));
+    // The device the account knows is not slowed by it.
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 1, "Robin's PC", DeviceKind::Pc));
+    let pc_again = signed_in(status, &body);
+    assert_eq!(pc_again.device, pc.device);
+    assert_eq!(list_of(&backend, &pc.session, pc.restore), 401, "signing in again ends the session the device had");
+    std::thread::sleep(Duration::from_millis(1100));
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 2, "Robin's phone", DeviceKind::Phone));
+    let phone = signed_in(status, &body);
+
+    // 12.3: a request naming another restore number is told the data was put back.
+    let list = account::encode(&ListDevices { head: speaks(phone.restore + 1), after: None }).unwrap();
+    let (status, body) = backend.post(account::LIST_DEVICES, Some(&phone.session), list.bytes());
+    assert_eq!(refusal(account::read_reply::<account::DevicePage>(status, &body).unwrap()), Refusal::NotSignedIn(NotSignedIn::DataPutBack));
+
+    // 8.9: a password changed on the PC with the present one; the phone is signed out, the PC
+    // stays; the old password no longer signs in, the new one does.
+    let new_password = "a third made-up password of robin's";
+    let change = account::ChangePassword {
+        head: speaks(pc_again.restore),
+        request_id: RequestId::new(3).unwrap(),
+        current_password: Password::presented(PASSWORD).unwrap(),
+        new_password: Password::new(new_password).unwrap(),
+    };
+    let (status, body) = backend.post(account::CHANGE_PASSWORD, Some(&pc_again.session), account::encode(&change).unwrap().bytes());
+    assert!(matches!(account::read_reply::<account::PasswordChanged>(status, &body).unwrap(), Reply::Done { .. }), "{status}");
+    assert_eq!(list_of(&backend, &phone.session, phone.restore), 401);
+    assert_eq!(list_of(&backend, &pc_again.session, pc_again.restore), 200);
+    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 1, "Robin's PC", DeviceKind::Pc));
+    assert_eq!(status, 403);
+    // The known device's own wait after its wrong password (the lead's ruling of 13:46).
+    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, new_password), 1, "Robin's PC", DeviceKind::Pc));
+    assert_eq!(status, 429);
+    std::thread::sleep(Duration::from_millis(1100));
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, new_password), 1, "Robin's PC", DeviceKind::Pc));
+    let pc_again = signed_in(status, &body);
+    // A common password is not allowed as a new one (8.2).
+    let change = account::ChangePassword {
+        head: speaks(pc_again.restore),
+        request_id: RequestId::new(4).unwrap(),
+        current_password: Password::presented(new_password).unwrap(),
+        new_password: Password::new("passwordpassword").unwrap(),
+    };
+    let (status, body) = backend.post(account::CHANGE_PASSWORD, Some(&pc_again.session), account::encode(&change).unwrap().bytes());
+    assert_eq!(refusal(account::read_reply::<account::PasswordChanged>(status, &body).unwrap()), Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
+}

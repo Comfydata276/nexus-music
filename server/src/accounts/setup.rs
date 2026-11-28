@@ -259,3 +259,45 @@ pub fn said_at_start(code: &OneTimeCode) -> Zeroizing<String> {
         spaced(code).as_str()
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_set_up_code_is_made_only_when_not_set_up_and_is_taken_once_within_fifteen_minutes() {
+        let (none, code) = SetUpCode::at_start(true, 1_000);
+        assert!(code.is_none() && !none.open(1_000));
+        let (live, code) = SetUpCode::at_start(false, 1_000);
+        let code = code.expect("a code while not set up");
+        let typed = || OneTimeCode::new(code.expose()).unwrap();
+        // Another code is not it, and leaves it as it was.
+        let other = OneTimeCode::from_random(7);
+        assert!(!live.take(&other, 2_000));
+        // Past fifteen minutes it is not taken.
+        assert!(!live.take(&typed(), 1_000 + SET_UP_CODE_MS));
+        assert!(live.take(&typed(), 1_000 + SET_UP_CODE_MS - 1));
+        // Once.
+        assert!(!live.take(&typed(), 2_000));
+        assert!(!live.open(2_000));
+    }
+
+    #[test]
+    fn each_start_makes_a_new_code() {
+        let codes: Vec<String> = (0..8).map(|_| SetUpCode::at_start(false, 0).1.unwrap().expose().to_string()).collect();
+        let mut distinct = codes.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), codes.len());
+        // 60 bits: twelve of C7's 32 symbols.
+        assert!(codes.iter().all(|code| code.len() == 12));
+    }
+
+    #[test]
+    fn a_code_is_shown_in_two_halves_and_its_debug_says_nothing() {
+        let code = OneTimeCode::new("ABCDEF123456").unwrap();
+        assert_eq!(spaced(&code).as_str(), "ABCDEF-123456");
+        assert!(!said_at_start(&code).contains("ABCDEF123456"));
+        assert!(!format!("{code:?}").contains("ABC"));
+    }
+}
