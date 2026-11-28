@@ -90,10 +90,12 @@ struct Machine {
     started_at: Option<Instant>,
     /// Starts in a row that ended in a keep that did not hold.
     failures: u32,
+    /// How many steps have given a list: each list's number ([`Batch::made`]).
+    made: u64,
 }
 
 static MACHINE: LazyLock<Mutex<Machine>> =
-    LazyLock::new(|| Mutex::new(Machine { client: Client::default(), epoch: 0, started: false, app: None, asks: HashMap::new(), started_at: None, failures: 0 }));
+    LazyLock::new(|| Mutex::new(Machine { client: Client::default(), epoch: 0, started: false, app: None, asks: HashMap::new(), started_at: None, failures: 0, made: 0 }));
 
 fn machine() -> MutexGuard<'static, Machine> {
     MACHINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -127,11 +129,14 @@ struct Batch {
     epoch: u64,
     dos: Vec<Do>,
     cause: Cause,
+    /// The step's number: the worker is given the lists in this order.
+    made: u64,
 }
 
+#[cfg(test)]
 impl Batch {
     fn of(epoch: u64, dos: Vec<Do>, cause: Cause) -> Batch {
-        Batch { epoch, dos, cause }
+        Batch { epoch, dos, cause, made: 0 }
     }
 }
 
@@ -158,24 +163,35 @@ pub fn tell(event: Happened) {
     if let Happened::Offline(on) = event {
         OFFLINE.store(on, Ordering::SeqCst);
     }
-    let cause = match &event {
-        Happened::Answered { ask, .. } => machine().asks.get(ask).cloned().map_or(Cause::Other, Cause::Answer),
-        _ => Cause::Other,
-    };
-    let batch = {
-        let mut machine = machine();
+    step(|machine| {
         if !machine.started {
-            return;
+            return None;
         }
-        if let Happened::Answered { ask, .. } | Happened::Failed { ask, .. } = &event {
-            machine.asks.remove(ask);
-        }
-        let dos = machine.client.happened(event, &given());
-        Batch::of(machine.epoch, dos, cause)
-    };
-    if !batch.dos.is_empty() {
-        send_job(Job::Batch(batch));
+        // Where an answer's ask was sent, taken under the same lock as the step it causes.
+        let cause = match &event {
+            Happened::Answered { ask, .. } => machine.asks.remove(ask).map_or(Cause::Other, Cause::Answer),
+            Happened::Failed { ask, .. } => {
+                machine.asks.remove(ask);
+                Cause::Other
+            }
+            _ => Cause::Other,
+        };
+        Some((machine.client.happened(event, &given()), cause))
+    });
+}
+
+/// One step of the machine, and **its list given to the worker under the same lock** (the
+/// review's MUST 2, W7c item 1): the lists reach the worker in the order of the steps that
+/// made them, so a `Forget` never overtakes an older `Keep` or `Hand`.
+fn step(reduce: impl FnOnce(&mut Machine) -> Option<(Vec<Do>, Cause)>) {
+    let mut machine = machine();
+    let Some((dos, cause)) = reduce(&mut machine) else { return };
+    if dos.is_empty() {
+        return;
     }
+    machine.made += 1;
+    let batch = Batch { epoch: machine.epoch, dos, cause, made: machine.made };
+    send_job(Job::Batch(batch));
 }
 
 /// Offline mode switched by the person (before anything else is done for it when it goes on,
@@ -608,7 +624,8 @@ fn start_machine(paths: &config::Paths) -> Option<Batch> {
         machine.started_at = Some(Instant::now());
         machine.asks.clear();
         let dos = machine.client.start(app, kept, &given());
-        Batch::of(machine.epoch, dos, Cause::Start)
+        machine.made += 1;
+        Batch { epoch: machine.epoch, dos, cause: Cause::Start, made: machine.made }
     };
     note(format_args!("client started"));
     // Diagnostics sends through this machine, and tells it of Offline at the switch.
@@ -1179,6 +1196,36 @@ mod tests {
         assert_eq!(carried, legacy.stem());
         assert_eq!(folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap(), carried);
         assert_eq!(folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap(), config::person_folder(&bob.backend_id, 8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7c item 1: the lists reach the worker in the order of the steps that made them, from
+    /// however many threads at once (each is given to the worker under the machine's lock).
+    #[test]
+    fn the_lists_reach_the_worker_in_the_order_of_their_steps() {
+        let (_one, dir, _paths) = profile("order");
+        let (sender, jobs) = mpsc::channel();
+        assert!(WORKER.set(Mutex::new(sender)).is_ok(), "no other test installs the worker");
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                std::thread::spawn(move || {
+                    for each in 0..200u64 {
+                        step(|_| {
+                            // The step itself takes a moment, as a real one can.
+                            std::thread::yield_now();
+                            Some((vec![Do::Hand(Hand::NoLogin { generation: thread * 1000 + each })], Cause::Other))
+                        });
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let made: Vec<u64> = jobs.try_iter().map(|job| if let Job::Batch(batch) = job { batch.made } else { 0 }).collect();
+        assert_eq!(made.len(), 1600);
+        assert!(made.windows(2).all(|pair| pair[0] < pair[1]), "a later step's list overtook an earlier one's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
