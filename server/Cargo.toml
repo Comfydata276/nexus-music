@@ -57,6 +57,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
+# The music check deadline is tested on a paused clock.
+tokio = { version = "1", default-features = false, features = ["test-util"] }
 # Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a
 # stranger), which the standard library cannot bind a client to. The relay uses it already.
 socket2 = "0.6"

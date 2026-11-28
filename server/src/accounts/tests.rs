@@ -1,6 +1,7 @@
 //! The accounts' own sequences, on the [`bench`](super::bench): a clock the test turns, and
 //! the real keeper, writer and workers. Each test names the finding or rule it pins.
 
+use nexus_core::nexus::admin;
 use nexus_core::nexus::account::{self, NotSignedIn, Refusal, RequestId, SESSION_IDLE_MS, SignOut, SignOutNote, SignOutSecret, SignedOut};
 
 use super::bench::{self, Bench};
@@ -251,13 +252,45 @@ fn an_account_not_an_admin_s_learns_nothing_of_accounts_or_settings_from_an_admi
     assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
 }
 
+fn grant_music_change(bench: &Bench, who: &account::SignedIn, request_id: RequestId, action: admin::Action) -> account::GrantSecret {
+    let change = admin::NamedChange { request_id, action };
+    let request = account::GrantRequest { head: bench::head(who.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+    let session = account::Session::from_bytes(*who.session.expose_bytes());
+    let answer = bench.runtime.block_on(bench.accounts.admin_grant(session, request));
+    match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+        admin::Reply::Done(account::GrantIssued { grant }) => grant,
+        other => panic!("no grant: {other:?}"),
+    }
+}
+
+fn set_test_music_server(bench: &Bench, who: &account::SignedIn) {
+    let request_id = RequestId::new(1).unwrap();
+    let public = account::MusicAddress::new("https://music.example.test").unwrap();
+    let grant = grant_music_change(bench, who, request_id, admin::Action::SetMusicServer(public.clone()));
+    let change = admin::MusicServerAddress { public };
+    let request = account::GrantedChange { head: bench::head(who.restore), request_id, change, grant };
+    let session = account::Session::from_bytes(*who.session.expose_bytes());
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(session, request)).status, 200);
+}
+
+fn test_music_login(bench: &Bench, who: &account::SignedIn, person: u64, number: u64) -> admin::SetMusicLogin {
+    let request_id = RequestId::new(number).unwrap();
+    let person = account::AccountId::new(person).unwrap();
+    let grant = grant_music_change(bench, who, request_id, admin::Action::SetMusicLogin(person));
+    let change = admin::TypedMusicLogin {
+        account: person,
+        name: account::Name::new("tester").unwrap(),
+        password: admin::MusicPassword::new("a made-up music password").unwrap(),
+    };
+    account::GrantedChange { head: bench::head(who.restore), request_id, change, grant }
+}
+
 /// S9-3 (the review of S9): with a music server that takes every connection and never answers,
 /// at most `CHECKS_AT_ONCE` logins are being checked at once: one more is told "busy" at once,
 /// a sign-in goes through meanwhile, and each check ends "not dealt with" when its
 /// unanswered connection closes.
 #[test]
 fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_on() {
-    use nexus_core::nexus::admin::{self, Action, Applied, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
     use std::time::Duration;
     let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     hold.set_nonblocking(true).unwrap();
@@ -272,27 +305,8 @@ fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_o
     bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
     let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), device))).collect();
     let copy = |n: usize| account::Session::from_bytes(*admins[n].session.expose_bytes());
-    let restore = admins[0].restore;
-    let grant = |n: usize, request: u64, action: Action| {
-        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
-        let request = account::GrantRequest { head: bench::head(restore), change, password: account::Password::presented(PASSWORD).unwrap() };
-        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(n), request));
-        match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
-            admin::Reply::Done(account::GrantIssued { grant }) => grant,
-            other => panic!("no grant: {other:?}"),
-        }
-    };
-    let public = account::MusicAddress::new("https://music.example.test").unwrap();
-    let secret = grant(0, 1, Action::SetMusicServer(public.clone()));
-    let set = account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(1).unwrap(), change: MusicServerAddress { public }, grant: secret };
-    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(copy(0), set)).status, 200);
-    let person = account::AccountId::new(made[1].number).unwrap();
-    let login = |n: usize| {
-        let request = 10 + n as u64;
-        let secret = grant(n, request, Action::SetMusicLogin(person));
-        let change = TypedMusicLogin { account: person, name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
-        (copy(n), account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(request).unwrap(), change, grant: secret })
-    };
+    set_test_music_server(&bench, &admins[0]);
+    let login = |n| (copy(n), test_music_login(&bench, &admins[n], made[1].number, 10 + n as u64));
     let (third, third_request) = login(2);
     let checking: Vec<_> = (0..2).map(login).map(|(session, request)| {
         let accounts = bench.accounts.clone();
@@ -305,13 +319,53 @@ fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_o
     let busy = bench.runtime.block_on(async {
         tokio::time::timeout(watchdog, bench.accounts.set_music_login(third, third_request)).await.expect("the third check did not return busy")
     });
-    assert_eq!(busy.status, 429, "{:?}", admin::read_reply::<Applied>(busy.status, busy.body.bytes()));
+    assert_eq!(busy.status, 429, "{:?}", admin::read_reply::<admin::Applied>(busy.status, busy.body.bytes()));
     bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9));
     assert!(checking.iter().all(|check| !check.is_finished()), "sign-in finished while both checks were still waiting");
     drop(held);
     for check in checking {
         assert_eq!(bench.runtime.block_on(check).unwrap(), 503);
     }
+}
+
+/// S9-3: the whole music login check ends at its deadline even if the socket stays open.
+#[test]
+fn an_unanswered_music_login_check_ends_at_the_server_deadline() {
+    use std::{sync::mpsc, time::Duration};
+    let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    hold.set_nonblocking(true).unwrap();
+    let internal = format!("http://{}", hold.local_addr().unwrap());
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty()).within(Duration::from_secs(60));
+    let music = super::music::MusicSide::new(client, internal);
+    let (bench, made) = Bench::with_music("check-deadline", &[("admin@example.test", true), ("person@example.test", false)], music);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let who = bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), 1));
+    set_test_music_server(&bench, &who);
+    let request = test_music_login(&bench, &who, made[1].number, 2);
+
+    let within = Duration::from_secs(8);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::from_std(hold).unwrap();
+        // Blocking tasks keep Tokio from advancing its clock. Wait for the connection before
+        // letting time pass so that disk work and loopback I/O take no time on this clock.
+        let (release, hold_clock) = mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || { let _ = hold_clock.recv_timeout(Duration::from_secs(30)); });
+        let started = tokio::time::Instant::now();
+        let accounts = bench.accounts.clone();
+        let checking = tokio::spawn(async move { accounts.set_music_login(who.session, request).await });
+        let answer = tokio::time::timeout(within + Duration::from_millis(100), async {
+            let (peer, _) = listener.accept().await.unwrap();
+            assert!(!checking.is_finished());
+            drop(release);
+            clock.await.unwrap();
+            let answer = checking.await.unwrap();
+            drop(peer);
+            answer
+        }).await.expect("the server's own check deadline must end the unanswered request");
+        assert!(started.elapsed() >= within);
+        assert_eq!(answer.status, 503);
+    });
 }
 
 /// C1 (the review of S8; the lead's ruling of 15:38), (a) and (b): a sign-out with neither a
