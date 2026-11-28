@@ -418,28 +418,31 @@ pub(super) fn disallowed_display_char(ch: char) -> bool {
         | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-fn display_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+fn clean_display_up_to(text: &str, max_chars: usize) -> String {
     let mut space = false;
-    text.chars().filter_map(move |ch| {
-        let ch = match ch {
-            '\u{2028}' | '\u{2029}' => ' ',
-            ch if disallowed_display_char(ch) => return None,
-            ch => ch,
-        };
+    let mut cleaned: String = text.chars().filter_map(|ch| match ch {
+        '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => Some(' '),
+        ch if disallowed_display_char(ch) => None,
+        ch => Some(ch),
+    }).skip_while(|&ch| ch == ' ').filter(|&ch| {
         let repeated_space = std::mem::replace(&mut space, ch == ' ') && ch == ' ';
-        (!repeated_space).then_some(ch)
-    })
+        !repeated_space
+    }).take(max_chars).collect();
+    if cleaned.ends_with(' ') {
+        cleaned.pop();
+    }
+    cleaned
 }
 
 /// Clean display text under the caller's own length ceiling.
 pub fn clean_display_text(text: &str) -> String {
-    display_chars(text).collect()
+    clean_display_up_to(text, usize::MAX)
 }
 
-/// The first 200 cleaned Unicode scalar values of a journal display field.
+/// Up to 200 cleaned Unicode scalar values of a journal display field.
 /// Opaque song and source IDs do not pass through this function.
 pub fn clean_text(text: &str) -> String {
-    display_chars(text).take(TEXT_CHARS).collect()
+    clean_display_up_to(text, TEXT_CHARS)
 }
 
 impl Kind {
