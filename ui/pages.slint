@@ -3247,10 +3247,21 @@ export component NoMusicPage inherits Rectangle {
                     }
 
                     Text {
-                        text: "Your admin hasn't set your music sign-in yet. Ask whoever runs your Nexus server to set it for you: your music appears here by itself as soon as they have. You don't need to sign in again.";
+                        text: "Your admin hasn't set your music sign-in yet. Ask whoever runs your Nexus server to set it for you. Once they have, your music appears the next time Nexus Music starts or talks to your server: press Check now. You don't need to sign in again.";
                         color: Theme.muted;
                         font-size: 14px;
                         wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        // An account call: its answer says whether a music sign-in is set.
+                        TextButton {
+                            text: Settings.devices-busy ? "Checking…" : "Check now";
+                            primary: true;
+                            enabled: !Settings.devices-busy && !Settings.offline;
+                            clicked => { Settings.load-devices(); }
+                        }
                     }
 
                     if Settings.offline: HorizontalLayout {
