@@ -755,3 +755,79 @@ fn measure_storage_for_events_and_reports() {
     eprintln!("5000 events: {wire_bytes} bytes JSON, {event_use} allocated bytes. 500-event HTTP median {:.1} ms and max {:.1} ms (includes reply verification). 30 reports: {report_bytes} text bytes, {report_use} allocated bytes.",
         milliseconds[5], milliseconds[9]);
 }
+
+#[test]
+fn admin_accounts_require_authority_and_a_live_page_session() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-accounts-idle");
+    let admin_code = fixture.set_up();
+    let other_code = fixture.other();
+    let clock = fixture.start_with_clock();
+    fixture.sign_in(with_code(admin_code), 1);
+    let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
+    let list = |stamp: &Stamp| account::encode(&admin::ListAccounts {
+        head: head(stamp),
+        after: None,
+    }).unwrap();
+
+    assert_eq!(fixture.post(admin::LIST_ACCOUNTS, Some(&other), list(&other_stamp).bytes()).0, 403);
+    let (admin, stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
+    let body = list(&stamp);
+    let (status, rows) = fixture.post_with(admin::LIST_ACCOUNTS, Some(&admin), BROWSER, body.bytes());
+    assert_eq!(status, 200);
+    assert_eq!(json::<i64>(&rows, "$.done.rows[0].id"), admin.person.id.get() as i64);
+    assert_eq!(json::<String>(&rows, "$.done.rows[0].music"), "none_set");
+    assert_eq!(json::<Option<String>>(&rows, "$.done.rows[0].password"), None);
+
+    clock.fetch_add(admin::PAGE_SESSION_IDLE_MS + 1, Ordering::SeqCst);
+    let (status, refusal) = fixture.post_with(admin::LIST_ACCOUNTS, Some(&admin), BROWSER, body.bytes());
+    assert_eq!(status, 401);
+    assert_eq!(json::<String>(&refusal, "$.refused.not_signed_in"), "session_ended");
+}
+
+#[test]
+fn the_diagnostics_default_needs_a_matching_grant_and_reaches_hello() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-diagnostics");
+    let code = fixture.set_up();
+    fixture.start_with_clock();
+    fixture.sign_in(with_code(code), 1);
+    let (admin, stamp) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    let request_id = RequestId::new(41).unwrap();
+    let request = account::encode(&admin::RequestGrant {
+        head: head(&stamp),
+        change: admin::NamedChange {
+            request_id,
+            action: admin::Action::SetDiagnosticsDefault(admin::DiagnosticsDefault { enabled: false }),
+        },
+        password: Password::presented(PASSWORD).unwrap(),
+    }).unwrap();
+    let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(&admin), BROWSER, request.bytes());
+    let grant = match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
+        admin::Reply::Done(issued) => issued.grant,
+        _ => panic!("no grant issued"),
+    };
+    let change = |enabled| account::encode(&admin::SetDiagnosticsDefault {
+        head: head(&stamp),
+        request_id,
+        grant: account::GrantSecret::from_bytes(*grant.expose_bytes()),
+        change: admin::DiagnosticsDefault { enabled },
+    }).unwrap();
+    let wrong = change(true);
+    let (status, body) = fixture.post_with(admin::SET_DIAGNOSTICS_DEFAULT, Some(&admin), BROWSER, wrong.bytes());
+    assert_eq!(status, 403);
+    assert_eq!(json::<String>(&body, "$.refused.not_allowed"), "grant_required");
+    let change = change(false);
+    let post = || fixture.post_with(admin::SET_DIAGNOSTICS_DEFAULT, Some(&admin), BROWSER, change.bytes());
+    assert_eq!(post().0, 200);
+    assert_eq!(post().0, 403);
+
+    let mut socket = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    socket.write_all(b"GET /nexus/api/hello HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nConnection: close\r\n\r\n").unwrap();
+    let (status, hello) = response(socket);
+    assert_eq!(status, 200);
+    assert_eq!(json::<bool>(&hello, "$.diagnostics"), false);
+}

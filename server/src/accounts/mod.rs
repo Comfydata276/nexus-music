@@ -9,6 +9,7 @@
 //! - [`routes`]: those, as the calls the door hands on.
 //! - [`rows`]: what they read from the data.
 
+mod admin;
 pub mod check;
 pub mod desk;
 pub mod music;

@@ -183,6 +183,16 @@ pub const ROUTES: &[Route] = &[
     Route::new(admin::SET_MUSIC_LOGIN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(admin::SET_MUSIC_SERVER, "POST", account::GRANTED_CHANGE_MAX_BYTES),
     Route::new(admin::GET_MUSIC_SERVER, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::LIST_ACCOUNTS, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::GET_DIAGNOSTICS_DEFAULT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::CREATE_ACCOUNT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_ACCOUNT_ENABLED, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::FORCE_OUT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_DIAGNOSTICS_DEFAULT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::DELETE_ACCOUNT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_ADMIN, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::RESET_PASSWORD, "POST", account::GRANTED_CHANGE_MAX_BYTES),
 ];
 
 /// Whether the proxy marked the request as having come to it by HTTPS (design 6.2:

@@ -43,7 +43,7 @@ pub struct MusicSide {
 
 /// An admin call's answer, of `nexus::admin`'s shapes. A reply that cannot be encoded is "not
 /// dealt with", which always can.
-fn answer<T: admin::ResultBody>(reply: Reply<T>) -> Answer {
+pub(super) fn answer<T: admin::ResultBody>(reply: Reply<T>) -> Answer {
     let status = reply.status();
     match admin::encode(&reply) {
         Ok(body) => Answer { status, body },
@@ -57,7 +57,7 @@ pub fn refused(refusal: Refusal) -> Answer {
     Answer { status, body: admin::encode(&reply).expect("a refusal always fits its 4 KiB") }
 }
 
-fn not_dealt_with<E>(_: E) -> Refusal {
+pub(super) fn not_dealt_with<E>(_: E) -> Refusal {
     Refusal::NotDealtWith
 }
 
@@ -66,7 +66,7 @@ fn busy() -> Refusal {
 }
 
 /// What a refusal of kept's is said as, to an admin's call.
-fn said(denied: Denied) -> Refusal {
+pub(super) fn said(denied: Denied) -> Refusal {
     match denied {
         Denied::NotSignedIn => Refusal::NotSignedIn(account::NotSignedIn::SessionEnded),
         Denied::StartAgain => Refusal::NotSignedIn(account::NotSignedIn::DataPutBack),
@@ -92,7 +92,7 @@ fn asked(outcome: Outcome) -> Refusal {
     }
 }
 
-fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
+pub(super) fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
     match done {
         Ok(Ok(answer)) => answer,
         Ok(Err(refusal)) => refused(refusal),
@@ -102,7 +102,7 @@ fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
 
 /// The signed-in admin of a call: the account and device of the session `hash`, under the
 /// restore number and speaking a version in common.
-fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, account::DeviceId, nexus_core::nexus::kept::Account), Refusal> {
+pub(super) fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, account::DeviceId, nexus_core::nexus::kept::Account), Refusal> {
     if !speaks_with(&head.speaks) {
         return Err(Refusal::Malformed);
     }
@@ -117,7 +117,7 @@ fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result
 }
 
 /// The account `id` names, loaded, if it is not the caller's own; `Ok(None)` for the caller's.
-fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
+pub(super) fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
     if id.get() == caller {
         return Ok(None);
     }

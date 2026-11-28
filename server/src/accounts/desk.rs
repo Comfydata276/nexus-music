@@ -28,6 +28,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicI8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -77,6 +78,24 @@ struct Shared {
 pub struct Desk {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<Keeper>>,
+    pub(crate) diagnostics: Arc<DiagnosticsSetting>,
+}
+
+/// The durable default, mirrored by the writer so hello never has to wait on the desk.
+pub(crate) struct DiagnosticsSetting(AtomicI8);
+
+impl DiagnosticsSetting {
+    pub(crate) fn get(&self) -> Option<bool> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set(&self, enabled: bool) {
+        self.0.store(i8::from(enabled), Ordering::Relaxed);
+    }
 }
 
 /// The lane was full, or the thread has stopped: nothing of the step was done.
@@ -88,6 +107,9 @@ impl Desk {
     /// lane's first, then the strangers'; and the store's idle work by `clock`.
     pub fn open(mut keeper: Keeper, clock: Clock) -> std::io::Result<Desk> {
         let shared = Arc::new(Shared { line: Mutex::new(Line { kept: VecDeque::new(), stranger: VecDeque::new(), open: true }), ready: Condvar::new() });
+        let diagnostics = super::rows::diagnostics_default(keeper.data().connection())
+            .ok().flatten().map_or(-1, i8::from);
+        let diagnostics = Arc::new(DiagnosticsSetting(AtomicI8::new(diagnostics)));
         let taken = shared.clone();
         let thread = thread::Builder::new().name("nexus-writer".into()).spawn(move || {
             loop {
@@ -121,7 +143,7 @@ impl Desk {
             }
             keeper
         })?;
-        Ok(Desk { shared, thread: Some(thread) })
+        Ok(Desk { shared, thread: Some(thread), diagnostics })
     }
 
     /// Does `step` on the thread that writes, in the kept lane, and gives back what it gave.

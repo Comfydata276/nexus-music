@@ -154,7 +154,7 @@ impl Shell {
     /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
     pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
         let public_origin = public_origin.map(Arc::<str>::from);
-        let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
+        let router = crate::accounts::routes::router(base_router(hello, accounts.desk.diagnostics.clone()), accounts.clone(), public_origin.clone());
         let router = crate::events::router(router, accounts, public_origin, data_budget);
         Self::with_routes(proxy, router, head::ROUTES.to_vec())
     }
@@ -218,13 +218,19 @@ fn router_with_public_origin(hello: &Hello, public_origin: Option<&str>) -> Rout
 }
 
 /// `hello` and the admin's document, with no sign-in: what S8's calls are added to.
-fn base_router(hello: &Hello) -> Router {
+fn base_router(hello: &Hello, diagnostics: Arc<crate::accounts::desk::DiagnosticsSetting>) -> Router {
+    let on = Bytes::from(hello.clone().with_diagnostics_default(true).to_json());
+    let off = Bytes::from(hello.clone().with_diagnostics_default(false).to_json());
     let body = Bytes::from(hello.to_json());
     Router::new()
         .route(
             proto::HELLO,
             get(move || {
-                let body = body.clone();
+                let body = match diagnostics.get() {
+                    Some(true) => on.clone(),
+                    Some(false) => off.clone(),
+                    None => body.clone(),
+                };
                 async move { ([(CONTENT_TYPE, "application/json")], body) }
             }),
         )
