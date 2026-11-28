@@ -12,6 +12,7 @@ const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 function loadPage(fetch, { requestsEnabled = false } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
+  const documentEvents = new Map();
   const timers = [];
   const fields = {
     signin: ["email", "password"], "grant-form": ["grant-password"],
@@ -35,6 +36,7 @@ function loadPage(fetch, { requestsEnabled = false } = {}) {
     set innerHTML(_) { assert.fail("Untrusted text reached innerHTML"); },
     set outerHTML(_) { assert.fail("Untrusted text reached outerHTML"); },
     insertAdjacentHTML() { assert.fail("Untrusted text reached insertAdjacentHTML"); },
+    setAttribute() { assert.fail("Untrusted text reached setAttribute"); },
   });
   const from = id => {
     if (!elements.has(id)) elements.set(id, node(null, id));
@@ -43,16 +45,22 @@ function loadPage(fetch, { requestsEnabled = false } = {}) {
   let currentTime = Date.now();
   const context = {
     document: {
+      hidden: false,
+      addEventListener(name, handler) { documentEvents.set(name, handler); },
+      write() { assert.fail("Untrusted text reached document.write"); },
+      writeln() { assert.fail("Untrusted text reached document.writeln"); },
       getElementById: from,
       createElement(tag) {
-        assert.ok(["li", "details", "summary", "div", "button", "span"].includes(tag), tag);
+        assert.ok(["li", "details", "summary", "div", "button", "span", "p"].includes(tag), tag);
         return node(tag);
       },
     },
     window: { addEventListener(name, handler) { windowEvents.set(name, handler); } },
     crypto: webcrypto,
-    setTimeout(fn, delay) { timers.push({ fn, delay }); return timers.length; },
-    clearTimeout: () => {},
+    setTimeout(fn, delay) { timers.push({ fn, delay, active: true }); return timers.length; },
+    clearTimeout(id) {
+      if (id !== undefined) timers[id - 1].active = false;
+    },
     TextDecoder,
     TextEncoder,
     URL,
@@ -60,7 +68,7 @@ function loadPage(fetch, { requestsEnabled = false } = {}) {
     AbortController,
     fetch,
   };
-  const instrumentation = "globalThis.forTest = { writeText, parseReply, typedCode };";
+  const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null };";
   const source = requestsEnabled ? script.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;") : script;
   runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
   const findButton = (node, label) => {
@@ -73,7 +81,18 @@ function loadPage(fetch, { requestsEnabled = false } = {}) {
   return {
     from,
     windowEvents,
-    timers,
+    documentEvents,
+    setHidden(hidden) {
+      context.document.hidden = hidden;
+      documentEvents.get("visibilitychange")();
+    },
+    fireIdleTimer() {
+      const timer = timers.find(timer => timer.active && timer.delay === 30_000);
+      assert.ok(timer, "idle check scheduled");
+      timer.active = false;
+      timer.fn();
+    },
+    button(container, label) { return findButton(from(container), label); },
     advance(ms) { currentTime += ms; },
     submit(id, values = {}) {
       for (const [field, value] of Object.entries(values)) from(field).value = value;
@@ -101,9 +120,11 @@ test("CSP grants match exactly the inline script and stylesheet", () => {
   }
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i);
   assert.doesNotMatch(html, /\/\//);
+  assert.match(route, /require-trusted-types-for 'script'; trusted-types 'none'/);
+  assert.doesNotMatch(script, /\b(?:innerHTML|outerHTML|insertAdjacentHTML|setAttribute|write|writeln|eval|Function)\s*(?:[=(]|\()/);
 });
 
-test("submit calls the sign-in route and shows the bare 501 as not built", async () => {
+test("submit uses the page sign-in marker and explains a wrong password", async () => {
   const page = loadPage(async (path, options) => {
     assert.equal(path, "/nexus/api/signin");
     assert.equal(options.credentials, "omit");
@@ -117,22 +138,20 @@ test("submit calls the sign-in route and shows the bare 501 as not built", async
     assert.deepEqual(body.credential, { password: {
       email: "sample@example.test", password: "example admin password",
     } });
-    return new Response(null, { status: 501 });
+    return new Response(JSON.stringify({ refused: { not_allowed: "wrong_login" } }), { status: 403 });
   });
   await page.signIn("sample@example.test", "example admin password");
-  assert.equal(page.from("status").textContent, "Sign-in has not been built yet.");
+  assert.match(page.from("status").textContent, /^That email or password is not right/);
   assert.equal(page.from("password").value, "");
   assert.equal(page.from("email").value, "");
   assert.equal(page.from("admin").hidden, true);
 });
 
-test("names and address examples reach only the text sink", async () => {
+test("sign-in identity is rendered literally and cleared on sign-out", async () => {
   const email = "<script>example()</script>@example.test";
-  const device = "<script>exampleDevice()</script>";
-  const address = "<script>exampleAddress()</script>";
   const token = "14".repeat(32);
   const response = '{"done":{"result":{"person":{"id":7,"email":' +
-    JSON.stringify(email) + ',"admin":true},"session":"' + token +
+    JSON.stringify(email) + ',"admin":true},"session_id":17,"session":"' + token +
     '","music":"none_set_yet","restore":18446744073709551615},' +
     '"receipt":{"stamp":{"account":7,"restore":18446744073709551615}}}}';
   const page = loadPage(async (path, options) => {
@@ -146,10 +165,6 @@ test("names and address examples reach only the text sink", async () => {
   await page.signIn(email, "example admin password");
   assert.equal(page.from("admin").hidden, false);
   assert.equal(page.from("identity").textContent, email);
-  for (const value of [device, address]) {
-    page.writeText(page.from("identity"), value);
-    assert.equal(page.from("identity").textContent, value);
-  }
   await page.from("signout").events.get("click")();
   assert.equal(page.from("identity").textContent, "");
   assert.equal(page.from("admin").hidden, true);
@@ -165,15 +180,16 @@ test("whole JSON rejects duplicate keys, too much nesting and invalid Unicode", 
   assert.equal(page.parseReply('{"value":18446744073709551615}').value, 18446744073709551615n);
 });
 
-test("authorized reads render text, paginate losslessly, and rearm idle expiry", async () => {
+test("authorized reads render text and paginate losslessly", async () => {
   const token = "39".repeat(32);
   const injected = "<script>sample()</script>";
   const requests = [];
   const done = result => new Response(JSON.stringify({ done: result }));
   const page = loadPage(async (path, options) => {
     if (path === "/nexus/api/signin") {
+      assert.equal(options.headers["X-Nexus-Admin"], "1");
       return done({
-        result: { person: { id: 1, email: "owner@example.test", admin: true }, session: token,
+        result: { person: { id: 1, email: "owner@example.test", admin: true }, session: token, session_id: 17,
           music: "none_set_yet", restore: 2 },
         receipt: { stamp: { account: 1, restore: 2 } },
       });
@@ -189,9 +205,9 @@ test("authorized reads render text, paginate losslessly, and rearm idle expiry",
     }
     if (path === "/nexus/api/admin/devices") {
       return done({ rows: [{ account: 1, device: 4, name: injected, kind: "phone",
-        app_version: "1.2.3", last_seen_ms: 0, session: null }], more: false });
+        app_version: "1.2.3", last_seen_ms: 0, session: null, page: false }], more: false });
     }
-    if (path === "/nexus/api/admin/music-server") return done({ internal: injected, public: null });
+    if (path === "/nexus/api/admin/music-server") return done({ internal: injected, public: injected });
     if (path === "/nexus/api/admin/diagnostics-default") return done({ enabled: true });
     throw new Error("Unexpected request " + path);
   });
@@ -206,7 +222,7 @@ test("authorized reads render text, paginate losslessly, and rearm idle expiry",
   assert.ok(page.from("accounts-list").children[0].textContent.includes(injected));
   assert.ok(page.from("devices-list").children[0].textContent.includes(injected));
   assert.equal(page.from("music-internal").textContent, injected);
-  assert.equal(page.from("music-public").textContent, "Unset");
+  assert.equal(page.from("music-public").textContent, injected);
   assert.equal(page.from("diagnostics-status").textContent, "New devices send diagnostics by default.");
   assert.equal(page.from("requests-list").children.length, 0);
   assert.equal(page.from("accounts-more").hidden, false);
@@ -214,9 +230,6 @@ test("authorized reads render text, paginate losslessly, and rearm idle expiry",
   assert.match(requests.at(-1)[1].body, /"after":18446744073709551614/);
   assert.equal(page.from("accounts-list").children.length, 2);
   assert.equal(page.from("accounts-more").hidden, true);
-  assert.equal(page.timers.length, 6);
-  assert.ok(page.timers.every(timer => timer.delay === 30 * 60 * 1000));
-
   page.windowEvents.get("pagehide")();
   assert.equal(page.from("admin").hidden, true);
   assert.equal(page.from("accounts-list").children.length, 0);
@@ -254,14 +267,16 @@ function adminStandIn() {
   const parse = raw => JSON.parse(raw.replace(/:\s*(\d{16,})(?=[,}])/g, ':"$1"'));
   const fetch = async (path, options) => {
     if (path === "/nexus/api/signin") {
+      assert.equal(options.headers["X-Nexus-Admin"], "1");
       return done({
-        result: { person: { id: 1, email: "owner@example.test", admin: true }, session: encodedToken,
+        result: { person: { id: 1, email: "owner@example.test", admin: true }, session: encodedToken, session_id: 17,
           music: "none_set_yet", restore: 2 },
         receipt: { stamp: { account: 1, restore: 2 } },
       });
     }
     if (path === "/nexus/api/signout") return done({ result: {} });
     assert.equal(options.headers.Authorization, "Bearer " + encodedToken);
+    assert.equal(options.headers["X-Nexus-Admin"], "1");
     assert.equal(options.credentials, "omit");
     assert.equal(options.cache, "no-store");
     const data = parse(options.body);
@@ -275,7 +290,7 @@ function adminStandIn() {
     }
     if (path === "/nexus/api/admin/devices") {
       return new Response('{"done":{"rows":[{"account":' + id +
-        ',"device":19,"name":"Pat’s phone","kind":"phone","app_version":"1.2.3","last_seen_ms":0,"session":' +
+        ',"device":19,"name":"Pat’s phone","kind":"phone","app_version":"1.2.3","last_seen_ms":0,"page":false,"session":' +
         (hasSession ? "23" : "null") + '}],"more":false}}');
     }
     if (path === "/nexus/api/admin/music-server") return done({ internal: internalAddress, public: publicAddress });
@@ -346,9 +361,11 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   assert.match(page.from("grant-summary").textContent, /new@example\.test/);
   await confirm(adminPassword);
   assert.equal(page.from("code-value").textContent, code);
+  assert.equal(page.from("code-person").textContent, "Code for <script>sample()</script> (new@example.test)");
   assert.equal(page.from("new-code").open, true);
   page.click("code-done");
   assert.equal(page.from("code-value").textContent, "");
+  assert.equal(page.from("code-person").textContent, "");
   assert.equal(page.from("new-code").open, false);
   assert.equal(page.from("create-name").value, "");
 
@@ -369,6 +386,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   page.press("accounts-list", "Reset password");
   await confirm();
   assert.equal(page.from("code-value").textContent, "01AB234CDE57");
+  assert.equal(page.from("code-person").textContent, "Code for Pat <script>sample()</script> (pat@example.test)");
   page.click("code-done");
 
   page.press("devices-list", "Sign this device out");
@@ -529,4 +547,106 @@ test("device report text uses its stamped page and clears as soon as the dialog 
   assert.equal(page.from("reports-more").hidden, true);
   page.click("reports-close");
   assert.equal(page.from("report-text").textContent, "");
+});
+
+test("authentication fields have explicit autocomplete purposes", () => {
+  const inputs = [...html.matchAll(/<input\b[^>]*>/g)].map(([input]) => input);
+  assert.ok(inputs.every(input => input.includes('autocomplete="')));
+  for (const [id, purpose] of Object.entries({
+    email: "username", password: "current-password", "setup-code": "one-time-code",
+    "music-user": "off", "music-password": "new-password", "lidarr-key": "new-password",
+  })) {
+    assert.ok(inputs.find(input => input.includes('id="' + id + '"')).includes('autocomplete="' + purpose + '"'));
+  }
+});
+
+test("elapsed inactivity clears the tab, including an open code and cached approval", async () => {
+  const mock = adminStandIn();
+  const page = loadPage(mock.fetch);
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.press("accounts-list", "Reset password");
+  await page.submit("grant-form", { "grant-password": adminPassword });
+  await settle();
+  assert.equal(page.from("code-value").textContent, code);
+  assert.equal(page.hasApproval(), true);
+  page.setHidden(true);
+  assert.equal(page.from("admin").hidden, true);
+  page.setHidden(false);
+  assert.equal(page.from("admin").hidden, false);
+
+  page.advance(30 * 60 * 1000);
+  page.fireIdleTimer();
+  for (const id of ["identity", "code-value", "code-person", "music-internal", "music-public"]) {
+    assert.equal(page.from(id).textContent, "");
+  }
+  for (const id of ["accounts-list", "devices-list"]) assert.equal(page.from(id).children.length, 0);
+  assert.equal(page.from("new-code").open, false);
+  assert.equal(page.hasApproval(), false);
+  assert.equal(page.from("grant-password").value, "");
+  assert.equal(page.from("admin").hidden, true);
+  assert.equal(page.from("signin").hidden, false);
+  assert.match(page.from("status").textContent, /^Your session has ended/);
+});
+
+test("the page checks elapsed time on wake or an action even if no timer ran", async () => {
+  for (const wake of [
+    page => page.setHidden(false),
+    page => page.windowEvents.get("focus")(),
+    page => page.windowEvents.get("pageshow")(),
+    page => {
+      let stopped = false;
+      page.documentEvents.get("click")({
+        preventDefault() {},
+        stopImmediatePropagation() { stopped = true; },
+      });
+      assert.equal(stopped, true);
+    },
+  ]) {
+    const page = loadPage(adminStandIn().fetch);
+    await page.signIn("owner@example.test", adminPassword);
+    await settle();
+    page.advance(30 * 60 * 1000 + 1);
+    wake(page);
+    assert.equal(page.from("identity").textContent, "");
+    assert.equal(page.from("admin").hidden, true);
+    assert.match(page.from("status").textContent, /Sign in again/);
+  }
+});
+
+test("the own row hides lockout controls and the current tab stays signed in", async () => {
+  const mock = adminStandIn();
+  const account = { id: 1, email: "owner@example.test", name: "Owner",
+    enabled: true, admin: true, requests_enabled: true, music: "none_set" };
+  const browser = { account: 1, device: 4, name: "Admin page", kind: "pc",
+    app_version: "0.1.0", last_seen_ms: 1000, session: 17, page: true };
+  const page = loadPage(async (path, options) => {
+    if (path === "/nexus/api/admin/accounts") {
+      return new Response(JSON.stringify({ done: { rows: [account], more: false } }));
+    }
+    if (path === "/nexus/api/admin/devices") {
+      const rows = mock.calls.some(call => call.phase === "change") ? [browser] :
+        [browser, { ...browser, device: 5, session: 18 }];
+      return new Response(JSON.stringify({ done: { rows, more: false } }));
+    }
+    return mock.fetch(path, options);
+  });
+  await page.signIn(account.email, adminPassword);
+  await settle();
+  const [own] = page.from("accounts-list").children;
+  assert.match(own.children[0].textContent, /the account you’re signed in with/);
+  for (const control of ["Switch account off", "Remove account", "Remove administrator access"]) {
+    assert.equal(page.button("accounts-list", control), undefined);
+  }
+  assert.ok(page.button("accounts-list", "Set music sign-in"));
+  const [current, other] = page.from("devices-list").children;
+  assert.match(current.textContent, /Admin page · This tab · Last used/);
+  assert.match(other.textContent, /Admin page · Signed in · Last used/);
+  page.press("devices-list", "Sign this admin page out");
+  await page.submit("grant-form", { "grant-password": adminPassword });
+  await settle();
+  assert.deepEqual(mock.calls.find(call => call.phase === "change").payload,
+    { account: 1, device: 5, session: 18 });
+  assert.equal(page.button("devices-list", "Sign this admin page out"), undefined);
+  assert.equal(page.from("identity").textContent, account.email);
 });
