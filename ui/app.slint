@@ -12,7 +12,7 @@ import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers,
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, NoticeOverlay } from "overlays.slint";
 
 export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow }
 
@@ -619,5 +619,7 @@ export component MainWindow inherits Window {
         if Prompt.open: prompt := PromptOverlay {
             init => { self.focus-input(); }
         }
+
+        if App.nexus-notice != "": NoticeOverlay { }
     }
 }

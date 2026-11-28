@@ -415,6 +415,15 @@ pub fn install(ui: &ui::MainWindow) {
     });
     let weak = ui.as_weak();
     app_global.on_form_closed(move || press_on(&weak, Press::FormClosed));
+    // The notice of what the server records is seen when, and only when, the person presses
+    // OK on it (W7c item 10).
+    let weak = ui.as_weak();
+    app_global.on_notice_seen(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<ui::App>().set_nexus_notice("".into());
+        }
+        press_on(&weak, Press::NoticeSeen);
+    });
     let weak = ui.as_weak();
     app_global.on_sign_out(move || press_on(&weak, Press::SignOut));
     let settings = ui.global::<ui::Settings>();
@@ -581,6 +590,7 @@ fn not_kept_shown() {
     app.set_nexus_sign_in_wanted(plays);
     app.set_login_busy(false);
     app.set_login_error(NOT_KEPT_WORDS.into());
+    app.set_nexus_notice("".into());
     ui.global::<ui::Settings>().set_nexus_row(NOT_KEPT_WORDS.into());
     crate::controller::with(|ctl| ctl.toast(NOT_KEPT_WORDS));
 }
@@ -1028,8 +1038,6 @@ fn hand_over(hand: Hand, cause: &Cause) {
 thread_local! {
     /// The countdown the form shows for the core's "come back in N seconds".
     static WAIT: std::cell::RefCell<Option<slint::Timer>> = const { std::cell::RefCell::new(None) };
-    /// The notice of what this server records, as last shown: shown once.
-    static NOTICE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Shows what the machine says is to be shown (on the window's thread).
@@ -1103,12 +1111,12 @@ fn show(shown: Shown) {
     settings.set_password_busy(shown.password.state == PasswordState::Working);
     settings.set_password_changed(shown.password.state == PasswordState::Changed);
     settings.set_password_note(shown.password.words.as_str().into());
-    // What this server records (13.6): shown once, then said to have been seen.
-    if let Some(notice) = shown.notice
-        && NOTICE.with(|seen| seen.replace(notice.clone())) != notice
-    {
-        crate::controller::with(|ctl| ctl.toast(notice));
-        window_now(|| tell(Happened::Pressed(Press::NoticeSeen)));
+    // What this server records (13.6): shown whole, in a surface of its own that scrolls,
+    // for as long as the machine holds it as not seen; seen only by the person's press (W7c
+    // item 10). Whatever sign-in it comes with, the same words included.
+    let notice = shown.notice.unwrap_or_default();
+    if app.get_nexus_notice() != notice.as_str() {
+        app.set_nexus_notice(notice.into());
     }
 }
 

@@ -2,6 +2,7 @@
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
+import { ScrollView } from "std-widgets.slint";
 import { App, Settings, Menu, Prompt, Toast, MenuEntry } from "types.slint";
 import { Icon, IconButton, TextButton, LinkText, Field, Toggle } from "widgets.slint";
 
@@ -225,6 +226,67 @@ export component PromptOverlay inherits Rectangle {
                     danger: Prompt.danger;
                     enabled: !Prompt.wants-text || Prompt.text != "";
                     clicked => { Prompt.confirmed(Prompt.text); }
+                }
+            }
+        }
+    }
+}
+
+// What the Nexus server records (design 13.6), as its admin or the server asks a person to be
+// told: the whole of it, scrolling if it is long, until the person presses OK. Nothing else
+// (a click outside, a time) marks it seen (W7c item 10).
+export component NoticeOverlay inherits Rectangle {
+    background: #000000a6;
+
+    // Taken here: nothing behind it is pressed, and a click outside does not close it.
+    TouchArea { }
+
+    box := Rectangle {
+        width: min(520px, root.width - 32px);
+        height: min(content.preferred-height, root.height - 32px);
+        border-radius: 12px;
+        background: Theme.overlay;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 48px;
+        drop-shadow-offset-y: 16px;
+        drop-shadow-color: #000000a0;
+
+        content := VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+
+            Text {
+                text: "What your Nexus server records";
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 22px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            notice-scroll := ScrollView {
+                vertical-stretch: 1;
+                min-height: 60px;
+                preferred-height: words.preferred-height;
+                vertical-scrollbar-policy: as-needed;
+                horizontal-scrollbar-policy: always-off;
+
+                words := Text {
+                    width: notice-scroll.visible-width - 12px;
+                    text: App.nexus-notice;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                TextButton {
+                    text: "OK";
+                    primary: true;
+                    clicked => { App.notice-seen(); }
                 }
             }
         }
