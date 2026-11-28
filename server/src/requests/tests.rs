@@ -728,10 +728,12 @@ fn a_finished_job_releases_its_worker_before_reporting_completion() {
         &mut keeper, actor, wire::RequestId::new(1).unwrap(), &encode(&change).unwrap(), &plan, false, &rooms,
     ).unwrap();
     let row = row_id(job).unwrap();
+    let reservation = JobReservation::take(rooms.clone(), row, actor.account.get()).unwrap();
     let place = Place::take_upstream(rooms.clone(), actor.account.get(), Some(row)).unwrap();
     finish_job(&mut keeper, actor.now, row, &JobResult::Done(Completed::Cancelled), &[], None).unwrap();
     assert!(matches!(after_job(keeper.data().connection(), actor, job, &rooms), Ok(Answer::Working)));
     drop(place);
+    drop(reservation);
     assert!(matches!(after_job(keeper.data().connection(), actor, job, &rooms),
         Ok(Answer::Done { result: Completed::Cancelled })));
     keeper.close();

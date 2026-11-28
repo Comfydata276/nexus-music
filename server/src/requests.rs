@@ -352,7 +352,39 @@ fn lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Rooms {
     ingress: HashSet<u64>,
     upstream: HashSet<u64>,
-    jobs: HashSet<i64>,
+    jobs: HashMap<i64, u64>,
+    working_jobs: HashSet<i64>,
+    available: Arc<Notify>,
+}
+
+// A claimed durable job stays unique while it waits or yields. The separate
+// Place is acquired only for actual upstream work.
+struct JobReservation {
+    rooms: Arc<Mutex<Rooms>>,
+    row: i64,
+}
+
+impl JobReservation {
+    fn take(rooms: Arc<Mutex<Rooms>>, row: i64, account: u64) -> Option<Self> {
+        let mut held = lock(&rooms);
+        if held.jobs.len() == wire::RUNNING_MAX || held.jobs.values().any(|known| *known == account) {
+            return None;
+        }
+        held.jobs.insert(row, account);
+        drop(held);
+        Some(Self { rooms, row })
+    }
+}
+
+impl Drop for JobReservation {
+    fn drop(&mut self) {
+        lock(&self.rooms).jobs.remove(&self.row);
+    }
+}
+
+struct MutationTurn {
+    _upstream: Place,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
 }
 
 struct Place {
@@ -382,7 +414,7 @@ impl Place {
             return None;
         }
         if let Some(job) = job {
-            held.jobs.insert(job);
+            held.working_jobs.insert(job);
         }
         drop(held);
         Some(Self { rooms, account, upstream: true, job })
@@ -394,7 +426,10 @@ impl Drop for Place {
         let mut held = lock(&self.rooms);
         if self.upstream { &mut held.upstream } else { &mut held.ingress }.remove(&self.account);
         if let Some(job) = self.job {
-            held.jobs.remove(&job);
+            held.working_jobs.remove(&job);
+        }
+        if self.upstream {
+            held.available.notify_waiters();
         }
     }
 }
@@ -908,7 +943,7 @@ fn enqueue(
         let rooms = lock(rooms);
         let mut waiting = 0;
         for job in active {
-            if !rooms.jobs.contains(&job.map_err(sql_error)?) {
+            if !rooms.working_jobs.contains(&job.map_err(sql_error)?) {
                 waiting += 1;
                 if waiting == wire::WAITING_MAX {
                     return Err(Refusal::Busy);
@@ -934,7 +969,7 @@ fn after_job(db: &Connection, actor: Actor, job: JobId, rooms: &Mutex<Rooms>) ->
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional().map_err(sql_error)?.ok_or(Refusal::JobNotFound)?;
     // Once the app sees completion, its next upstream read can use this place.
-    if stage != FINISHED || lock(rooms).jobs.contains(&row) {
+    if stage != FINISHED || lock(rooms).jobs.contains_key(&row) {
         return Ok(Answer::Working);
     }
     result.as_deref().ok_or(Refusal::NotDealtWith).and_then(read_job_result).map(JobResult::answer)
@@ -1388,23 +1423,20 @@ impl Requests {
             loop {
                 let Some(state) = service.upgrade() else { return };
                 state.restore_at_start().await;
-                // A queued mutation takes no upstream place while the turn is held.
-                if let Ok(turn) = state.mutation.clone().try_lock_owned() {
+                loop {
                     let dispatching = state.clone();
                     let clock = state.accounts.clock.clone();
                     let selected = state.accounts.desk.ask(move |keeper| {
                         dispatching.claim(keeper, clock())
                     }).await;
-                    if let Ok(Ok(Some((job, place, credential)))) = selected {
-                        let state = state.clone();
-                        let runtime = Handle::current();
-                        tokio::task::spawn_blocking(move || {
-                            state.run(job, credential, runtime);
-                            drop(place);
-                            drop(turn);
-                            state.wake.notify_one();
-                        });
-                    }
+                    let Ok(Ok(Some((job, reservation, credential)))) = selected else { break };
+                    let state = state.clone();
+                    let runtime = Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        state.run(job, credential, runtime);
+                        drop(reservation);
+                        state.wake.notify_one();
+                    });
                 }
                 drop(state);
                 let _ = tokio::time::timeout(Duration::from_secs(2), wake.notified()).await;
@@ -1441,12 +1473,12 @@ impl Requests {
         }).await;
     }
 
-    fn claim(&self, keeper: &mut Keeper, now: u64) -> Result<Option<(Job, Place, Credential)>, Refusal> {
+    fn claim(&self, keeper: &mut Keeper, now: u64) -> Result<Option<(Job, JobReservation, Credential)>, Refusal> {
         let Some(endpoint) = &self.endpoint else { return Ok(None) };
         close_parked_lines(keeper, now)?;
         let db = keeper.data().connection();
         let (
-            row, account, session, change, plan, stage, place,
+            row, account, session, change, plan, stage, reservation,
         ) = {
             let mut query = db.prepare(
                 "SELECT id, account, session, change, work, stage FROM requests_jobs
@@ -1463,10 +1495,10 @@ impl Requests {
                 let Some(row) = rows.next().map_err(sql_error)? else { return Ok(None) };
                 let account = unsigned(row.get::<_, i64>(1).map_err(sql_error)?)?;
                 let id = row.get::<_, i64>(0).map_err(sql_error)?;
-                let Some(place) = Place::take_upstream(self.rooms.clone(), account, Some(id)) else { continue };
+                let Some(reservation) = JobReservation::take(self.rooms.clone(), id, account) else { continue };
                 break (id, account, row.get::<_, i64>(2).map_err(sql_error)?,
                     row.get::<_, Vec<u8>>(3).map_err(sql_error)?, row.get::<_, Vec<u8>>(4).map_err(sql_error)?,
-                    row.get::<_, i64>(5).map_err(sql_error)?, place);
+                    row.get::<_, i64>(5).map_err(sql_error)?, reservation);
             }
         };
         let plan: Plan = decode(&plan)?;
@@ -1514,11 +1546,33 @@ impl Requests {
             change,
             plan,
             recovering: stage == MAY_HAVE_CHANGED,
-        }, place, key)))
+        }, reservation, key)))
+    }
+
+    async fn upstream_for_job(&self, job: &Job) -> Place {
+        let available = lock(&self.rooms).available.clone();
+        loop {
+            let waiting = available.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            if let Some(place) = Place::take_upstream(self.rooms.clone(), job.account.get(), Some(job.row)) {
+                return place;
+            }
+            waiting.await;
+        }
+    }
+
+    fn mutation_turn(&self, job: &Job, runtime: &Handle) -> MutationTurn {
+        runtime.block_on(async {
+            let turn = self.mutation.clone().lock_owned().await;
+            let upstream = self.upstream_for_job(job).await;
+            MutationTurn { _upstream: upstream, _turn: turn }
+        })
     }
 
     fn run(self: &Arc<Self>, mut job: Job, credential: Credential, runtime: Handle) {
         let Some(endpoint) = &self.endpoint else { return };
+        let _turn = self.mutation_turn(&job, &runtime);
         let journal = Journal {
             service: self.clone(), runtime: runtime.clone(), binding: job.plan.binding,
             restore: job.restore, row: job.row,
