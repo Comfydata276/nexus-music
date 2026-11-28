@@ -1,4 +1,4 @@
-//! Where things live on disk, saved settings, and the stored password.
+//! Where things live on disk, saved settings, and the music login kept where secrets are kept.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,20 @@ impl Paths {
         paths
     }
 
+    /// The files of a profile in `dir`, its folders made (for the tests).
+    #[cfg(test)]
+    pub fn in_dir(dir: &Path) -> Paths {
+        let paths = Paths::at(&dir.join("config"), &dir.join("cache"), &dir.join("data"));
+        let _ = fs::create_dir_all(dir.join("config"));
+        paths
+    }
+
+    /// Where a credential named `name` is kept off Windows: a file beside the settings.
+    #[cfg(not(windows))]
+    pub fn secret_file(&self, name: &str) -> PathBuf {
+        self.secret.with_file_name(name)
+    }
+
     /// Where each file goes, in these three folders (see `docs/FILES.md`).
     fn at(config: &Path, cache: &Path, data: &Path) -> Paths {
         Paths {
@@ -103,9 +117,6 @@ impl Paths {
 
 pub use nexus_core::sync::ListPrefs;
 
-/// One of the person's other devices, as the new linking last saw it: the library's own
-/// record, kept here as it is.
-pub use nexus_core::link::seen::Seen as LinkSeen;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -156,6 +167,11 @@ pub struct Settings {
     pub download_quality: u32,
     /// The folder downloads are kept in; empty for the app's own.
     pub downloads_dir: String,
+    /// A downloads folder chosen under Settings by one person on this PC, by their folder's
+    /// name (`Controller::downloads_dir_for`): moving one person's downloads moves theirs
+    /// alone, and leaves everyone else's where they are.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub downloads_dirs: std::collections::BTreeMap<String, String>,
     /// The folder songs are kept in as they play; empty for the app's own. Read when the app
     /// starts.
     pub songs_dir: String,
@@ -184,31 +200,13 @@ pub struct Settings {
     /// neither used nor bound (see `keep::take_token_telling`), until a token is next kept
     /// bound.
     pub lidarr_token_spent: bool,
-    /// Hosting jams is switched on, and the relay they're hosted at. (The host key for it is
-    /// kept with the account password, not here.)
-    pub jam_host: bool,
-    pub jam_relay: String,
-    /// The name to go by in jams; empty for the account's name.
-    pub jam_name: String,
-    /// Guests in a jam hosted here may pause and skip.
-    pub jam_guests_control: bool,
-    /// Other copies of the app signed in to the same account can see this one, steer it,
-    /// and take over what it's playing (and it them). Needs the relay.
-    pub link_devices: bool,
-    /// What this device is called in other devices' lists; empty for the computer's name.
+    /// What this device is called in the person's list of devices at the Nexus server; empty
+    /// for the computer's name.
     pub device_name: String,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
     pub device_id: String,
-    /// What this installation calls itself to the person's other devices under the new
-    /// linking (see `link`): sixteen random bytes. Made the first time it is needed.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub link_device: String,
-    /// The person's other devices as the new linking has seen them, so that the list can
-    /// show them at once. Written only where that linking is switched on.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub link_seen: Vec<LinkSeen>,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
     /// When the pins and the theme that were last agreed with the server were chosen (see
@@ -240,6 +238,14 @@ pub struct Settings {
     /// The person has been told that the settings folder's drive can't make hard links
     /// (`no_links_note`).
     pub said_no_links: bool,
+    /// The address and email last signed in with to the Nexus server, put in the sign-in
+    /// screen's fields (nothing secret: the session is kept where secrets are kept).
+    pub sign_in_address: String,
+    pub sign_in_email: String,
+    /// Who took over the folder this PC had before the Nexus server (the backend's id and
+    /// their account), and that folder's name: written once, at that sign-in (`folder_for`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_over: Option<(String, String)>,
 }
 
 impl Default for Settings {
@@ -272,6 +278,7 @@ impl Default for Settings {
             exclusive: false,
             download_quality: 0,
             downloads_dir: String::new(),
+            downloads_dirs: Default::default(),
             songs_dir: String::new(),
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
@@ -284,16 +291,9 @@ impl Default for Settings {
             lidarr_gate_client: String::new(),
             lidarr_signed_in: String::new(),
             lidarr_token_spent: false,
-            jam_host: false,
-            jam_relay: String::new(),
-            jam_name: String::new(),
-            jam_guests_control: true,
-            link_devices: true,
             device_name: String::new(),
             sync: true,
             device_id: String::new(),
-            link_device: String::new(),
-            link_seen: Vec::new(),
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,
@@ -307,6 +307,9 @@ impl Default for Settings {
             check_updates: true,
             update_notified: String::new(),
             said_no_links: false,
+            sign_in_address: String::new(),
+            sign_in_email: String::new(),
+            carried_over: None,
         }
     }
 }
@@ -968,6 +971,19 @@ pub fn clear_settings_leftovers(dir: &Path, account_file: &str, account_stem: &s
     clear_leftovers(dir, own, &old);
 }
 
+/// One account's own, when it is entered (before anything of it is written): its list of
+/// changes waiting to be sent, its queue, its place and Recently played (their files of its
+/// own), and its two lists of downloads.
+pub fn clear_account_leftovers(paths: &Paths, downloads: &Path, account_stem: &str) {
+    if let Some(dir) = paths.settings.parent() {
+        let names = ["pending", "queue", "queue-place", "history"].map(|name| format!("{name}-{account_stem}"));
+        let own = |name: &str| names.iter().any(|stem| name == format!("{stem}.json"));
+        let old: Vec<String> = names.iter().map(|stem| format!("{stem}.tmp")).collect();
+        clear_leftovers(dir, own, &old);
+    }
+    clear_downloads_leftovers(downloads, account_stem);
+}
+
 /// The data folder's: the crash note's marker's (0.40.10 wrote it in place: nothing old).
 pub fn clear_data_leftovers(dir: &Path) {
     clear_leftovers(dir, |name| name == "crash.seen", &[]);
@@ -1019,7 +1035,7 @@ pub const REPLACING: Steps = Steps { place: |from, to| fs::rename(from, to), ..O
 /// `MOVEFILE_WRITE_THROUGH`, which Microsoft documents as not returning until the file is
 /// actually moved on the disk.
 #[cfg(windows)]
-fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
     let wide = |path: &Path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
@@ -1035,7 +1051,7 @@ fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
 /// comes with the whole file. (If the removal doesn't happen, the file under its first name
 /// is cleared by the next attempt, and never read.)
 #[cfg(not(windows))]
-fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Err(error) = fs::hard_link(from, to) {
         // A drive that can't make a second name for a file (FAT, exFAT, some network ones):
         // "not permitted", "not supported", "too many links".
@@ -1064,60 +1080,135 @@ fn sync_folder(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 const KEYRING_SERVICE: &str = "Nexus Music";
 
-fn account(server: &str, username: &str) -> String {
-    format!("{username}@{server}")
+/// The sign-in to the music server this device was handed by the Nexus server (design 9.4):
+/// the server's address, the name of the person's user there, and a salt and token made for
+/// this device, with the number of the login they were made from. Never a password.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MusicLogin {
+    pub server: String,
+    pub username: String,
+    pub salt: String,
+    pub token: String,
+    /// The Nexus server's count of this person's music login when it was handed (design 9.4).
+    pub count: u64,
 }
 
-// On Windows the password goes to Credential Manager. Other platforms are only used for
-// development, and keep it in a file readable by the current user.
-
-#[cfg(windows)]
-pub fn save_password(_paths: &Paths, server: &str, username: &str, password: &str) -> bool {
-    keyring::Entry::new(KEYRING_SERVICE, &account(server, username))
-        .and_then(|entry| entry.set_password(password))
-        .is_ok()
-}
-
-#[cfg(windows)]
-pub fn load_password(_paths: &Paths, server: &str, username: &str) -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, &account(server, username)).ok()?.get_password().ok()
-}
-
-#[cfg(windows)]
-pub fn delete_password(_paths: &Paths, server: &str, username: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account(server, username)) {
-        let _ = entry.delete_credential();
+impl std::fmt::Debug for MusicLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MusicLogin {{ server: {:?}, username: {:?}, count: {} }}", self.server, self.username, self.count)
     }
 }
 
-#[cfg(not(windows))]
-pub fn save_password(paths: &Paths, server: &str, username: &str, password: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let body = format!("{KEYRING_SERVICE}\n{}\n{password}", account(server, username));
-    if fs::write(&paths.secret, body).is_err() {
-        return false;
+/// What a sign-in to the Nexus server leaves on this PC (design 11): **one thing, kept where
+/// secrets are kept and put in place in one step**, so that a write cut short leaves the one
+/// before it whole. Its parts are what the shared library's client says to keep
+/// (its `client::Keep`): the session, the music login, and the account (the
+/// Nexus address, the backend's id, who the person is to it, the numbers last seen), kept
+/// here as the library wrote it; and the folder this person's things are under. A cold start
+/// reads it and plays from its music login without asking the Nexus server anything
+/// (design 6.1). The device's own secret is kept beside it; the password typed, nowhere.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SignedIn {
+    /// What the shared library's client said to keep, whole (its `client::Saved`,
+    /// as it serialises it): the Nexus origin, the backend's id, who the person is to it,
+    /// the session and the note that can end it, and the music login with its number.
+    #[serde(default)]
+    pub saved: Option<serde_json::Value>,
+    /// The name of the folder this person's things are kept under on this PC (downloads,
+    /// the changes waiting for the music server): decided once, at the sign-in that made it
+    /// (`folder_for`), and from then on tied to who they are to the backend, never to the
+    /// music server and user.
+    #[serde(default)]
+    pub folder: String,
+    /// The request that handed over the music login in `saved` (its address, exactly as it
+    /// was sent): what the music server's address is checked against at every start.
+    #[serde(default)]
+    pub handed_at: String,
+}
+
+impl std::fmt::Debug for SignedIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignedIn {{ saved: {}, folder: {:?} }}", self.saved.is_some(), self.folder)
     }
-    let _ = fs::set_permissions(&paths.secret, fs::Permissions::from_mode(0o600));
-    true
 }
 
-#[cfg(not(windows))]
-pub fn load_password(paths: &Paths, server: &str, username: &str) -> Option<String> {
-    let body = fs::read_to_string(&paths.secret).ok()?;
-    let mut lines = body.splitn(3, '\n');
-    let (_, who, password) = (lines.next()?, lines.next()?, lines.next()?);
-    (who == account(server, username)).then(|| password.to_string())
+/// The sign-in this PC had before the Nexus server, and what became of its folder (design
+/// 11; the review of W7, MUST 14): **captured once**, at the first start of this version,
+/// before anything can change the settings' music server and user, and **decided once**, at
+/// the first music login kept on this PC: carried over to that person if the shared library
+/// says their login names that same music server and user, else to nobody, ever. Kept in a
+/// file of its own (`nexus-legacy.json`), which a sign-out does not touch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Legacy {
+    pub server: String,
+    pub username: String,
+    /// Whether the folder's fate is decided (true at once when there was no sign-in before).
+    pub decided: bool,
+    /// Who it was carried over to (`Legacy::who`), if anyone.
+    pub carried_to: Option<String>,
 }
 
-#[cfg(not(windows))]
-pub fn delete_password(paths: &Paths, _server: &str, _username: &str) {
-    let _ = fs::remove_file(&paths.secret);
+impl Legacy {
+    /// What the settings say now, at the first start of this version (and what the first
+    /// build of W7 decided, if it did).
+    pub fn of(settings: &Settings) -> Legacy {
+        let none = settings.server.is_empty() || settings.username.is_empty();
+        Legacy {
+            server: settings.server.clone(),
+            username: settings.username.clone(),
+            decided: none || settings.carried_over.is_some(),
+            carried_to: settings.carried_over.as_ref().map(|(who, _)| who.clone()),
+        }
+    }
+
+    /// Who a person is to a backend, as the decision names them.
+    pub fn who(backend: &str, account: u64) -> String {
+        format!("{backend}\n{account}")
+    }
+
+    /// The folder the sign-in before had (`downloads/index-<stem>.json` and the rest).
+    pub fn stem(&self) -> String {
+        crate::controller::account_stem(&self.server, &self.username)
+    }
 }
 
-/// Keeps a secret other than the account password, by name, where that one is kept: the
-/// Windows credential store, or elsewhere a file only this user can read. An empty value
+fn legacy_path(paths: &Paths) -> PathBuf {
+    paths.settings.with_file_name("nexus-legacy.json")
+}
+
+/// The decision, as kept. An unreadable one is an error, never taken for none.
+pub fn load_legacy(paths: &Paths) -> std::io::Result<Legacy> {
+    let bytes = fs::read(legacy_path(paths))?;
+    serde_json::from_slice(&bytes).map_err(std::io::Error::from)
+}
+
+pub fn save_legacy(paths: &Paths, legacy: &Legacy) -> std::io::Result<()> {
+    write_surely(&legacy_path(paths), &serde_json::to_vec(legacy)?)
+}
+
+/// At each start: what the window knew is kept, if nothing is kept yet. Once kept, never
+/// replaced from the settings.
+pub fn keep_legacy(paths: &Paths, legacy: &Legacy) -> std::io::Result<()> {
+    match fs::metadata(legacy_path(paths)) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => save_legacy(paths, legacy),
+        Err(error) => Err(error),
+    }
+}
+
+/// A folder named by who a person is to the backend: its id and their account's number.
+pub fn person_folder(backend: &str, account: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(format!("{backend}\n{account}").as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    format!("nexus-{account}-{hash}")
+}
+
+/// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this
+/// user can read. An empty value
 /// forgets it. Says whether that was done (forgetting one that isn't there is done).
 #[cfg(windows)]
 pub fn save_secret(_paths: &Paths, name: &str, value: &str) -> bool {
@@ -1220,7 +1311,14 @@ pub fn write_kept(paths: &Paths, name: &str, value: &str) -> bool {
     if value.is_empty() {
         return save_secret(paths, name, "");
     }
-    fs::write(&file, kept_bytes(value)).is_ok() && fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).is_ok()
+    // Whole or not at all, as the credential store writes it: a file only this user can
+    // read, renamed into place.
+    let temp = temp_for(&file);
+    let written = fs::write(&temp, kept_bytes(value)).is_ok() && fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).is_ok() && fs::rename(&temp, &file).is_ok();
+    if !written {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 #[cfg(not(windows))]

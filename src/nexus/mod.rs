@@ -74,8 +74,10 @@ use slint::ComponentHandle;
 
 use crate::ui;
 
-/// The switch: the component is made only when this is `1`.
-const SWITCH: &str = "NEXUS_MUSIC_NEXUS";
+mod call;
+mod signin;
+pub mod vault;
+
 /// How the program is told it is a look, and at what.
 const PROBE_ARG: &str = "--nexus-probe";
 /// The first look after an account is published, so that it is never on the first tick.
@@ -100,12 +102,6 @@ const NO_ANSWER: i32 = 12;
 
 /// What the row under Settings says.
 const NONE_FOUND: &str = "None found";
-
-/// Whether the component is switched on for this run of the app.
-pub fn switched_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var(SWITCH).is_ok_and(|value| value == "1"))
-}
 
 /// What one look found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,14 +144,14 @@ fn own_file() -> Option<(PathBuf, u64, Option<SystemTime>)> {
     Some((path, meta.len(), meta.modified().ok()))
 }
 
-/// Installs the component on `ui`, if it is switched on: once the event loop runs (for an
-/// account the controller published while it was being made), and each time the window says
-/// the account has changed. Called by `main` after the controller is made; never by it.
+/// Installs the component on `ui`: what is kept of the last sign-in read, the window's
+/// sign-in screen and Account settings handed to it (`signin`), and its look started once
+/// the event loop runs (for an account the controller published while it was being made),
+/// and each time the window says the account has changed. Called by `main` after the
+/// controller is made (and a kept music login entered); never by it.
 pub fn install(ui: &ui::MainWindow) {
-    if !switched_on() {
-        return;
-    }
     OWN.get_or_init(own_file);
+    signin::install(ui);
     let app = ui.global::<ui::App>();
     // Only now does the window track the account (app.slint: `account`).
     app.set_nexus_on(true);
@@ -183,12 +179,28 @@ pub fn install(ui: &ui::MainWindow) {
     trigger_for_tests(ui);
 }
 
+/// The music server refused the login of this number and generation: told to the machine.
+pub fn music_refused(count: u64, generation: u64) {
+    signin::music_refused(count, generation);
+}
+
+/// Offline mode switched by the person: kept for the machine's next start.
+pub fn offline_is(on: bool) {
+    signin::offline_is(on);
+}
+
+/// From the first moment of quitting: the machine stops, so that no ask is granted its send,
+/// and every ask's process still running is ended.
+pub fn quitting() {
+    signin::stop();
+    call::shutdown();
+}
+
 /// At the app's end: a look still running is killed, and reaped without blocking for more
 /// than [`REAP`]. Called by `main` after the window has closed.
 pub fn shutdown() {
-    if !switched_on() {
-        return;
-    }
+    signin::stop();
+    call::shutdown();
     let child = CHILD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     if let Some(mut child) = child {
         end(&mut child);
@@ -225,8 +237,9 @@ fn follow(ui: &ui::MainWindow) {
         counter.set(counter.get() + 1);
         counter.get()
     });
-    let server = account.split('\n').next().unwrap_or_default();
-    let url = proto::hello_url(server);
+    // The backend this account was signed in through: where it is asked.
+    let (server, name) = account.split_once('\n').unwrap_or_default();
+    let url = signin::backend_for(server, name).and_then(|backend| proto::hello_url(&backend));
     note(format_args!("published {generation} {}", url.as_deref().unwrap_or("-")));
     if url.is_none() {
         // Not HTTPS: there can be none, and nothing is asked.
@@ -307,7 +320,7 @@ fn due(ui: &ui::MainWindow, generation: u64) {
                 let outcome = supervise(&url, generation, deadline());
                 IN_FLIGHT.store(false, Ordering::SeqCst);
                 hold_result_for_tests(outcome);
-                let _ = weak.upgrade_in_event_loop(move |ui| commit(&ui, generation, &account, outcome));
+                let _ = weak.upgrade_in_event_loop(move |ui| commit(&ui, generation, &account, &url, outcome));
             });
             if started.is_err() {
                 IN_FLIGHT.store(false, Ordering::SeqCst);
@@ -319,7 +332,7 @@ fn due(ui: &ui::MainWindow, generation: u64) {
 
 /// An answer has come back: shown only if it is for the generation in use and the account
 /// the window publishes now, and Offline mode is still off.
-fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome) {
+fn commit(ui: &ui::MainWindow, generation: u64, account: &str, url: &str, outcome: Outcome) {
     let current = RUNNING.with(|running| running.borrow().as_ref().is_some_and(|running| running.generation == generation));
     // (A deliberate fault, to show that the test of a late answer catches it.)
     let sabotaged = test_var("NEXUS_TEST_SABOTAGE_NO_GENERATION").is_some();
@@ -333,13 +346,15 @@ fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome)
         return;
     }
     let settings = ui.global::<ui::Settings>();
-    let server = account.split('\n').next().unwrap_or_default();
-    let url = proto::hello_url(server).unwrap_or_default();
-    settings.set_nexus_server(words(outcome, &url).into());
+    // Worded by the address it was asked at.
+    settings.set_nexus_server(words(outcome, url).into());
     // (With the fault above, the late answer is put under the account published now.)
     settings.set_nexus_for(if sabotaged { published(ui) } else { account.to_string() }.into());
     note(format_args!("shown {generation} {outcome:?}"));
     schedule(ui, generation, again());
+    if !sabotaged {
+        signin::after_look(url, outcome == Outcome::Found);
+    }
 }
 
 /// Whether Offline mode is switched on, as the controller's settings have it (the window's
@@ -444,7 +459,13 @@ fn read_status(status: ExitStatus) -> Outcome {
 /// When the program was started as a look, the look itself and the code to exit with;
 /// `None` when it was started as the app. `main` asks this first.
 pub fn probe_mode() -> Option<i32> {
-    probe_mode_with(std::env::args_os().skip(1), switched_on())
+    let mut args = std::env::args_os().skip(1);
+    if std::env::args_os().nth(1).is_some_and(|first| first == call::CALL_ARG) {
+        args.next();
+        OWN.get_or_init(own_file);
+        return Some(call::in_process(args));
+    }
+    probe_mode_with(args, true)
 }
 
 fn probe_mode_with(mut args: impl Iterator<Item = OsString>, on: bool) -> Option<i32> {
@@ -580,12 +601,19 @@ fn trigger_for_tests(ui: &ui::MainWindow) {
 }
 
 /// `NEXUS_TEST_NEXUS_LOG=<file>`: what the component does, a line each, with the time.
+/// A line of the component's test log (`NEXUS_TEST_NEXUS_LOG`), from anywhere in the app.
+pub fn trace(what: std::fmt::Arguments<'_>) {
+    note(what);
+}
+
 fn note(what: std::fmt::Arguments<'_>) {
     if let Some(path) = test_var("NEXUS_TEST_NEXUS_LOG") {
         use std::io::Write;
         let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        // One write for the whole line, so that lines from two threads never run together.
+        let line = format!("{now:.3} {what}\n");
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{now:.3} {what}");
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -711,32 +739,49 @@ mod tests {
     #[test]
     fn nothing_that_plays_names_it() {
         let paths: &[(&str, &str)] = &[
-            ("controller.rs", include_str!("controller.rs")),
-            ("config.rs", include_str!("config.rs")),
-            ("playback.rs", include_str!("playback.rs")),
-            ("plays.rs", include_str!("plays.rs")),
-            ("downloads.rs", include_str!("downloads.rs")),
-            ("offline.rs", include_str!("offline.rs")),
-            ("subsonic.rs", include_str!("subsonic.rs")),
-            ("sync.rs", include_str!("sync.rs")),
-            ("songcache.rs", include_str!("songcache.rs")),
-            ("media.rs", include_str!("media.rs")),
-            ("taskbar.rs", include_str!("taskbar.rs")),
-            ("audio/mod.rs", include_str!("audio/mod.rs")),
-            ("audio/engine.rs", include_str!("audio/engine.rs")),
-            ("audio/source.rs", include_str!("audio/source.rs")),
-            ("audio/dsp.rs", include_str!("audio/dsp.rs")),
-            ("audio/exclusive.rs", include_str!("audio/exclusive.rs")),
+            ("controller.rs", include_str!("../controller.rs")),
+            ("config.rs", include_str!("../config.rs")),
+            ("playback.rs", include_str!("../playback.rs")),
+            ("plays.rs", include_str!("../plays.rs")),
+            ("downloads.rs", include_str!("../downloads.rs")),
+            ("offline.rs", include_str!("../offline.rs")),
+            ("subsonic.rs", include_str!("../subsonic.rs")),
+            ("sync.rs", include_str!("../sync.rs")),
+            ("songcache.rs", include_str!("../songcache.rs")),
+            ("media.rs", include_str!("../media.rs")),
+            ("taskbar.rs", include_str!("../taskbar.rs")),
+            ("audio/mod.rs", include_str!("../audio/mod.rs")),
+            ("audio/engine.rs", include_str!("../audio/engine.rs")),
+            ("audio/source.rs", include_str!("../audio/source.rs")),
+            ("audio/dsp.rs", include_str!("../audio/dsp.rs")),
+            ("audio/exclusive.rs", include_str!("../audio/exclusive.rs")),
+        ];
+        // The controller's seams to it, each of which returns at once and waits for nothing
+        // (W7b): the legacy passwords' removal (on a thread of its own), a trace line, the
+        // machine stopped at quitting, a refusal told, Offline noted.
+        let seams = [
+            "crate::nexus::vault::forget_legacy_passwords",
+            "crate::nexus::trace",
+            "crate::nexus::quitting",
+            "crate::nexus::music_refused",
+            "crate::nexus::offline_is",
         ];
         for (name, text) in paths {
+            let mut text = text.to_string();
+            if *name == "controller.rs" {
+                for seam in seams {
+                    text = text.replace(seam, "");
+                }
+            }
             for word in ["nexus::", "crate::nexus", "super::nexus", "nexus_server", "nexus-server", "nexus_for", "nexus-for", "nexus_on", "nexus-on", "NEXUS_TEST_HOLD_NEXUS", "NEXUS_TEST_NEXUS", "NEXUS_TEST_PROBE", "NEXUS_TEST_SABOTAGE", "NEXUS_TEST_TRIGGER", "NEXUS_TEST_DEADLINE", "NEXUS_MUSIC_NEXUS"] {
                 assert!(!text.contains(word), "{name} names the Nexus server's component ({word})");
             }
         }
-        // `main` makes it, and ends its look at the app's end, only when it is switched on;
-        // and the window tracks the account for it only once it is made.
-        let main = include_str!("main.rs");
-        assert!(main.contains("if nexus::switched_on() {\n        nexus::install(&controller.ui);"));
-        assert!(include_str!("../ui/app.slint").contains("property <string> account: App.nexus-on && App.signed-in ?"));
+        // `main` makes it after the controller (and a kept sign-in entered), and before the
+        // window is shown; and the window tracks the account for it only once it is made.
+        let main = include_str!("../main.rs");
+        let (made, installed, shown) = (main.find("controller::Controller::install(window);"), main.find("nexus::install(&controller.ui);"), main.find("controller.ui.show()?;"));
+        assert!(made.is_some() && installed > made && shown > installed, "main makes the component after the controller");
+        assert!(include_str!("../../ui/app.slint").contains("property <string> account: App.nexus-on && App.signed-in ?"));
     }
 }

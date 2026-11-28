@@ -10,7 +10,6 @@ use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, M
 
 use crate::controller::{Controller, post};
 use crate::diagnostics::{self, Line, Note};
-use crate::jam::Remote;
 use crate::subsonic::Song;
 
 pub struct MediaKeys {
@@ -63,9 +62,6 @@ impl Controller {
     }
 
     fn media_play(self: &Rc<Self>, toggle: bool) {
-        if self.remote(if toggle { Remote::Toggle } else { Remote::Play(true) }) {
-            return;
-        }
         let was_playing = {
             let playback = self.playback.borrow();
             if playback.current().is_none() {

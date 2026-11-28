@@ -15,7 +15,6 @@ use crate::diagnostics::{self, FaultPlace, FaultShape, SoundOutput};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{Durable, SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
-use crate::jam::Remote;
 use crate::journal::{self, Began, Sound, Stopped};
 use crate::subsonic::{ApiError, Lyrics, Song};
 use crate::ui;
@@ -74,6 +73,10 @@ pub struct Playback {
     /// connection failed, and whether it's now waiting for the server to come back.
     reconnects: u32,
     waiting_for_server: bool,
+    /// The music login the current song was asked for under (its number and generation): a
+    /// stream that stops under an older one than the login in use now is asked for again at
+    /// once under the current one (W7c item 4).
+    opened_with: (u64, u64),
     /// Where the song had got to when last looked at, and for how many looks in a row (four
     /// a second) it hasn't moved although it's meant to be playing.
     seen_at: Option<f64>,
@@ -88,8 +91,6 @@ pub struct Playback {
     autoplay_seed: String,
     /// The queue ran out while those songs were still on their way: start them on arrival.
     autoplay_resume: bool,
-    /// And for as long as that is so, this PC counts as busy to the person's other devices.
-    autoplay_wait: Option<nexus_core::link::rule::Waiting>,
     /// The track that last triggered an early autoplay lookup, so each track asks only once.
     autoplay_asked: u64,
     /// Song IDs that entered this queue through autoplay.
@@ -127,6 +128,7 @@ impl Playback {
             failures: 0,
             reconnects: 0,
             waiting_for_server: false,
+            opened_with: (0, 0),
             seen_at: None,
             stuck_ticks: 0,
             dropped_kept: HashSet::new(),
@@ -134,7 +136,6 @@ impl Playback {
             autoplay_loading: false,
             autoplay_seed: String::new(),
             autoplay_resume: false,
-            autoplay_wait: None,
             autoplay_asked: 0,
             journal_autoplay: HashSet::new(),
             journal_from: None,
@@ -350,10 +351,6 @@ impl Controller {
         self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool,
         from: Option<journal::PlayedFrom>,
     ) {
-        if self.remote_play(&songs, start, context, any_start) {
-            self.play_from.take();
-            return;
-        }
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins, source_list) = match self.play_from.take() {
             Some(from) if from.rows.len() == songs.len() => {
@@ -421,10 +418,6 @@ impl Controller {
             pb.playing = true;
             pb.failures = 0;
             pb.autoplay_resume = false;
-            // (If the last queue had run out and was waiting for more: it waits no longer.)
-            if let Some(waiting) = pb.autoplay_wait.take() {
-                self.looked_up(waiting);
-            }
         }
         self.whole_queue();
         // (A new queue starting: in passing.)
@@ -438,7 +431,6 @@ impl Controller {
         match self.ways.whose() {
             Some(Who::Elsewhere) => Began::AnotherDevice,
             Some(Who::Guest) => Began::Jam,
-            _ if journal::recording() && self.in_a_jam() => Began::Jam,
             Some(Who::Nobody) => Began::NextInQueue,
             _ => Began::PressedHere,
         }
@@ -459,6 +451,7 @@ impl Controller {
             pb.last_tick = at;
             pb.scrobbled = false;
             pb.waiting_for_server = false;
+            pb.opened_with = client.handed();
             let request = self.request_for(&mut pb, &song, token, at);
             (request, pb.playing)
         };
@@ -718,9 +711,6 @@ impl Controller {
     // ---- transport -----------------------------------------------------------------------------
 
     pub fn toggle_play(self: &Rc<Self>) {
-        if self.remote(Remote::Toggle) {
-            return;
-        }
         self.toggle_play_here();
     }
 
@@ -770,25 +760,6 @@ impl Controller {
         }
     }
 
-    /// Pauses this PC's own player, whatever else this PC is steering: what a command from
-    /// another of the person's devices does (see `link`). Unlike `set_playing`, it never
-    /// goes on to a jam this PC has joined.
-    pub fn pause_here(self: &Rc<Self>) {
-        let was_playing = {
-            let mut pb = self.playback.borrow_mut();
-            if pb.current().is_none() {
-                return;
-            }
-            std::mem::replace(&mut pb.playing, false)
-        };
-        if was_playing {
-            journal::pause(true);
-            self.engine.set_playing(false);
-            self.sync_transport();
-            self.save_queue();
-        }
-    }
-
     /// Likes or unlikes the song that's playing. Used by the taskbar's like button.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn toggle_current_star(self: &Rc<Self>) {
@@ -800,9 +771,6 @@ impl Controller {
 
     /// Used by the media keys and the sleep timer.
     pub fn set_playing(self: &Rc<Self>, playing: bool) {
-        if self.remote(Remote::Play(playing)) {
-            return;
-        }
         self.set_playing_here(playing);
     }
 
@@ -813,9 +781,6 @@ impl Controller {
     }
 
     pub fn next_track(self: &Rc<Self>) {
-        if self.remote(Remote::Next) {
-            return;
-        }
         self.next_track_here();
     }
 
@@ -846,9 +811,6 @@ impl Controller {
     }
 
     pub fn previous_track(self: &Rc<Self>) {
-        if self.remote(Remote::Previous) {
-            return;
-        }
         self.previous_track_here();
     }
 
@@ -878,9 +840,6 @@ impl Controller {
     }
 
     pub fn seek(self: &Rc<Self>, seconds: f64) {
-        if self.remote(Remote::Seek(seconds)) {
-            return;
-        }
         self.seek_here(seconds);
     }
 
@@ -945,9 +904,6 @@ impl Controller {
     }
 
     pub fn set_volume(self: &Rc<Self>, volume: f32) {
-        if self.remote(Remote::Volume(volume)) {
-            return;
-        }
         self.set_volume_here(volume);
     }
 
@@ -965,9 +921,6 @@ impl Controller {
     }
 
     pub fn toggle_shuffle(self: &Rc<Self>) {
-        if self.remote(Remote::Shuffle) {
-            return;
-        }
         let on = !self.playback.borrow().shuffle;
         self.set_shuffle(on);
     }
@@ -976,12 +929,6 @@ impl Controller {
     /// on shuffles what follows; turning it off continues from this song in the list's order.
     pub fn set_shuffle(self: &Rc<Self>, on: bool) {
         self.shuffle_saving(on, Durable::Flushed);
-    }
-
-    /// Shuffle turned on or off by a jam's guest or a linked device: no press here, so the
-    /// settings are written in passing.
-    pub fn set_shuffle_from_afar(self: &Rc<Self>, on: bool) {
-        self.shuffle_saving(on, Durable::InPassing);
     }
 
     fn shuffle_saving(self: &Rc<Self>, on: bool, durable: Durable) {
@@ -1042,9 +989,6 @@ impl Controller {
     }
 
     fn cycle_repeat(self: &Rc<Self>) {
-        if self.remote(Remote::Repeat) {
-            return;
-        }
         let mode = (self.playback.borrow().repeat + 1) % 3;
         self.set_repeat(mode);
     }
@@ -1052,11 +996,6 @@ impl Controller {
     /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
     pub fn set_repeat(self: &Rc<Self>, mode: u8) {
         self.repeat_saving(mode, Durable::Flushed);
-    }
-
-    /// Repeat set by a jam's guest or a linked device: written in passing.
-    pub fn set_repeat_from_afar(self: &Rc<Self>, mode: u8) {
-        self.repeat_saving(mode, Durable::InPassing);
     }
 
     fn repeat_saving(self: &Rc<Self>, mode: u8, durable: Durable) {
@@ -1082,9 +1021,6 @@ impl Controller {
     /// list is queued all the same, and plays again when its turn in the list comes.
     pub fn enqueue(self: &Rc<Self>, songs: Vec<Song>, play_next: bool) {
         if songs.is_empty() {
-            return;
-        }
-        if self.remote_add(&songs, play_next) {
             return;
         }
         self.enqueue_here(songs, play_next);
@@ -1125,9 +1061,6 @@ impl Controller {
 
     /// Removes the entry `offset` places after the current track.
     pub fn remove_upcoming(self: &Rc<Self>, offset: usize) {
-        if self.remote(Remote::Remove(offset)) {
-            return;
-        }
         self.remove_upcoming_here(offset);
     }
 
@@ -1147,9 +1080,6 @@ impl Controller {
     /// Moves the entry `from` places after the current track to `to` places after it.
     /// `queued` says which part of the queue it lands in: "Next in queue" or the list.
     pub fn move_upcoming(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
-        if self.remote(Remote::Move(from, to, queued)) {
-            return;
-        }
         self.move_upcoming_here(from, to, queued);
     }
 
@@ -1167,9 +1097,6 @@ impl Controller {
     /// Empties part of what's to come: with `queued`, the songs queued by hand; otherwise
     /// the rest of the list behind them.
     pub fn clear_upcoming(self: &Rc<Self>, queued: bool) {
-        if self.remote(Remote::Clear(queued)) {
-            return;
-        }
         self.clear_upcoming_here(queued);
     }
 
@@ -1184,9 +1111,6 @@ impl Controller {
 
     /// Plays the entry `offset` places after the current track now.
     pub fn jump_to_upcoming(self: &Rc<Self>, offset: usize) {
-        if self.remote(Remote::Jump(offset)) {
-            return;
-        }
         self.jump_to_upcoming_here(offset);
     }
 
@@ -1204,78 +1128,11 @@ impl Controller {
         self.start_current(0.0);
     }
 
-    /// Takes over a queue handed across from another device: these songs in this order,
-    /// starting with the one at `index`, from `position` seconds into it. Songs marked as
-    /// queued by hand stay so.
-    pub fn load_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, playing: bool, context: &str) {
-        if songs.is_empty() {
-            return;
-        }
-        let _way = self.way_in(Who::Here, What::Playing);
-        self.take_queue(songs, index, position, context);
-        if playing {
-            self.toggle_play();
-        } else {
-            self.save_queue();
-        }
-    }
-
-    /// The same, and played on this PC's own player whatever else this PC is steering: what
-    /// a queue sent by another of the person's devices does (see `link`).
-    pub fn load_queue_here(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
-        if songs.is_empty() {
-            return;
-        }
-        let _way = self.way_in(Who::Here, What::Playing);
-        self.take_queue(songs, index, position, context);
-        self.toggle_play_here_from(Some(Began::AnotherDevice));
-    }
-
-    /// Puts a queue in the player in place of what was there, stopped at its place.
-    fn take_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
-        self.engine.set_playing(false);
-        self.engine.stop();
-        let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
-        // Handed over in a song's last moments, it starts from the top instead.
-        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
-        self.replace_queue(songs, index, position);
-        self.playback.borrow_mut().context = context.to_string();
-        self.track_changed();
-    }
-
     // ---- engine events and the clock -----------------------------------------------------------
-
-    /// The song the sound has rolled into by itself, if it has and this thread has not yet
-    /// been told: its token. The engine says so in its own time (`Event::Started`); what
-    /// is sounding can be read at any moment.
-    pub fn rolled_ahead(&self) -> Option<u64> {
-        let pb = self.playback.borrow();
-        self.engine.position().map(|(token, _)| token).filter(|token| *token != 0 && *token == pb.next_token && *token != pb.current_token)
-    }
-
-    /// Where the sound has got to in the song the player holds, if it is playing and the
-    /// engine has reached that song: its place in the song, in seconds.
-    pub fn sounding_at(&self) -> Option<f64> {
-        let pb = self.playback.borrow();
-        if !pb.playing || pb.current_token == 0 {
-            return None;
-        }
-        self.engine.position().filter(|(token, _)| *token == pb.current_token).map(|(_, at)| at)
-    }
-
-    /// What the engine's word that a song has started does, done now.
-    pub fn started(self: &Rc<Self>, token: u64) {
-        self.on_engine_event(Event::Started(token));
-    }
 
     pub fn on_engine_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::Started(token) => {
-                // (Where the new linking is switched on, the window may have been brought
-                // up to this already: see `link_catch_up`.)
-                if self.link_caught_up(token) {
-                    return;
-                }
                 let advanced = {
                     let mut pb = self.playback.borrow_mut();
                     pb.failures = 0;
@@ -1352,12 +1209,6 @@ impl Controller {
                             // Similar songs are on their way (or about to be asked for);
                             // carry on with them when they land.
                             pb.autoplay_resume = true;
-                            // The queue has run out and what plays next is being looked
-                            // up: until it lands, this PC is busy to other devices (see
-                            // `link`). What they would act on is about to change by itself.
-                            if let Some(earlier) = pb.autoplay_wait.replace(self.looking_up()) {
-                                self.looked_up(earlier);
-                            }
                             drop(pb);
                             return self.load_autoplay();
                         }
@@ -1491,6 +1342,11 @@ impl Controller {
         const WAITS: [u64; 4] = [1, 2, 4, 8];
         let player = self.ui.global::<ui::Player>();
         player.set_reconnecting(true);
+        // Asked for under a login that has since been renewed (it missed the renewal's edge):
+        // asked for again at once, once, under the current one (W7c item 4).
+        if attempt == 0 && self.renewed_since(self.playback.borrow().opened_with) {
+            return self.retry_current(token);
+        }
         if let Some(&wait) = WAITS.get(attempt as usize) {
             self.retry_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(wait), move || {
                 with(|ctl| ctl.retry_current(token));
@@ -1533,6 +1389,31 @@ impl Controller {
         let radio = self.playback.borrow().current().is_some_and(|song| !song.radio_url.is_empty());
         self.restart_current(if radio { 0.0 } else { position });
         self.ui.global::<ui::Player>().set_reconnecting(true);
+    }
+
+    /// Whether the login in use now is another than the one handed as `then`, and may send.
+    pub fn renewed_since(&self, then: (u64, u64)) -> bool {
+        self.client().is_some_and(|client| client.handed() != then && !client.refused() && !client.retired())
+    }
+
+    /// A renewed music login (design 6.3): the song that was waiting for the server, or
+    /// between its tries at reconnecting, is tried once more now, under the new login. A
+    /// stream that is still arriving is left to arrive.
+    pub fn retry_current_now(self: &Rc<Self>) {
+        let (token, waiting) = {
+            let pb = self.playback.borrow();
+            (pb.current_token, pb.waiting_for_server)
+        };
+        if token == 0 {
+            return;
+        }
+        if waiting {
+            return self.resume_waiting();
+        }
+        if self.retry_timer.running() {
+            self.retry_timer.stop();
+            self.retry_current(token);
+        }
     }
 
     /// The server is back: carry on with a song that was waiting for it.
@@ -1578,7 +1459,6 @@ impl Controller {
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
-        self.jam_tick();
         self.tick_downloads();
         // Every few seconds while there's a queue, see that the next songs are on hand.
         let keep_ticks = self.keep_ticks.get() + 1;
@@ -1761,9 +1641,6 @@ impl Controller {
                 return;
             }
             pb.autoplay_loading = false;
-            if let Some(waiting) = pb.autoplay_wait.take() {
-                self.looked_up(waiting);
-            }
             self.came_in(Who::Nobody, What::Playing);
             let resume = std::mem::take(&mut pb.autoplay_resume);
             // The queue may have been replaced while the request was out.
@@ -1980,9 +1857,6 @@ impl Controller {
                 }
             }
         }
-        if self.show_remote() {
-            return;
-        }
         let player = self.ui.global::<ui::Player>();
         let current = self.playback.borrow().current().cloned();
         match &current {
@@ -2016,9 +1890,6 @@ impl Controller {
     }
 
     pub fn sync_transport(self: &Rc<Self>) {
-        if self.show_remote() {
-            return;
-        }
         let pb = self.playback.borrow();
         let player = self.ui.global::<ui::Player>();
         player.set_playing(pb.playing);
@@ -2038,11 +1909,6 @@ impl Controller {
     }
 
     pub fn sync_queue(self: &Rc<Self>) {
-        if self.show_remote() {
-            return;
-        }
-        // In a jam hosted here, songs guests queued say who queued them.
-        let added_by = self.jam.borrow().added_by();
         let pb = self.playback.borrow();
         let ahead = pb.queued_ahead();
         let rows: Vec<ui::Track> = pb
@@ -2051,13 +1917,7 @@ impl Controller {
             .skip(pb.cursor + 1)
             .take(QUEUE_ROWS)
             .filter_map(|&i| pb.queue.get(i))
-            .map(|song| {
-                let mut row = self.track_row(song);
-                if let Some(name) = added_by.get(&song.id).filter(|_| song.queued) {
-                    row.by = name.as_str().into();
-                }
-                row
-            })
+            .map(|song| self.track_row(song))
             .collect();
         drop(pb);
         self.show_queue(rows, ahead);
@@ -2170,7 +2030,9 @@ impl Controller {
             }
             history.insert(0, crate::config::Played { song, at: chrono::Utc::now().timestamp() });
             history.truncate(HISTORY_LENGTH);
-            crate::config::save_history(&self.paths.history, &history);
+            if let Some((_, _, path)) = self.queue_files() {
+                crate::config::save_history(&path, &history);
+            }
         }
         self.sync_history();
         self.share_soon();
@@ -2227,12 +2089,16 @@ impl Controller {
             // device's save: see `nexus_core::handover`.)
             self.queue_moved_on();
         }
+        // Nobody's (nobody signed in yet, or the sign-in's owner not known): nothing is
+        // written or cleared, and 0.40's queue stays as it was until an account owns it (W7c
+        // item 6).
+        let Some((queue_file, place_file, _)) = self.queue_files() else { return };
         if pb.queue.is_empty() {
             // Nothing to come back to, unless the saved copy is being held on to (see `leave`).
             if !self.keep_saved_queue.get() {
                 self.queue_saved.set(0);
-                self.saver.remove(self.paths.queue.clone());
-                self.saver.remove(self.paths.queue_place.clone());
+                self.saver.remove(queue_file);
+                self.saver.remove(place_file);
             }
             return;
         }
@@ -2254,30 +2120,22 @@ impl Controller {
                 stamp,
                 source_list: pb.source_list.clone(),
             };
-            self.saver.write(self.paths.queue.clone(), move || serde_json::to_vec(&saved).ok());
+            self.saver.write(queue_file, move || serde_json::to_vec(&saved).ok());
         }
         let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_owner.taken() };
-        self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
-    }
-
-    /// [`Self::save_queue`], and **not back until it is on disk**: for the mark of a queue
-    /// handed to another device, which the next start of the app must find whatever becomes
-    /// of this run. Whether it is there (false if a write failed, or five seconds went by
-    /// first: it is then written with the next save). Linking only.
-    pub(crate) fn save_queue_surely(&self) -> bool {
-        self.save_queue();
-        self.saver.flush()
+        self.saver.write(place_file, move || serde_json::to_vec(&place).ok());
     }
 
     /// Brings back the queue from the last run, paused where it stopped.
     pub fn restore_queue(self: &Rc<Self>) {
         // Anything still on its way to disk gets there first.
         self.saver.flush();
-        let Some(mut saved) = SavedQueue::load(&self.paths.queue) else { return };
+        let Some((queue_file, place_file, _)) = self.queue_files() else { return };
+        let Some(mut saved) = SavedQueue::load(&queue_file) else { return };
         let shape =
             crate::config::queue_shape(&saved.songs, &saved.order, &saved.context, &saved.source, &saved.origins, &saved.source_list);
         // Where playback had got to, if that was noted for this same queue.
-        let place = crate::config::QueuePlace::load(&self.paths.queue_place);
+        let place = crate::config::QueuePlace::load(&place_file);
         if let Some(place) = place.filter(|place| place.shape == shape && place.cursor < saved.order.len()) {
             saved.cursor = place.cursor;
             saved.position = place.position;
@@ -2285,7 +2143,7 @@ impl Controller {
             // A queue taken up from another device is still that device's after a restart.
             // (One marked as handed on by a run in which linking existed is this PC's own
             // in a run in which it does not: `nexus_core::handover::restored`.)
-            self.queue_owner.restored(nexus_core::handover::restored(place.taken, crate::link::on()));
+            self.queue_owner.restored(nexus_core::handover::restored(place.taken, false));
         }
         self.queue_saved.set(shape);
         {
@@ -2313,7 +2171,7 @@ impl Controller {
         let stamp = if saved.stamp > 0 {
             saved.stamp
         } else {
-            std::fs::metadata(&self.paths.queue)
+            std::fs::metadata(&queue_file)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -2762,8 +2620,6 @@ impl Controller {
             }
             crate::pages::PlaySource::Albums(ids) => {
                 let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
-                // Until the songs have been looked up, this PC is busy to other devices.
-                let waiting = self.looking_up();
                 self.request(
                     move |client| {
                         let mut all = Vec::new();
@@ -2774,13 +2630,11 @@ impl Controller {
                     },
                     move |ctl, result| match result {
                         Ok(all) => {
-                            ctl.looked_up(waiting);
                             // Played from this page, though its rows aren't these songs.
                             ctl.play_from.replace(Some(PlayFrom { key, rows: Vec::new(), list: Vec::new() }));
                             ctl.play_songs(all, 0, &context, true)
                         }
                         Err(e) => {
-                            ctl.looked_up(waiting);
                             ctl.toast(e.to_string())
                         }
                     },

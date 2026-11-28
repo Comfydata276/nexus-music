@@ -20,9 +20,7 @@ mod frame;
 mod gate;
 #[cfg(windows)]
 mod instance;
-mod jam;
 mod keep;
-mod link;
 #[cfg(windows)]
 mod media;
 mod lidarr;
@@ -30,8 +28,8 @@ mod lyrics;
 mod listenbrainz;
 mod mixes;
 mod musicbrainz;
-// The Nexus server's component: installed here, after the controller, and named by nothing
-// that plays music (see its own notes).
+// The Nexus server's component, which signs in: installed here, after the controller, and
+// named by nothing that plays music (see its own notes).
 mod nexus;
 mod offline;
 mod pages;
@@ -95,11 +93,8 @@ fn main() -> Result<(), slint::PlatformError> {
     journal::install(controller.paths.crash_log.with_file_name("listening-journal"));
     #[cfg(debug_assertions)]
     journal::test_account();
-    // After the controller is made (and a saved sign-in entered), never by it; and only when
-    // it is switched on (NEXUS_MUSIC_NEXUS=1).
-    if nexus::switched_on() {
-        nexus::install(&controller.ui);
-    }
+    // After the controller is made, never by it.
+    nexus::install(&controller.ui);
     controller.ui.show()?;
     // The loop is ended explicitly (see `Controller::quit`): with a tray icon present it
     // would otherwise outlive the window.
@@ -113,9 +108,7 @@ fn main() -> Result<(), slint::PlatformError> {
     controller.saver.flush();
     journal::finish();
     diagnostics::finish(&controller);
-    // A look of the Nexus server's component still running is ended (at most two seconds).
-    if nexus::switched_on() {
-        nexus::shutdown();
-    }
+    // What the Nexus server's component still has running is ended (at most two seconds).
+    nexus::shutdown();
     Ok(())
 }

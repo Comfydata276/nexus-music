@@ -226,14 +226,6 @@ impl QueueOwner {
         self.revision.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The queue was marked as handed to another device and this PC then did not stop: it
-    /// is whose it was before the mark (`was`), and another queue again for anything
-    /// waiting to be saved.
-    pub fn handed_back(&self, was: Option<String>) {
-        *self.taken.borrow_mut() = was;
-        self.revision.fetch_add(1, Ordering::SeqCst);
-    }
-
     /// An offer of this saved queue was taken ("Continue here"), or the person did something
     /// here while it stood: it is done with, and the same one is not made again. What that
     /// device saves next is another.
@@ -824,7 +816,9 @@ impl Controller {
     fn take_history(self: &Rc<Self>, take: &Take, songs: &HashMap<String, Song>) {
         let merged = merged_history(&self.history.borrow(), take, songs);
         if let Some(history) = merged {
-            crate::config::save_history(&self.paths.history, &history);
+            if let Some((_, _, path)) = self.queue_files() {
+                crate::config::save_history(&path, &history);
+            }
             *self.history.borrow_mut() = history;
             self.sync_history();
         }

@@ -24,6 +24,10 @@ pub struct SongCache {
     dir: PathBuf,
     /// The names of the files kept, and when the folder was last read for them.
     listed: Arc<Mutex<Option<(Instant, HashSet<std::ffi::OsString>)>>>,
+    /// Whose songs these are: the account and the music server (a short hash of them, first
+    /// in each file's name), so that a song of one person's library is never played for
+    /// another whose library has a song of the same id (the review's MUST 16).
+    scope: Arc<Mutex<String>>,
 }
 
 impl SongCache {
@@ -34,7 +38,15 @@ impl SongCache {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        SongCache { dir, listed: Arc::default() }
+        SongCache { dir, listed: Arc::default(), scope: Arc::default() }
+    }
+
+    /// Whose songs are kept and looked for from now on (`who`: the person's folder, the music
+    /// server and the user). Empty: nobody's in particular (the tests).
+    pub fn scope(&self, who: &str) {
+        use sha2::{Digest, Sha256};
+        let hash: String = Sha256::digest(who.as_bytes()).iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+        *self.scope.lock().unwrap_or_else(|stuck| stuck.into_inner()) = hash;
     }
 
     /// Whether a song is kept, going by a list of the folder that's at most two seconds old.
@@ -60,7 +72,9 @@ impl SongCache {
     pub fn file(&self, song: &str, bitrate: u32, suffix: &str) -> PathBuf {
         let safe: String = song.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
         let form = if bitrate == 0 { "raw".to_string() } else { bitrate.to_string() };
-        self.dir.join(format!("{safe}.{form}.{}", if suffix.is_empty() { "bin" } else { suffix }))
+        let scope = self.scope.lock().unwrap_or_else(|stuck| stuck.into_inner()).clone();
+        let scope = if scope.is_empty() { String::new() } else { format!("{scope}-") };
+        self.dir.join(format!("{scope}{safe}.{form}.{}", if suffix.is_empty() { "bin" } else { suffix }))
     }
 
     /// Bytes kept.
@@ -317,6 +331,13 @@ mod tests {
         adopt(&streamed, &b);
         assert_eq!(fs::read(&b).unwrap(), b"audio");
         assert!(!dir.join("song-b.320.adopt").exists());
+        // Another person's, or another music server's, song of the same id is another file.
+        cache.scope("nexus-7-ab\nhttps://music.example.org\nada");
+        let theirs = cache.file("song-b", 320, "mp3");
+        assert_ne!(theirs, b);
+        assert!(!ready(&theirs));
+        cache.scope("nexus-8-cd\nhttps://music.example.org\nbob");
+        assert_ne!(cache.file("song-b", 320, "mp3"), theirs);
         cache.clear();
         assert_eq!(cache.size(), 0);
         let _ = fs::remove_dir_all(&dir);

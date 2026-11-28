@@ -7,7 +7,9 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
-use md5::{Digest, Md5};
+#[cfg(test)]
+use md5::Md5;
+use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -82,9 +84,154 @@ struct Inner {
     salt: String,
     token: String,
     /// One agent for everything, so API calls, artwork and audio share warm connections.
+    /// **Every request it sends is held to the login's gate at the moment its bytes go**
+    /// (`Gated`): a refusal recorded while a request waited, a redirect's next hop, a reopened
+    /// range: none goes once the login is set aside or Offline mode is on.
     agent: ureq::Agent,
+    gate: Arc<Gate>,
+}
+
+/// What a login may send: shared by every agent made for it (the connection measurement's
+/// included), so that a refusal anywhere stops it everywhere.
+struct Gate {
     /// Offline mode: every request fails at once instead of going out.
     offline: std::sync::atomic::AtomicBool,
+    /// The music server has refused this sign-in as a wrong name or password (design 6.3,
+    /// R10), or the machine set it aside: nothing is sent with it again. A new pair is a new
+    /// `Client`.
+    refused: std::sync::atomic::AtomicBool,
+    /// The login was replaced (another login, another account, signed out): **this client and
+    /// every clone of it send nothing more**, checked where each send is granted (W7c item 3).
+    retired: std::sync::atomic::AtomicBool,
+    /// The login's number and the generation it was handed under: what a refusal of it
+    /// carries back to the machine (the review's MUST 5).
+    handed: std::sync::Mutex<(u64, u64)>,
+    proof: Proof,
+    /// The pair, for the process's list of logins proven this run.
+    key: [u8; 32],
+}
+
+/// Until a login has been accepted once this run, **exactly one request is in flight with
+/// it**: a short authenticated `ping`, sent by whichever request needs to go first, and
+/// every other request waits for what it finds, however long that takes (bounded by the
+/// ping's own time-out). Navidrome refuses a name outright after five refusals in twenty
+/// seconds, which would shut the person's other devices out too and refuse the renewed
+/// login as well (design 6.3). Accepted (a Subsonic "ok"), every waiting request goes, and
+/// from then on nothing waits for the rest of the run (`PROVEN`). Refused, they fail unsent.
+/// Not answered, they fail unsent too, and the next request asks again. Offline mode or a
+/// refusal wakes every waiter at once. A login proven this run never waits again.
+#[derive(Default)]
+struct Proof {
+    state: std::sync::Mutex<ProofState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default, Clone)]
+struct ProofState {
+    proven: bool,
+    /// A ping is out for it now.
+    probing: bool,
+    /// Moved by every ping that came back without proving it: what waited for that one goes
+    /// unsent, with what it found.
+    round: u64,
+    found: String,
+}
+
+/// How long the ping that proves a login may take.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Logins accepted this run: they never wait again (a client made again for one, the
+/// measurement's included, starts proven).
+static PROVEN: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
+
+/// For the tests: every refusal as it is told to the controller (the client, and the number
+/// and generation taken with it).
+#[cfg(test)]
+static TOLD: std::sync::Mutex<Vec<(Client, (u64, u64))>> = std::sync::Mutex::new(Vec::new());
+
+fn pair_key(base: &str, username: &str, salt: &str, token: &str) -> [u8; 32] {
+    Sha256::digest(format!("{base}\n{username}\n{salt}\n{token}").as_bytes()).into()
+}
+
+/// The agent's connections, each held to its gate: a request whose bytes are about to go is
+/// let go only if `allow` says so then.
+mod gated {
+    use std::sync::Arc;
+    use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport};
+
+    pub type Allow = Arc<dyn Fn() -> bool + Send + Sync>;
+
+    pub struct GateConnector(pub Allow);
+
+    impl std::fmt::Debug for GateConnector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("GateConnector")
+        }
+    }
+
+    impl Connector<Box<dyn Transport>> for GateConnector {
+        type Out = Gated;
+
+        fn connect(&self, _: &ConnectionDetails, chained: Option<Box<dyn Transport>>) -> Result<Option<Gated>, ureq::Error> {
+            Ok(chained.map(|inner| Gated { inner, allow: self.0.clone() }))
+        }
+    }
+
+    pub struct Gated {
+        inner: Box<dyn Transport>,
+        allow: Allow,
+    }
+
+    impl std::fmt::Debug for Gated {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Gated")
+        }
+    }
+
+    impl Transport for Gated {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.inner.buffers()
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+            if !(self.allow)() {
+                return Err(ureq::Error::Io(std::io::Error::other(super::REFUSED)));
+            }
+            self.inner.transmit_output(amount, timeout)
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.inner.await_input(timeout)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.inner.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.inner.is_tls()
+        }
+    }
+}
+
+/// A music login's own agent: every request held to `gate`.
+fn gated_agent(gate: &Arc<Gate>) -> ureq::Agent {
+    use ureq::unversioned::transport::{Connector, DefaultConnector};
+    let held = gate.clone();
+    let allow: gated::Allow = Arc::new(move || held.open());
+    ureq::Agent::with_parts(config_following(10, Duration::from_secs(300)), DefaultConnector::new().chain(gated::GateConnector(allow)), dns::CachingResolver::default())
+}
+
+impl Gate {
+    fn open(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        !self.offline.load(SeqCst) && !self.refused.load(SeqCst) && !self.retired.load(SeqCst)
+    }
+
+    fn wake(&self) {
+        let _held = self.proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.proof.changed.notify_all();
+    }
 }
 
 #[derive(Clone)]
@@ -94,11 +241,13 @@ pub struct Client {
 
 // How a typed address is tidied, which addresses are tried for it and when plain HTTP
 // matters are the library's.
-pub use nexus_core::address::{addresses_to_try, https_only, normalize_server_url, unencrypted_beyond_home};
+pub use nexus_core::address::normalize_server_url;
 
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// An agent held to no login's gate (the tests' stand-ins; a music login's is `gated_agent`).
+#[cfg(test)]
 pub(crate) fn make_agent() -> ureq::Agent {
     agent_following(10, Duration::from_secs(300))
 }
@@ -111,14 +260,6 @@ pub(crate) fn make_public_agent(idle: Duration) -> ureq::Agent {
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
-/// Splits a call's address into where the calls are and the sign-in as a form's fields:
-/// what is before the call's own name, and the query without the answer's format.
-fn account_of(url: &str) -> (String, String) {
-    let (address, form) = url.split_once('?').unwrap_or((url, ""));
-    let rest = address.rsplit_once('/').map_or(address, |(rest, _)| rest);
-    (rest.to_string(), form.replacen("&f=json", "", 1))
-}
-
 pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
     agent_following(0, Duration::from_secs(300))
 }
@@ -311,6 +452,19 @@ mod dns {
     }
 }
 
+/// The Subsonic error for a sign-in the music server refuses: "wrong username or password".
+const WRONG_SIGN_IN: i64 = 40;
+
+/// What a request with a refused sign-in fails with, unsent.
+pub const REFUSED: &str = "Your music sign-in needs renewing.";
+
+/// Whether a stream's JSON answer is the music server refusing the sign-in.
+fn stream_refused_sign_in(text: &str) -> bool {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+    root.get("subsonic-response").and_then(|body| body.get("error")).and_then(|error| error.get("code")).and_then(|code| code.as_i64()) == Some(WRONG_SIGN_IN)
+}
+
+#[cfg(test)]
 fn random_salt() -> String {
     (0..16).map(|_| fastrand::alphanumeric()).collect()
 }
@@ -319,30 +473,187 @@ pub use nexus_core::text::encode;
 pub(crate) use dns::far_away;
 
 impl Client {
+    /// The music server's client, from the sign-in a device is handed (design 9.4): the
+    /// server's address, the name, and a salt and token made for this device. No password
+    /// is known to this app, so none is turned into a token here.
+    pub fn from_pair(server: &str, username: &str, salt: &str, token: &str) -> Client {
+        let base = normalize_server_url(server);
+        let key = pair_key(&base, username, salt, token);
+        let proof = Proof::default();
+        proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).proven = PROVEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&key);
+        let gate = Arc::new(Gate {
+            offline: std::sync::atomic::AtomicBool::new(false),
+            refused: std::sync::atomic::AtomicBool::new(false),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            handed: std::sync::Mutex::new((0, 0)),
+            proof,
+            key,
+        });
+        Client { inner: Arc::new(Inner { base, username: username.to_string(), salt: salt.to_string(), token: token.to_string(), agent: gated_agent(&gate), gate }) }
+    }
+
+    /// The number this login was handed under and its generation (`Hand::Login`).
+    pub fn handed_as(&self, handed: (u64, u64)) {
+        *self.inner.gate.handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = handed;
+    }
+
+    pub fn handed(&self) -> (u64, u64) {
+        *self.inner.gate.handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// For the tests alone: a client whose token is made from a password, as a music server's
+    /// own sign-in makes one. The app itself never holds a music-server password.
+    #[cfg(test)]
     pub fn new(server: &str, username: &str, password: &str) -> Client {
         let salt = random_salt();
         let digest = Md5::digest(format!("{password}{salt}").as_bytes());
         let token: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        Client {
-            inner: Arc::new(Inner {
-                base: normalize_server_url(server),
-                username: username.to_string(),
-                salt,
-                token,
-                agent: make_agent(),
-                offline: std::sync::atomic::AtomicBool::new(false),
-            }),
+        let client = Client::from_pair(server, username, &salt, &token);
+        // The tests' stand-in servers answer what each test asks, not a ping: their logins
+        // are taken as proven. (The proof itself is tested with `from_pair`.)
+        client.inner.gate.proof.state.lock().unwrap().proven = true;
+        client
+    }
+
+    /// Whether this is the same sign-in as `other`: the same address, name, salt and token.
+    pub fn same_pair(&self, other: &Client) -> bool {
+        let (a, b) = (&self.inner, &other.inner);
+        a.base == b.base && a.username == b.username && a.salt == b.salt && a.token == b.token
+    }
+
+    /// Whether this is the same login as `other`: the same gate, made once for it, shared by
+    /// every clone and by the connection measurement's own agent (W7c item 3: one identity
+    /// for a refusal, whichever path saw it first).
+    pub fn is(&self, other: &Client) -> bool {
+        Arc::ptr_eq(&self.inner.gate, &other.inner.gate)
+    }
+
+    /// The login was replaced: this client, its clones and anything still holding one send
+    /// nothing more, from this moment (W7c item 3). What waited wakes, and fails unsent.
+    pub fn retire(&self) {
+        self.inner.gate.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.gate.wake();
+    }
+
+    /// Whether this login was replaced (`retire`).
+    pub fn retired(&self) -> bool {
+        self.inner.gate.retired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the music server has refused this sign-in: then nothing more is sent with it.
+    pub fn refused(&self) -> bool {
+        self.inner.gate.refused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Sends nothing more with this sign-in (the shared library's rule set it aside). What
+    /// waited to go wakes, and fails unsent.
+    pub fn set_aside(&self) {
+        self.inner.gate.refused.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.gate.wake();
+    }
+
+    /// The music server said "wrong name or password" to this sign-in. The first time, the
+    /// controller is told (once, on the window's thread), so that the current sign-in can be
+    /// asked for; every request after it is refused here, unsent (design 6.3).
+    fn was_refused(&self) {
+        if !self.inner.gate.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // The number and generation are taken now, on this thread, as the refusal is
+            // seen: a same-pair hand-over before the window reads them is not taken for it.
+            let (refused, handed) = (self.clone(), self.handed());
+            #[cfg(test)]
+            TOLD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((refused.clone(), handed));
+            crate::controller::post(move |ctl| ctl.music_refused(&refused, handed));
+        }
+        // Whoever waited for the first answer learns it now.
+        self.inner.gate.wake();
+    }
+
+    /// A request of the music server's own may begin: online, not refused, and the login
+    /// accepted this run, or else proven now by one ping (`Proof`) while any other waits.
+    fn begin(&self) -> ApiResult<()> {
+        self.check_online()?;
+        let gate = &self.inner.gate;
+        let mut state = gate.proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.proven {
+            return Ok(());
+        }
+        if !state.probing {
+            state.probing = true;
+            drop(state);
+            return self.prove();
+        }
+        // Another request's ping is out: wait for what it finds, at most as long as it may
+        // take, and go only if it proved the login.
+        let round = state.round;
+        let until = std::time::Instant::now() + PROOF_TIMEOUT + Duration::from_secs(2);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= until {
+                return Err(ApiError::Network("The music server is slow to answer.".into()));
+            }
+            state = gate.proof.changed.wait_timeout(state, until - now).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+            if !gate.open() {
+                drop(state);
+                return self.check_online();
+            }
+            if state.proven {
+                return Ok(());
+            }
+            if state.round != round {
+                return Err(ApiError::Network(state.found.clone()));
+            }
         }
     }
 
-    /// In offline mode nothing is sent: requests fail straight away.
+    /// The one request in flight with a login not yet accepted: a ping. What it finds is
+    /// what everyone waiting is told.
+    fn prove(&self) -> ApiResult<()> {
+        /// Settles the proof however `prove` ends (a panic included): never left "out".
+        struct Settle<'a>(&'a Gate, Option<String>);
+        impl Drop for Settle<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.proof.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.probing = false;
+                match self.1.take() {
+                    None => {
+                        state.proven = true;
+                        let mut proven = PROVEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !proven.contains(&self.0.key) {
+                            proven.push(self.0.key);
+                        }
+                    }
+                    Some(found) => {
+                        state.round += 1;
+                        state.found = found;
+                    }
+                }
+                drop(state);
+                self.0.proof.changed.notify_all();
+            }
+        }
+        let mut settle = Settle(&self.inner.gate, Some("The music server didn't answer.".into()));
+        let answer: ApiResult<serde_json::Value> = self.call_timed_once(CLIENT_NAME, "ping", &[], None, PROOF_TIMEOUT).map(|timed| timed.value);
+        match &answer {
+            Ok(_) => settle.1 = None,
+            Err(error) => settle.1 = Some(error.to_string()),
+        }
+        drop(settle);
+        answer.map(|_| ())
+    }
+
+    /// In offline mode nothing is sent: requests fail straight away, and what waited wakes.
     pub fn set_offline(&self, offline: bool) {
-        self.inner.offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+        self.inner.gate.offline.store(offline, std::sync::atomic::Ordering::SeqCst);
+        self.inner.gate.wake();
     }
 
     fn check_online(&self) -> ApiResult<()> {
-        if self.inner.offline.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.inner.gate.offline.load(std::sync::atomic::Ordering::SeqCst) {
             Err(ApiError::Network("Offline mode is on.".into()))
+        } else if self.refused() || self.retired() {
+            // Never sent again as it was (design 6.3), nor once replaced: treated as the
+            // server out of reach, so that what is on this PC plays.
+            Err(ApiError::Network(REFUSED.into()))
         } else {
             Ok(())
         }
@@ -432,6 +743,18 @@ impl Client {
         field: Option<&str>,
         limit: Duration,
     ) -> ApiResult<Timed<T>> {
+        self.begin()?;
+        self.call_timed_once(app, endpoint, params, field, limit)
+    }
+
+    fn call_timed_once<T: DeserializeOwned + Default>(
+        &self,
+        app: &str,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        field: Option<&str>,
+        limit: Duration,
+    ) -> ApiResult<Timed<T>> {
         let url = self.url_as(app, endpoint, params);
         // A long list of song ids can outgrow what servers and proxies accept in an address,
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
@@ -453,6 +776,10 @@ impl Client {
         };
         if body.get("status").and_then(|s| s.as_str()) != Some("ok") {
             let err = body.get("error");
+            let code = err.and_then(|e| e.get("code")).and_then(|c| c.as_i64()).unwrap_or(0);
+            if code == WRONG_SIGN_IN {
+                self.was_refused();
+            }
             return Err(ApiError::Server {
                 code: err.and_then(|e| e.get("code")).and_then(|c| c.as_i64()).unwrap_or(0),
                 message: err
@@ -501,19 +828,6 @@ impl Client {
             .map_err(|e| ApiError::Network(network_hint(&e)))
     }
 
-    /// The sign-in as a look at the linking secret uses it (`nexus_core::link::look`): where
-    /// the server's calls are, and the sign-in as the fields of a form. The look sends
-    /// every call as a form POST, so neither the sign-in nor the secret is in an address.
-    pub fn link_account(&self) -> nexus_core::link::look::Account {
-        let (rest, form) = account_of(&self.url("getPlaylists", &[]));
-        nexus_core::link::look::Account { rest, form, username: self.inner.username.clone() }
-    }
-
-    /// Whether the person has put the app in offline mode: nothing is asked of the server.
-    pub fn is_offline(&self) -> bool {
-        self.check_online().is_err()
-    }
-
     /// Opens connections ahead of need, so the first clicks don't pay for setting them up.
     pub fn warm_up(&self, connections: usize) {
         std::thread::scope(|scope| {
@@ -528,14 +842,17 @@ impl Client {
     /// Times a request on a brand-new connection and one on a reused connection, in
     /// milliseconds. The gap between them is what connection reuse saves.
     pub fn measure(&self) -> ApiResult<(u128, u128)> {
+        // Nothing is measured with a login that may not send; and the measurement's own
+        // agent is held to this login's gate, so its refusal is this login's.
+        self.check_online()?;
         let fresh = Client {
             inner: Arc::new(Inner {
                 base: self.inner.base.clone(),
                 username: self.inner.username.clone(),
                 salt: self.inner.salt.clone(),
                 token: self.inner.token.clone(),
-                agent: make_agent(),
-                offline: std::sync::atomic::AtomicBool::new(false),
+                agent: gated_agent(&self.inner.gate),
+                gate: self.inner.gate.clone(),
             }),
         };
         dns::forget();
@@ -545,12 +862,6 @@ impl Client {
         let started = std::time::Instant::now();
         fresh.ping()?;
         Ok((cold, started.elapsed().as_millis()))
-    }
-
-    /// Whether anything at all answers at this address within `limit`. For trying an address
-    /// that's only a guess without waiting long on it.
-    pub fn answers_within(&self, limit: Duration) -> bool {
-        self.get(&self.url_as(CLIENT_NAME, "ping", &[]), Some(limit)).is_ok()
     }
 
     pub fn ping(&self) -> ApiResult<ServerInfo> {
@@ -924,11 +1235,29 @@ impl Client {
         Ok(all.into_iter().find(|l| !l.line.is_empty()))
     }
 
-    /// Fetches a small binary resource such as cover art.
+    /// Fetches a small binary resource such as cover art. A refused sign-in, which comes as
+    /// a success with a small JSON body, is told apart before anything is used as a picture
+    /// (design 6.3).
     pub fn fetch_bytes(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
+        if url.starts_with(&self.inner.base) {
+            self.begin()?;
+        }
+        self.fetch_bytes_once(url, limit)
+    }
+
+    fn fetch_bytes_once(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
         let mut response = self.get(url, Some(API_TIMEOUT))?;
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {}.", response.status().as_u16())));
+        }
+        let is_json = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("json"));
+        if is_json && url.starts_with(&self.inner.base) {
+            let text = response.body_mut().with_config().limit(16 * 1024).read_to_string().unwrap_or_default();
+            if stream_refused_sign_in(&text) {
+                self.was_refused();
+                return Err(ApiError::Server { code: WRONG_SIGN_IN, message: "wrong name or password".into() });
+            }
+            return Err(ApiError::Server { code: 70, message: "not a picture".into() });
         }
         response
             .body_mut()
@@ -978,7 +1307,24 @@ impl Client {
         hops: u8,
         live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>, bool)> {
-        self.check_online()?;
+        // (Only the music server's own addresses wait for, and prove, the sign-in: a radio
+        // station's stream does neither.)
+        let ours = url.starts_with(&self.inner.base);
+        if !ours {
+            self.check_online()?;
+            return self.open_stream_once(url, range, hops, live);
+        }
+        self.begin()?;
+        self.open_stream_once(url, range, hops, live)
+    }
+
+    fn open_stream_once(
+        &self,
+        url: &str,
+        range: Option<(u64, Option<u64>)>,
+        hops: u8,
+        live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
+    ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>, bool)> {
         let mut request = self.inner.agent.get(url);
         if live.is_some() {
             // Asks the station to include "now playing" announcements in the stream.
@@ -1003,17 +1349,26 @@ impl Client {
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {status}.")));
         }
-        if range.is_some_and(|(start, _)| start > 0) && status != 206 {
-            return Err(ApiError::Network("The server ignored a range request.".into()));
-        }
         let is_json = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("json"));
+        // A refusal comes as a JSON body with a success status, to a reopened range too: it
+        // is read (bounded) before anything else is made of the answer (the review's MUST 5).
         if is_json {
-            // Subsonic reports stream errors as a JSON body with HTTP 200.
+            // Subsonic reports stream errors as a JSON body with HTTP 200: among them a
+            // refused sign-in, which is never sent again (design 6.3).
+            let mut response = response;
+            let text = response.body_mut().with_config().limit(16 * 1024).read_to_string().unwrap_or_default();
+            if stream_refused_sign_in(&text) {
+                self.was_refused();
+                return Err(ApiError::Server { code: WRONG_SIGN_IN, message: "wrong name or password".into() });
+            }
             return Err(ApiError::Server { code: 70, message: "stream unavailable".into() });
+        }
+        if range.is_some_and(|(start, _)| start > 0) && status != 206 {
+            return Err(ApiError::Network("The server ignored a range request.".into()));
         }
         let kind = response
             .headers()
@@ -1253,6 +1608,140 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design 6.3: a login the music server refuses is sent once, not by every request a
+    /// cold start begins at once (Navidrome shuts a name out after five refusals in twenty
+    /// seconds). Once a login has been answered, requests go side by side.
+    #[test]
+    fn a_refused_login_is_sent_once_whatever_is_begun_at_once() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt", "token");
+        let all: Vec<_> = (0..8).map(|_| { let client = client.clone(); std::thread::spawn(move || client.ping().is_err()) }).collect();
+        assert!(all.into_iter().all(|one| one.join().unwrap()));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the refused login was sent more than once");
+        assert!(client.refused());
+        // Answered: side by side.
+        let answered = Arc::new(AtomicUsize::new(0));
+        let at_once = Arc::new(AtomicUsize::new(0));
+        let (seen, most) = (answered.clone(), at_once.clone());
+        let address = fake::server(move |_, _, stream| {
+            let now = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            seen.fetch_sub(1, Ordering::SeqCst);
+            let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt", "token");
+        assert!(client.ping().is_ok());
+        let all: Vec<_> = (0..4).map(|_| { let client = client.clone(); std::thread::spawn(move || client.ping().is_ok()) }).collect();
+        assert!(all.into_iter().all(|one| one.join().unwrap()));
+        assert!(at_once.load(Ordering::SeqCst) > 1, "answered, requests should go side by side");
+    }
+
+    /// W7c item 3: a refusal seen first by the connection measurement is the login's own:
+    /// the controller is told of a client that `is` the one in use, with the number and
+    /// generation taken when it was seen (a same-pair hand-over after it changes neither).
+    /// And a login replaced sends nothing more, from any clone of it.
+    #[test]
+    fn one_identity_for_a_refusal_and_a_replaced_login_sends_nothing() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "measured", "salt", "token");
+        client.handed_as((4, 9));
+        assert!(client.measure().is_err());
+        client.handed_as((5, 9));
+        let told: Vec<_> = TOLD.lock().unwrap().iter().filter(|(told, _)| told.username() == "measured").cloned().collect();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].0.is(&client), "the measurement's refusal is the login's own");
+        assert_eq!(told[0].1, (4, 9), "taken when the refusal was seen");
+        assert!(client.refused());
+        // A login replaced: neither it nor a clone of it sends anything more.
+        let sent = asked.load(Ordering::SeqCst);
+        let other = Client::from_pair(&address, "replaced", "salt", "token");
+        let clone = other.clone();
+        other.retire();
+        assert!(clone.ping().is_err());
+        assert!(clone.open_stream(&clone.stream_url("1", 0, 0), None).is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), sent, "a replaced login sent a request");
+        assert!(!other.is(&client));
+    }
+
+    /// The review of W7, MUST 6: the first refusal held far past the old three seconds, and
+    /// requests of every kind begun meanwhile (API calls, streams, covers, the measurement):
+    /// the music server still sees exactly one request with the unproven login. Offline
+    /// switched on wakes a waiter at once. A login proven this run never waits again, even in
+    /// a client made again for it.
+    #[test]
+    fn one_unproven_request_however_long_its_answer_takes() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(4500));
+            let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt-held", "token");
+        let mut all = Vec::new();
+        for kind in 0..9 {
+            let client = client.clone();
+            all.push(std::thread::spawn(move || match kind % 3 {
+                0 => client.ping().is_err(),
+                1 => client.open_stream(&client.stream_url("s1", 0, 0), None).is_err(),
+                _ => client.fetch_bytes(&client.cover_url("c1", 64), 1 << 20).is_err(),
+            }));
+        }
+        let measure = { let client = client.clone(); std::thread::spawn(move || client.measure().is_err()) };
+        assert!(all.into_iter().all(|one| one.join().unwrap()));
+        assert!(measure.join().unwrap());
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "more than one request went with the unproven login");
+        assert!(client.refused());
+
+        // Offline wakes a waiter at once.
+        let address = fake::server(move |_, _, stream| {
+            std::thread::sleep(Duration::from_millis(3000));
+            let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "someone", "salt-offline", "token");
+        let prover = { let client = client.clone(); std::thread::spawn(move || client.ping().is_ok()) };
+        std::thread::sleep(Duration::from_millis(200));
+        let waiter = { let client = client.clone(); std::thread::spawn(move || { let began = std::time::Instant::now(); (client.ping().is_err(), began.elapsed()) }) };
+        std::thread::sleep(Duration::from_millis(200));
+        client.set_offline(true);
+        let (failed, took) = waiter.join().unwrap();
+        assert!(failed && took < Duration::from_millis(1500), "{took:?}");
+        let _ = prover.join();
+
+        // Proven this run: a client made again for the same pair never waits.
+        let address = fake::server(move |_, _, stream| {
+            std::thread::sleep(Duration::from_millis(400));
+            let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        assert!(Client::from_pair(&address, "someone", "salt-proven", "token").ping().is_ok());
+        let again = Client::from_pair(&address, "someone", "salt-proven", "token");
+        assert!(again.inner.gate.proof.state.lock().unwrap().proven);
+    }
 
     /// Against a Navidrome of its own, never one whose playlists matter: makes a song go
     /// missing from the library while a playlist holds it, and shows that the app's way of

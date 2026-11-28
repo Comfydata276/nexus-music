@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device, Linked, LinkedDevice } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
-import { Sidebar, TopBar, QueuePanel, ConnectPanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
-import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay } from "overlays.slint";
+import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
+import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, NoticeOverlay } from "overlays.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device, Linked, LinkedDevice }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -287,7 +287,7 @@ export component MainWindow inherits Window {
             App.queue-over = false;
         }
     }
-    property <bool> queue-usable: (self.wide ? App.queue-open : App.queue-over) && !Devices.open && App.queue-tab == 0 && Player.queue.length > 0;
+    property <bool> queue-usable: (self.wide ? App.queue-open : App.queue-over) && App.queue-tab == 0 && Player.queue.length > 0;
     // The account in use, as one value: a change to it is called out after the Rust side has
     // finished publishing it.
     // (Only for the Nexus server's component, and only once it is switched on: until then
@@ -297,17 +297,10 @@ export component MainWindow inherits Window {
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }
-    // Closing the jam window gives the keyboard back to the player's shortcuts.
-    property <bool> jam-open: Jam.open;
-    changed jam-open => {
-        if !self.jam-open {
-            keys.focus();
-        }
-    }
 
     keys := FocusScope {
         key-pressed(event) => {
-            if Prompt.open || Jam.open || !App.signed-in {
+            if Prompt.open || !App.signed-in || App.show-sign-in {
                 return reject;
             }
             // A menu that's open takes the arrow keys and Enter.
@@ -491,16 +484,13 @@ export component MainWindow inherits Window {
         // Panels are placed by hand, not by a layout, so their sizes can follow the window.
         if App.signed-in: Rectangle {
             property <length> gap: Theme.gap;
-            // In a jam, a strip along the very bottom says so; the player bar sits on it.
-            property <length> strip: Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px;
-            property <length> bar: 84px + self.strip;
+            property <length> bar: 84px;
             // The top bar's height: panels start below it.
             property <length> top: 60px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
-            // The panel at the side holds the queue, or the list of devices in its place.
-            // In a window too narrow to leave the page room beside it, the panel lies over
+            // The panel at the side holds the queue. In a window too narrow to leave the page room beside it, the panel lies over
             // the page's right-hand side instead of squeezing it, and only when asked for.
-            property <bool> queue-shown: (root.wide ? App.queue-open : App.queue-over) || Devices.open;
+            property <bool> queue-shown: (root.wide ? App.queue-open : App.queue-over);
             property <length> queue: self.queue-shown ? clamp(root.width * 0.26, 280px, 360px) : 0px;
             property <bool> queue-beside: self.queue-shown && root.wide;
             property <length> body: root.height - self.bar - self.top;
@@ -559,19 +549,10 @@ export component MainWindow inherits Window {
                     if App.page == Page.lyrics: LyricsPage { }
                     if App.page == Page.now-playing: NowPlayingPage { }
                     if App.page == Page.settings: SettingsPage { }
-                    if App.page == Page.jam: JamPage { }
                 }
             }
 
-            if self.queue-shown && Devices.open: ConnectPanel {
-                x: root.width - parent.queue - parent.gap;
-                y: parent.top;
-                width: parent.queue;
-                height: parent.body;
-                over: !parent.queue-beside;
-            }
-
-            if self.queue-shown && !Devices.open: QueuePanel {
+            if self.queue-shown: QueuePanel {
                 x: root.width - parent.queue - parent.gap;
                 y: parent.top;
                 width: parent.queue;
@@ -585,16 +566,12 @@ export component MainWindow inherits Window {
                 y: root.height - parent.bar;
                 width: root.width;
             }
-
-            if self.strip > 0: JamStrip {
-                x: 0;
-                y: root.height - parent.strip;
-                width: root.width;
-                height: parent.strip;
-            }
         }
 
-        if !App.signed-in: LoginPage { }
+        // Signed in with no music login yet: a screen of its own, with the account's own
+        // actions; never the sign-in form (src/nexus/signin.rs).
+        if !App.signed-in && App.nexus-signed-in && !App.show-sign-in: NoMusicPage { }
+        if (!App.signed-in && !App.nexus-signed-in && !App.nexus-starting) || App.show-sign-in: LoginPage { }
 
         // Above everything else, including the sign-in screen: it's how the window is moved
         // and closed.
@@ -610,7 +587,7 @@ export component MainWindow inherits Window {
         }
 
         ToastOverlay {
-            y: root.height - self.height - (App.signed-in ? 100px + (Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px) : 32px);
+            y: root.height - self.height - (App.signed-in ? 100px : 32px);
         }
 
         // What's being dragged, following the pointer.
@@ -637,12 +614,12 @@ export component MainWindow inherits Window {
             }
         }
 
-        if Jam.open && App.signed-in: JamOverlay { }
-
         if Menu.open: MenuOverlay { }
 
         if Prompt.open: prompt := PromptOverlay {
             init => { self.focus-input(); }
         }
+
+        if App.nexus-notice != "": NoticeOverlay { }
     }
 }

@@ -292,14 +292,10 @@ impl Controller {
 
     /// `index` is the row in the queue panel, or -1 for the track that's playing.
     pub fn open_queue_menu(self: &Rc<Self>, index: i32, x: f32, y: f32) {
-        // Controlling playback elsewhere, the queue on show is that one, not this PC's.
-        let song = match self.remote_song(index) {
-            Some(found) => found,
-            None => {
-                let pb = self.playback.borrow();
-                let at = (pb.cursor as i64 + 1 + index as i64) as usize;
-                pb.order.get(at).and_then(|&i| pb.queue.get(i)).cloned()
-            }
+        let song = {
+            let pb = self.playback.borrow();
+            let at = (pb.cursor as i64 + 1 + index as i64) as usize;
+            pb.order.get(at).and_then(|&i| pb.queue.get(i)).cloned()
         };
         if let Some(song) = song {
             self.song_menu(song, None, (index >= 0).then_some(index as usize), x, y);
@@ -672,29 +668,24 @@ impl Controller {
         };
         match (id, &target) {
             ("play", _) => self.play_target(target, name),
-            // (Until the songs have been looked up, this PC is busy to other devices: see `link`.)
             ("play-next", _) => {
-                let waiting = self.looking_up();
                 self.with_songs_or(
                     target,
                     move |ctl, songs| {
-                        ctl.looked_up(waiting);
                         ctl.enqueue(songs, true);
                         ctl.toast("Playing next");
                     },
-                    move |ctl| ctl.looked_up(waiting),
+                    |_| {},
                 )
             }
             ("add-queue", _) => {
-                let waiting = self.looking_up();
                 self.with_songs_or(
                     target,
                     move |ctl, songs| {
-                        ctl.looked_up(waiting);
                         ctl.enqueue(songs, false);
                         ctl.toast("Added to queue");
                     },
-                    move |ctl| ctl.looked_up(waiting),
+                    |_| {},
                 )
             }
             ("pl-new", _) => self.with_songs(target, |ctl, songs| ctl.prompt_new_playlist(songs)),
@@ -1145,7 +1136,7 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if let Some(kept) = crate::link::kept_name(&name) {
+                if let Some(kept) = nexus_core::link::secret::kept_name(&name, false) {
                     // A name the app keeps for a playlist of its own.
                     return self.toast(kept);
                 }
@@ -1168,7 +1159,7 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if let Some(kept) = crate::link::kept_name(&name) {
+                if let Some(kept) = nexus_core::link::secret::kept_name(&name, false) {
                     // A name the app keeps for a playlist of its own.
                     return self.toast(kept);
                 }
@@ -1372,13 +1363,10 @@ impl Controller {
 
     fn start_radio(self: &Rc<Self>, seed: Song) {
         let id = seed.id.clone();
-        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
-        let waiting = self.looking_up();
         self.request(
             move |client| client.similar_songs(&id, 60),
             move |ctl, result| {
                 let similar = result.unwrap_or_default();
-                ctl.looked_up(waiting);
                 if similar.is_empty() {
                     ctl.toast("No similar songs found. Radio needs Last.fm set up in Navidrome.");
                     return;
@@ -1433,12 +1421,9 @@ impl Controller {
             Target::Playlist { id, .. } => Some(id.clone()),
             _ => None,
         };
-        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
-        let waiting = self.looking_up();
         self.with_songs_or(
             target,
             move |ctl, all| {
-                ctl.looked_up(waiting);
                 // A playlist plays in the order its page shows it in.
                 let rows: Vec<usize> = match &playlist {
                     Some(id) => ctl.playlist_order(id, &all),
@@ -1449,7 +1434,7 @@ impl Controller {
                 ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
                 ctl.play_songs(songs, 0, &name, true)
             },
-            move |ctl| ctl.looked_up(waiting),
+            |_| {},
         );
     }
 

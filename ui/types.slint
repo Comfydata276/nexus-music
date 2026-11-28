@@ -1,6 +1,6 @@
 // Data passed between the Rust side and the interface.
 
-export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing, jam }
+export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
 
 export enum CardKind { album, artist, playlist, genre, mix, request, outside-artist }
 
@@ -31,8 +31,6 @@ export struct Track {
     selected: bool,
     // Can't be played right now: the app is offline and the song isn't downloaded.
     unavailable: bool,
-    // In the queue of a jam hosted here: the guest who added the song. Empty otherwise.
-    by: string,
 }
 
 export struct Card {
@@ -135,19 +133,52 @@ export global App {
     in property <bool> signed-in;
     in property <string> server;
     in property <string> username;
-    // Set by the Nexus server's component when it is switched on (src/nexus.rs): only then
-    // does the window track the account for it.
+    // Set by the Nexus server's component when it is installed (src/nexus/): only then does
+    // the window track the account for it.
     in property <bool> nexus-on;
     // Called once the account in use has changed (see `account` in app.slint), for what
     // follows the account without being told by the controller: the Nexus server's
-    // component (src/nexus.rs).
+    // component (src/nexus/).
     callback account-changed();
     in property <string> server-version;
     in property <string> app-version;
-    in property <string> login-error;
+    // The sign-in screen (src/nexus/signin.rs): signing in is to the Nexus server, which
+    // hands this PC its music sign-in. The address and email last used are put back in it.
+    in property <string> nexus-address;
+    in property <string> nexus-email;
+    in-out property <string> login-error;
     in property <bool> login-busy;
-    callback sign-in(server: string, username: string, password: string);
+    callback sign-in(address: string, email: string, password: string);
+    // A first sign-in with the one-time code the admin gave, and the password chosen, typed
+    // twice: one press.
+    callback sign-in-code(address: string, code: string, password: string, again: string);
+    // The Nexus server said to come back in this many seconds: the button waits, counting.
+    in property <int> login-wait;
+    // The sign-in form was closed with nothing sent.
+    callback form-closed();
+    // Moved each time the window goes (to the tray too): what was typed into the sign-in
+    // form and not sent goes with it (W7c item 13).
+    in property <int> form-wipe;
     callback sign-out();
+    // Signed out of the Nexus server with the music still playing (its data was put back):
+    // the Account tab offers the sign-in screen, which is then shown over the app.
+    in property <bool> nexus-sign-in-wanted;
+    in-out property <bool> show-sign-in;
+    // The Nexus server's machine has not shown its first screen yet (src/nexus/signin.rs): the
+    // window shows neither the sign-in form nor the player until it has.
+    in property <bool> nexus-starting;
+    // Signed in to the Nexus server, whatever the player holds (an account whose admin has
+    // not set its music sign-in yet is signed in, with no music).
+    in property <bool> nexus-signed-in;
+    // A music login is held.
+    in property <bool> nexus-plays;
+    // What the Nexus server records, as it asks the person to be told (design 13.6): shown
+    // whole, over the window, until the person presses OK (W7c item 10). Empty: none.
+    in-out property <string> nexus-notice;
+    callback notice-seen();
+    // The music server refused the music sign-in (src/subsonic.rs): the component asks the
+    // Nexus server for the current one.
+    callback music-login-refused();
 
     in property <Page> page: Page.home;
     // The current route, e.g. "home" or "playlist:abc"; the sidebar highlights from it.
@@ -476,137 +507,6 @@ export global Prompt {
     callback dismissed();
 }
 
-// Someone who has joined a jam hosted here.
-export struct JamGuest {
-    id: string,
-    name: string,
-}
-
-// A song found in the library of the host of a jam this PC has joined.
-export struct JamSong {
-    id: string,
-    title: string,
-    // Who it's by and the album it's on.
-    about: string,
-    cover: string,
-    duration: string,
-    // What can be done with it: 1 add it to the jam's queue, 2 it's being added, 3 it's
-    // already waiting in the queue.
-    action: int,
-}
-
-// A jam: several people adding to one queue. `hosting` is one started here, where the music
-// plays; `joined` is someone else's, which the player and the queue panel then show and
-// steer in place of this PC's own queue.
-export global Jam {
-    // The window for starting or joining a jam, and for looking after one hosted here.
-    in-out property <bool> open;
-    callback opened();
-    // The name this person goes by in jams.
-    in property <string> name;
-    // A jam is being started or joined.
-    in property <bool> busy;
-    // Why the last start or join didn't work; empty if it did.
-    in property <string> problem;
-
-    // Hosting is switched on in Settings and a relay is on file.
-    in property <bool> can-host;
-    in property <bool> hosting;
-    // What friends open to join, and the same as a QR code.
-    in property <string> link;
-    in property <image> qr;
-    in property <[JamGuest]> guests;
-    // Guests may steer: pause, skip, reorder and take songs out. (They can always add.)
-    in property <bool> guests-control;
-    // Trouble reaching the relay, in words; empty when there's none.
-    in property <string> status;
-    // `name` is what's in the name box, which may have been changed.
-    callback start(name: string);
-    callback end();
-    callback remove-guest(id: string);
-    callback set-guests-control(on: bool);
-
-    in property <bool> joined;
-    // Not a jam, but the same arrangement: the player and queue are steering another of
-    // this person's own devices, the one named.
-    in property <bool> linked;
-    in property <string> device;
-    in property <string> host;
-    // Who else is there, as a sentence.
-    in property <string> with;
-    // Something the guest should know (the host's app has gone quiet); empty for nothing.
-    in property <string> notice;
-    // The host lets guests steer.
-    in property <bool> control;
-    // What's typed in the jam page's search box, and what the host's library has for it.
-    in-out property <string> query;
-    in property <bool> searched;
-    in property <[JamSong]> results;
-    callback join(link: string, name: string);
-    callback leave();
-    callback search(text: string);
-    callback add(id: string);
-}
-
-// One of the person's devices: this PC (first in the list, with an empty id) or another
-// copy of the app signed in to the same account.
-export struct Device {
-    id: string,
-    name: string,
-    // What it's doing, in a few words.
-    about: string,
-    // It's where the player on this PC is playing: this PC itself, or the device being steered.
-    active: bool,
-    // It can be picked.
-    ready: bool,
-}
-
-// The person's other devices, for moving playback between them and steering one from another.
-export global Devices {
-    // This PC is linked up: there's a relay, and it's looking for the others.
-    in property <bool> linked;
-    in property <[Device]> list;
-    // The list is showing.
-    in-out property <bool> open;
-    callback choose(id: string);
-}
-
-// One of the person's other devices, under the new linking (see src/link.rs).
-export struct LinkedDevice {
-    // Its place at the relay: what Pause is sent to.
-    place: string,
-    name: string,
-    // What it's doing, in a few words.
-    about: string,
-    playing: bool,
-    // It's the device the player on this PC is steering.
-    active: bool,
-    // It's here to be picked. Otherwise it is one seen before that isn't here just now,
-    // or one that does not speak as this PC does (`update`).
-    ready: bool,
-    // It does not speak as this PC does: which of the two to update, said under its row.
-    // Empty for every other device.
-    update: string,
-}
-
-// The new linking, where it is switched on for a test. Not shown otherwise.
-export global Linked {
-    in property <bool> on;
-    // This PC has its place in the room.
-    in property <bool> entered;
-    in property <[LinkedDevice]> list;
-    // What there is to say: what became of the last thing asked, or why nothing is linked.
-    in property <string> note;
-    // The device being steered from here, by name; empty for none.
-    in property <string> steering;
-    callback pause(place: string);
-    // A device was picked: steer it, and move what's playing here over to it. With no
-    // place: bring what the device being steered is playing back here.
-    callback choose(place: string);
-    // "Reset linking": a new secret for every device.
-    callback reset();
-}
-
 export global Toast {
     in property <bool> visible;
     in property <string> text;
@@ -624,6 +524,15 @@ export global Lyrics {
     in property <string> note;
 }
 
+// One of the person's devices, in the list under Settings, Account.
+export struct DeviceRow {
+    id: string,
+    name: string,
+    detail: string,
+    here: bool,
+    can-force-out: bool,
+}
+
 export struct QualityOption {
     title: string,
     detail: string,
@@ -636,6 +545,23 @@ export global Settings {
     // src/nexus.rs alone.
     in property <string> nexus-server;
     in property <string> nexus-for;
+    // The Nexus server, as its client says (src/nexus/signin.rs): the row ("Connected",
+    // "Not reachable since 14:02. Your music plays as usual"), who is signed in, and a
+    // sentence about the music sign-in when there is one.
+    in property <string> nexus-row;
+    in property <string> nexus-who;
+    in property <string> nexus-music;
+    // The person's devices, and forcing one out.
+    in property <[DeviceRow]> devices;
+    in property <bool> devices-busy;
+    in property <string> devices-note;
+    callback load-devices();
+    callback force-out(id: string);
+    // Changing the password.
+    in property <bool> password-busy;
+    in property <bool> password-changed;
+    in property <string> password-note;
+    callback change-password(current: string, new: string, again: string);
     in property <[QualityOption]> qualities;
     // Their names alone, for the control that chooses between them.
     in property <[string]> quality-names;
@@ -779,22 +705,9 @@ export global Settings {
     callback sign-in-requests();
     callback cancel-sign-in();
     callback sign-out-requests();
-    // Hosting jams: switched on, the relay on file ("jam.example.org", empty for none), and
-    // where the connection to it stands: "none", "checking", "connected" or "error", with
-    // the same in words.
-    in property <bool> jam-host;
-    in property <string> jam-relay;
-    in property <string> jam-state: "none";
-    in property <string> jam-status;
-    callback set-jam-host(on: bool);
-    // Linking this person's devices through the relay, and what this one is called.
-    in property <bool> link-devices;
+    // What this PC is called in the person's list of devices at the Nexus server.
     in property <string> device-name;
-    callback set-link-devices(on: bool);
     callback set-device-name(name: string);
-    // Keeps a host link (the relay's address and its key) and checks it.
-    callback save-jam-link(link: string);
-    callback check-jam();
     callback check-updates-now();
     in property <bool> nexus-records-listening;
     in property <bool> send-diagnostics: true;
