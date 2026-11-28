@@ -203,7 +203,7 @@ impl Account {
                     // Only a reload allows the maximum unrecorded interval.
                     last_accepted: session
                         .as_ref()
-                        .map(|s| s.last_used.saturating_add(USE_WRITE_MS - 1)),
+                        .map(|s| s.kind.reload_activity(s.last_used)),
                     session,
                 },
             );
@@ -610,6 +610,7 @@ pub struct SessionGrant {
     pub account: AccountId,
     pub device: DeviceId,
     pub session: SessionId,
+    pub kind: SessionKind,
     pub music_login: u64,
 }
 
@@ -717,7 +718,19 @@ impl Turn<'_> {
         fresh: FreshSession,
         previous: Option<&mut Account>,
     ) -> Result<SessionGrant, Denied> {
-        self.sign_in_checked(receipt, fresh, previous, None)
+        self.sign_in_as(SessionKind::App, receipt, fresh, previous)
+    }
+
+    /// The backend selects AdminPage only on its configured browser sign-in
+    /// path. It is never selected by a field in the app request.
+    pub fn sign_in_as(
+        self,
+        kind: SessionKind,
+        receipt: PasswordReceipt,
+        fresh: FreshSession,
+        previous: Option<&mut Account>,
+    ) -> Result<SessionGrant, Denied> {
+        self.sign_in_checked(kind, receipt, fresh, previous, None)
     }
 
     /// Spend the code apart first, then write the new verifier and the session in
@@ -729,11 +742,23 @@ impl Turn<'_> {
         fresh: FreshSession,
         previous: Option<&mut Account>,
     ) -> Result<SessionGrant, Denied> {
-        self.sign_in_checked(receipt, fresh, previous, Some(verifier))
+        self.redeem_code_as(SessionKind::App, receipt, verifier, fresh, previous)
+    }
+
+    pub fn redeem_code_as(
+        self,
+        kind: SessionKind,
+        receipt: PasswordReceipt,
+        verifier: Fingerprint,
+        fresh: FreshSession,
+        previous: Option<&mut Account>,
+    ) -> Result<SessionGrant, Denied> {
+        self.sign_in_checked(kind, receipt, fresh, previous, Some(verifier))
     }
 
     fn sign_in_checked(
         self,
+        kind: SessionKind,
         receipt: PasswordReceipt,
         fresh: FreshSession,
         previous: Option<&mut Account>,
@@ -750,7 +775,11 @@ impl Turn<'_> {
                 .state
                 .scope(&Device::new(id, fresh.hash.clone())),
         };
-        let (secret, is_new, code) = match (receipt.consume(&scope, self.now)?, verifier) {
+        let purpose = receipt.consume(&scope, self.now)?;
+        if kind == SessionKind::AdminPage && !self.account.state.admin {
+            return Err(Denied::WrongPassword);
+        }
+        let (secret, is_new, code) = match (purpose, verifier) {
             (Purpose::SignIn { secret, is_new }, None) => {
                 self.account.state.allows_session()?;
                 (secret, is_new, None)
@@ -802,6 +831,7 @@ impl Turn<'_> {
         device.end()?;
         device.session = Some(Session {
             id: fresh.id,
+            kind,
             hash: fresh.hash,
             sign_out: fresh.sign_out,
             last_used: self.now,
@@ -847,8 +877,18 @@ impl Turn<'_> {
             account: self.account.state.id,
             device: id,
             session: fresh.id,
+            kind,
             music_login: self.account.state.music_login,
         })
+    }
+
+    /// Use this when an authenticated caller asks for a music login. The
+    /// returned kind comes from the live session, never the request.
+    pub fn session_kind(self, bearer: Bearer<'_>) -> Result<SessionKind, Denied> {
+        Ok(self
+            .account
+            .session(bearer.device, bearer.hash, self.now)?
+            .kind)
     }
 
     pub fn check_leave(

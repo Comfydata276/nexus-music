@@ -887,3 +887,68 @@ fn a_new_accounts_code_expires_before_both_check_and_redemption() -> Result<(), 
     );
     Ok(())
 }
+
+#[test]
+fn admin_page_idle_is_thirty_minutes_from_last_use_even_after_reload() -> Result<(), Denied> {
+    let mut authority = state("alice@example.test");
+    authority.admin = true;
+    let mut s = Stored::new(authority);
+    let receipt = s.bind(8, 1, 0)?;
+    let browser = s.step(0, |turn| {
+        turn.sign_in_as(SessionKind::AdminPage, receipt, fresh(1), None)
+    })?;
+    assert_eq!(browser.kind, SessionKind::AdminPage);
+    s.sign_in(9, 2, 2, 0)?;
+    let last = ADMIN_PAGE_IDLE_MS - 1;
+    assert_eq!(
+        s.step(last, |turn| turn.session_kind(bearer(1, &hash(1))))?,
+        SessionKind::AdminPage
+    );
+    assert_eq!(
+        s.data
+            .devices
+            .get(&dev(1))
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .last_used,
+        last
+    );
+    s.reload();
+    assert_eq!(
+        s.read(1, 1, last + ADMIN_PAGE_IDLE_MS).err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert!(s.apart.devices.get(&dev(1)).unwrap().permit.is_none());
+    assert_eq!(
+        s.step(last + ADMIN_PAGE_IDLE_MS, |turn| turn
+            .session_kind(bearer(2, &hash(2))))?,
+        SessionKind::App
+    );
+    Ok(())
+}
+
+#[test]
+fn a_correct_non_admin_page_sign_in_has_the_same_refusal_as_a_wrong_password() -> Result<(), Denied>
+{
+    let mut s = Stored::new(state("alice@example.test"));
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    let wrong = s
+        .step(0, |turn| turn.check_sign_in(&secret, dev(1), hash(42)))?
+        .check(hash(41), clock(0, 0))
+        .err();
+    let checked = s.bind(8, 1, 0)?;
+    s.account
+        .sign_in_turn(clock(0, 0), |turn| {
+            turn.sign_in_as(SessionKind::AdminPage, checked, fresh(1), None)
+        })
+        .apply(|effects| {
+            assert!(effects.updates.is_empty());
+            Ok::<_, Denied>(())
+        })
+        .map(|answer| assert_eq!(answer.err(), wrong))?;
+    assert_eq!(wrong, Some(Denied::WrongPassword));
+    s.sign_in(8, 1, 1, 0)?;
+    Ok(())
+}

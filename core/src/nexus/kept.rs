@@ -282,9 +282,34 @@ impl Leave {
     }
 }
 
+pub const ADMIN_PAGE_IDLE_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SessionKind {
+    App,
+    AdminPage,
+}
+
+impl SessionKind {
+    pub fn idle_ms(self) -> u64 {
+        match self {
+            Self::App => SESSION_IDLE_MS,
+            Self::AdminPage => ADMIN_PAGE_IDLE_MS,
+        }
+    }
+
+    fn reload_activity(self, last_used: u64) -> u64 {
+        match self {
+            Self::App => last_used.saturating_add(USE_WRITE_MS - 1),
+            Self::AdminPage => last_used,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Session {
     pub id: SessionId,
+    pub kind: SessionKind,
     pub hash: Fingerprint,
     pub sign_out: Fingerprint,
     pub last_used: u64,
@@ -328,8 +353,10 @@ impl Device {
 
     fn expire(&mut self, now: u64) -> Result<(), Denied> {
         if self
-            .last_accepted
-            .is_some_and(|last| now.saturating_sub(last) >= SESSION_IDLE_MS)
+            .session
+            .as_ref()
+            .zip(self.last_accepted)
+            .is_some_and(|(session, last)| now.saturating_sub(last) >= session.kind.idle_ms())
         {
             self.end()?;
         }
@@ -339,7 +366,11 @@ impl Device {
     fn touch(&mut self, now: u64) -> Result<&mut Session, Denied> {
         let session = self.session.as_mut().ok_or(Denied::NotSignedIn)?;
         self.last_accepted = Some(self.last_accepted.unwrap_or(now).max(now));
-        if now.saturating_sub(session.last_used) >= USE_WRITE_MS {
+        // The design does not say how hourly persistence applies to a page's
+        // shorter idle. Persist its exact activity, with no hour of reload grace.
+        if session.kind == SessionKind::AdminPage
+            || now.saturating_sub(session.last_used) >= USE_WRITE_MS
+        {
             session.last_used = now;
         }
         Ok(session)

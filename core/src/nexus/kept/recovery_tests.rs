@@ -888,6 +888,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             assert_eq!(
                 hand_out(
                     needs_recovery.state(),
+                    SessionKind::App,
                     Some(&old_login),
                     &key,
                     &public,
@@ -896,9 +897,14 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                 MusicLoginResult::UnusableNow
             );
             let recovered = Account::load(&update.apart_first, Some(&update.data));
-            let MusicLoginResult::Login(handed) =
-                hand_out(recovered.state(), Some(login), &key, &public, salt())
-            else {
+            let MusicLoginResult::Login(handed) = hand_out(
+                recovered.state(),
+                SessionKind::App,
+                Some(login),
+                &key,
+                &public,
+                salt(),
+            ) else {
                 panic!("committed replacement should work before the last apart write");
             };
             assert_eq!(
@@ -907,7 +913,14 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             );
             let restored = Account::load(&update.apart_last, Some(&alice.data));
             assert_eq!(
-                hand_out(restored.state(), Some(&old_login), &key, &public, salt()),
+                hand_out(
+                    restored.state(),
+                    SessionKind::App,
+                    Some(&old_login),
+                    &key,
+                    &public,
+                    salt()
+                ),
                 MusicLoginResult::UnusableNow
             );
             assert_eq!(update.data.account.music_login, 2);
