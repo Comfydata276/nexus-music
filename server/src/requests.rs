@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::{Mutex, MutexGuard};
 
-use axum::Router;
+use axum::{Extension, Router};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
-use crate::accounts::{check::Checked, rows, session::Accounts, setup::random};
+use crate::accounts::{admit::Caller, rows, session::Accounts, setup::random};
 use crate::events;
 use crate::store::keeper::Keeper;
 
@@ -65,26 +65,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn read(configured: Option<String>) -> Result<Option<Self>, &'static str> {
-        let Some(address) = configured.filter(|address| !address.trim().is_empty()) else {
-            return Ok(None);
-        };
-        Self::parse(address.trim()).map(Some).ok_or("NEXUS_LIDARR is wrong")
-    }
-
-    fn parse(address: &str) -> Option<Self> {
-        if !(address.starts_with("http://") || address.starts_with("https://")) {
-            return None;
-        }
-        let origin = lidarr::origin(address).ok()?;
-        let url = Url::parse(address).ok()?;
-        if url.query().is_some() || url.fragment().is_some() || origin.port != url.port_or_known_default()? {
-            return None;
-        }
-        let written_path = address.split_once("://")?.1.split_once('/').map_or("", |(_, path)| path);
-        if !written_path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte))
-            || written_path.split('/').any(|part| part == "." || part == "..")
-            || written_path.contains("//")
+    fn new(address: admin::InternalAddress) -> Option<Self> {
+        let url = Url::parse(address.as_str()).ok()?;
+        let origin = lidarr::origin(address.as_str()).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.port_or_known_default()? != origin.port
+            || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
         {
             return None;
         }
@@ -100,7 +85,6 @@ impl Endpoint {
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             TlsConnector::from(Arc::new(config))
         });
-        let address = admin::InternalAddress::new(url.as_str().trim_end_matches('/'))?;
         Some(Self { address, url, api, tls })
     }
 
@@ -253,7 +237,8 @@ pub(crate) struct Requests {
 }
 
 impl Requests {
-    pub(crate) fn new(accounts: Arc<Accounts>, origin: Option<Arc<str>>, endpoint: Option<Endpoint>) -> Arc<Self> {
+    pub(crate) fn new(accounts: Arc<Accounts>, origin: Option<Arc<str>>) -> Arc<Self> {
+        let endpoint = accounts.lidarr.clone().and_then(Endpoint::new);
         Arc::new(Self {
             accounts,
             origin,
@@ -266,7 +251,6 @@ impl Requests {
     }
 
     pub(crate) fn router(self: &Arc<Self>, base: Router) -> Router {
-        let base = base.layer(axum::middleware::from_fn_with_state(self.clone(), admin_grant));
         base.merge(Router::new()
             .route(wire::REQUESTS, post(call))
             .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
@@ -274,76 +258,37 @@ impl Requests {
             .route(admin::SET_LIDARR, post(set_lidarr))
             .route(wire::ADMIN_ATTRIBUTION, post(attribution))
             .with_state(self.clone()))
-            .layer(axum::middleware::from_fn_with_state(self.clone(), ingress))
     }
 
-    async fn account_place(self: &Arc<Self>, path: &str, headers: &HeaderMap) -> Result<Ingress, Response<Body>> {
-        let outcome = async {
-            if crate::admin::is_browser(headers)
-                && !crate::admin::browser_origin_allowed(headers, self.origin.as_deref())
-            {
-                return Err(account::Refusal::Malformed);
-            }
-            let page = crate::admin::browser_origin_allowed(headers, self.origin.as_deref());
-            let hash = Fingerprint::of(bearer(headers)?.expose_bytes());
-            let copied = hash.clone();
-            let clock = self.accounts.clock.clone();
-            let who = events::answer(self.accounts.desk.ask(move |keeper| {
-                let (number, device) = rows::session_by_hash(keeper.data().connection(), copied.as_bytes())
-                    .map_err(events::unavailable)?.ok_or_else(ended)?;
-                let mut account = keeper.load(number).map_err(events::unavailable)?;
-                let kind = events::inspect_session(keeper, &mut account, device, &copied, clock())?;
-                let session = session_id(&account, device)?;
-                Ok((number, session, kind))
-            }).await)?;
-            if matches!(path, admin::GET_LIDARR_SETTING | admin::SET_LIDARR | admin::SET_REQUESTS_ENABLED | wire::ADMIN_ATTRIBUTION) && (!page || who.2 != SessionKind::AdminPage) {
-                return Err(account::Refusal::NotAllowed(account::NotAllowed::Denied));
-            }
-            let place = Place::ingress(self.rooms.clone(), who.0).ok_or_else(events::busy)?;
-            Ok(Ingress { hash, session: who.1, kind: who.2, page, _place: place })
-        }.await;
-        outcome.map_err(|why| events::respond(crate::accounts::session::refused(why)))
+    fn admitted(
+        &self, headers: &HeaderMap, caller: Option<Extension<Caller>>, head: &RequestHead,
+    ) -> Result<Ingress, account::Refusal> {
+        let hash = Fingerprint::of(bearer(headers)?.expose_bytes());
+        // The shared listener can withhold Caller for an unproven bearer after a
+        // put-back. Use the body's restore number to issue the expected refusal.
+        self.accounts.live(head, &hash)?;
+        let Extension(caller) = caller.ok_or_else(ended)?;
+        Ok(Ingress { hash, caller })
     }
 
     async fn shown<T: Send + 'static>(
         &self,
-        hash: Fingerprint,
+        ingress: Ingress,
         head: RequestHead,
-        expected: SessionId,
         step: impl FnOnce(&mut Keeper, Actor) -> Result<T, account::Refusal> + Send + 'static,
     ) -> Result<(T, Receipt), account::Refusal> {
-        self.accounts.live(&head, &hash)?;
+        self.accounts.live(&head, &ingress.hash)?;
         let clock = self.accounts.clock.clone();
         events::answer(self.accounts.desk.ask(move |keeper| {
             let now = clock();
-            let (_, device, account, _) = events::authenticated(keeper, &head, &hash, Access::Read, now)?;
-            if session_id(&account, device)? != expected {
-                return Err(ended());
-            }
-            let actor = Actor { account: account.state().id, session: expected, admin: account.state().admin,
+            let (_, device, account, kind) = events::authenticated(keeper, &head, &ingress.hash, Access::Read, now)?;
+            ingress.check(&account, device, kind)?;
+            let actor = Actor { account: account.state().id, session: ingress.caller.session, admin: account.state().admin,
                 restore: head.restore, now: keeper.clock(now).effective() };
             let done = step(keeper, actor)?;
             Ok((done, events::receipt(keeper, account.state())?))
         }).await)
     }
-}
-
-async fn ingress(
-    State(service): State<Arc<Requests>>,
-    mut request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response<Body> {
-    if guards(request.uri().path()) {
-        match service.account_place(request.uri().path(), request.headers()).await {
-            Ok(ingress) => { request.extensions_mut().insert(Arc::new(ingress)); }
-            Err(response) => return response,
-        }
-    }
-    next.run(request).await
-}
-
-pub(crate) fn session_ended() -> Response<Body> {
-    events::respond(crate::accounts::session::refused(ended()))
 }
 
 fn bearer(headers: &HeaderMap) -> Result<account::Session, account::Refusal> {
@@ -363,14 +308,21 @@ fn session_id(account: &Account, device: DeviceId) -> Result<SessionId, account:
     account.rows().devices.get(&device).and_then(|row| row.session.as_ref()).map(|session| session.id).ok_or_else(ended)
 }
 
-/// Held from header admission through body reading and dispatch. This is
-/// separate from the upstream worker place so polls can run during a job.
-pub(crate) struct Ingress {
+#[derive(Clone)]
+struct Ingress {
     hash: Fingerprint,
-    session: SessionId,
-    kind: SessionKind,
-    page: bool,
-    _place: Place,
+    caller: Caller,
+}
+
+impl Ingress {
+    fn check(&self, account: &Account, device: DeviceId, kind: SessionKind) -> Result<(), account::Refusal> {
+        if account.state().id != self.caller.account || device != self.caller.device
+            || session_id(account, device)? != self.caller.session || kind != self.caller.kind
+        {
+            return Err(ended());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1188,8 +1140,7 @@ fn owners(
     let releases = serde_json::to_string(releases).map_err(|_| Refusal::NotDealtWith)?;
     let mut select = db.prepare(
         "SELECT DISTINCT value,
-            (SELECT COALESCE(json_extract(CAST(metadata AS TEXT), '$.placed'), 0)
-             FROM requests_owners WHERE binding = ?2 AND release = value AND account = ?3),
+            (SELECT placed FROM requests_owners WHERE binding = ?2 AND release = value AND account = ?3),
             (SELECT account FROM requests_owners WHERE binding = ?2 AND release = value AND account <> ?3 LIMIT 1)
          FROM json_each(?1)",
     ).map_err(sql_error)?;
@@ -1267,19 +1218,28 @@ enum Dispatch {
 
 async fn call(
     State(service): State<Arc<Requests>>,
-    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    caller: Option<Extension<Caller>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    if crate::admin::is_browser(&headers) && !crate::admin::browser_origin_allowed(&headers, service.origin.as_deref()) {
+        return events::respond(crate::accounts::session::refused(account::Refusal::Malformed));
+    }
     let message = match wire::read_call(&body) {
         Ok(message) => message,
         Err(_) => return events::respond(crate::accounts::session::refused(account::Refusal::Malformed)),
     };
-    let hash = ingress.hash.clone();
     let head = message.head;
+    let ingress = match service.admitted(&headers, caller, &head) {
+        Ok(ingress) => ingress,
+        Err(why) => return events::respond(crate::accounts::session::refused(why)),
+    };
+    let Some(_place) = Place::ingress(service.rooms.clone(), ingress.caller.account.get()) else {
+        return events::respond(crate::accounts::session::refused(events::busy()));
+    };
     let for_finish = RequestHead { speaks: head.speaks, restore: head.restore };
-    let session = ingress.session;
     let state = service.clone();
-    let result = service.shown(hash.clone(), head, session, move |keeper, actor| {
+    let result = service.shown(ingress.clone(), head, move |keeper, actor| {
         Ok(state.dispatch(keeper, actor, message.call))
     }).await;
     match result {
@@ -1299,7 +1259,7 @@ async fn call(
                 for_read.ask(&lidarr).map_err(|error| wire::refusal_for(&error, None))
             }).await.unwrap_or(Err(Refusal::NotDealtWith));
             let state = service.clone();
-            match service.shown(hash, for_finish, session, move |keeper, actor| {
+            match service.shown(ingress, for_finish, move |keeper, actor| {
                 Ok((|| {
                     access(keeper, actor.account)?.check()?;
                     let db = keeper.data().connection();
@@ -1384,7 +1344,7 @@ impl Requests {
     }
 
     pub(crate) async fn start(self: &Arc<Self>) {
-        let address = self.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+        let address = self.accounts.lidarr.clone();
         let observed = self.accounts.desk.ask(move |keeper| keeper.lidarr(address.as_ref()).map(drop)).await;
         if !matches!(observed, Ok(Ok(()))) || self.endpoint.is_none() {
             return;
@@ -1601,9 +1561,8 @@ fn finish_job(
     }).map_err(|_| Refusal::NotDealtWith)
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 struct RecordedAsk {
-    #[serde(flatten)]
     asked: AskedRelease,
     placed: bool,
 }
@@ -1611,13 +1570,13 @@ struct RecordedAsk {
 fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, ask: &RecordedAsk, now: u64) -> rusqlite::Result<()> {
     let mut row = ask.clone();
     row.asked.asked_ms = now;
-    let metadata = serde_json::to_vec(&row).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let metadata = serde_json::to_vec(&row.asked)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     db.execute(
-        "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata)
-         SELECT ?1, number, ?2, ?3, ?4 FROM accounts WHERE number = ?5
-         ON CONFLICT(binding, account, release) DO UPDATE SET
-            metadata = CAST(json_set(CAST(requests_owners.metadata AS TEXT), '$.placed', json('true')) AS BLOB)
-         WHERE ?6 AND NOT COALESCE(json_extract(CAST(requests_owners.metadata AS TEXT), '$.placed'), 0)",
+        "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed)
+         SELECT ?1, number, ?2, ?3, ?4, ?6 FROM accounts WHERE number = ?5
+         ON CONFLICT(binding, account, release) DO UPDATE SET placed = 1
+         WHERE excluded.placed = 1 AND requests_owners.placed = 0",
         params![binding.as_slice(), row.asked.release.as_str(), events::sql(now)?, metadata,
             events::sql(account.get())?, row.placed],
     ).map(drop)
@@ -1774,12 +1733,26 @@ impl Job {
                 let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
                 let asked = asked_release(view)?;
                 let wanted: Offer = view.clone().into();
-                let placed = lidarr_result(lidarr.request_placement(&wanted, journal), Some(&wanted))?;
+                // A different request number may name an album already asked for.
+                // Reuse that observation only when core confirms the same live release.
+                let binding = self.plan.binding;
+                let release = wanted.album.clone();
+                let known = journal.ask(move |keeper, _, _| {
+                    keeper.data().connection().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM requests_owners WHERE binding = ?1 AND release = ?2)",
+                        params![binding.as_slice(), release], |row| row.get::<_, bool>(0),
+                    ).map_err(sql_error)
+                })?;
+                let placed = if known && matches!(confirmed_placement(lidarr, &wanted, None)?, PlacementRecovery::Listed { .. }) {
+                    false
+                } else {
+                    lidarr_result(lidarr.request_placement(&wanted, journal), Some(&wanted))?
+                };
                 Ok((Completed::Requested { placed }, vec![RecordedAsk { asked, placed }], None))
             }
             Change::AddArtist { artist } => {
                 let name = &self.plan.artist.as_ref().ok_or(Refusal::SearchAgain)?.name;
-                let added = lidarr_result(lidarr.add_artist(artist.as_str(), name, journal), None)?;
+                let added = lidarr_result(lidarr.add_artist_exact(artist.as_str(), name, journal), None)?;
                 added_artist(&added)
             }
             Change::AddWanting { artist, offers: selected } => {
@@ -1858,9 +1831,8 @@ impl Job {
         }
     }
 
-    /// CARRIED while core supplies interrupted-operation decisions. A restart
-    /// can run a job which made no writes, or verify a remote effect which may
-    /// already have happened. It must never replay an uncertain mutation.
+    /// A restart can run a job which made no writes, or verify a remote effect
+    /// that may already have happened. An uncertain mutation must never replay.
     fn recover(&self, lidarr: &Lidarr) -> Result<Changed, Refusal> {
         match &self.change {
             Change::Request { .. } => {
@@ -2192,10 +2164,6 @@ fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credent
     Ok(sealing.open(&binding, &sealed).map(|key| Credential { revision: binding.revision, key }))
 }
 
-pub(crate) fn guards(path: &str) -> bool {
-    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | admin::GET_LIDARR_SETTING | admin::SET_LIDARR | wire::ADMIN_ATTRIBUTION)
-}
-
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
     let reply = match answer {
         Ok(result) => admin::Reply::Done(result),
@@ -2211,104 +2179,19 @@ fn admin_denied() -> admin::Refusal {
     admin::Refusal::NotAllowed(admin::Denial::Denied)
 }
 
-fn send_admin_denied() -> Response<Body> {
-    admin_reply::<admin::Applied>(Err(admin_denied()))
-}
-
-fn read_admin<T>(body: Bytes, read: impl FnOnce(&[u8]) -> Result<T, account::BadMessage>) -> Result<T, admin::Refusal> {
+fn admin_input<T, E>(
+    service: &Requests, caller: Option<Extension<Caller>>, headers: &HeaderMap, body: Bytes,
+    read: impl FnOnce(&[u8]) -> Result<T, E>, head: impl FnOnce(&T) -> &RequestHead,
+) -> Result<(T, Ingress), admin::Refusal> {
     use zeroize::Zeroize;
-    let result = read(&body).map_err(|_| admin::Refusal::Malformed);
+    let request = crate::admin::browser_origin_allowed(headers, service.origin.as_deref())
+        .then(|| read(&body));
     if let Ok(mut unique) = body.try_into_mut() {
         unique.as_mut().zeroize();
     }
-    result
-}
-
-async fn admin_grant(
-    State(service): State<Arc<Requests>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response<Body> {
-    if request.uri().path() != admin::REQUEST_GRANT {
-        return next.run(request).await;
-    }
-    let (parts, body) = request.into_parts();
-    let Some(ingress) = parts.extensions.get::<Arc<Ingress>>() else { return send_admin_denied() };
-    let Ok(session) = bearer(&parts.headers) else { return send_admin_denied() };
-    let Ok(body) = axum::body::to_bytes(body, account::PASSWORD_REQUEST_MAX_BYTES).await else {
-        return admin_reply::<admin::Applied>(Err(admin::Refusal::Malformed));
-    };
-    let grant = match read_admin(body, admin::read::<admin::RequestGrant>) {
-        Ok(grant) => grant,
-        Err(reason) => return admin_reply::<admin::Applied>(Err(reason)),
-    };
-    if !matches!(&grant.change.action, admin::Action::SetRequestsEnabled(_) | admin::Action::SetLidarr(_)) {
-        return events::respond(service.accounts.admin_grant(session, grant).await);
-    }
-    if !ingress.page || ingress.kind != SessionKind::AdminPage {
-        return send_admin_denied();
-    }
-    admin_reply(requests_grant(&service, ingress.clone(), grant).await)
-}
-
-async fn requests_grant(
-    service: &Requests,
-    ingress: Arc<Ingress>,
-    request: admin::RequestGrant,
-) -> Result<admin::GrantIssued, admin::Refusal> {
-    use admin::Refusal as Why;
-
-    let account::GrantRequest { head, change, password } = request;
-    let restore = head.restore;
-    service.accounts.live(&head, &ingress.hash).map_err(admin_from_account)?;
-    let address = service.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
-    let clock = service.accounts.clock.clone();
-    let busy = || Why::Busy { retry_after_seconds: account::Wait::new(1) };
-    let (number, device, email, check, stored) = service.accounts.desk.ask(move |keeper| {
-        let now = clock();
-        let (device, mut caller) = admin_actor(keeper, &head, &ingress, now)?;
-        let intent = match &change.action {
-            admin::Action::SetRequestsEnabled(request) => {
-                let target = admin_target(keeper, &caller, request.account)?;
-                let current = keeper.requests_switch(request.account.get()).map_err(|_| Why::NotDealtWith)?;
-                change.requests_grant_intent(target.as_ref().unwrap_or(&caller).state(), current.revision)
-            }
-            admin::Action::SetLidarr(_) => {
-                let binding = current_lidarr(keeper, address.as_ref())?;
-                change.lidarr_grant_intent(&binding)
-            }
-            _ => None,
-        }.ok_or(Why::Malformed)?;
-        let number = caller.state().id.get();
-        let email = caller.state().email.clone();
-        let stored = keeper.data().password(number).map_err(|_| Why::NotDealtWith)?;
-        let expected = Fingerprint::from_bytes(stored.as_ref().map_or([0; 32], |kept| kept.hash));
-        let bearer = Bearer { device, hash: &ingress.hash, grant: None };
-        let check = caller.request(head.restore, keeper.clock(now), |turn| {
-            turn.check_leave(bearer, intent, expected)
-        }).apply(|effects| keeper.persist(effects, &[], now))
-            .map_err(|_| Why::NotDealtWith)?
-            .map_err(admin_said)?;
-        Ok((number, device, email, check, stored))
-    }).await.map_err(|_| busy())??;
-    let checked = service.accounts.workers.check(
-        &email, account::PasswordDoor::KnownDevice, Some(device), password, stored,
-    ).await.map_err(|_| busy())?;
-    let Checked::Match { derived, .. } = checked else {
-        return Err(Why::NotAllowed(admin::Denial::WrongPassword));
-    };
-    let clock = service.accounts.clock.clone();
-    service.accounts.desk.ask(move |keeper| {
-        let now = clock();
-        let receipt = check.check(derived, keeper.clock(now)).map_err(admin_said)?;
-        let mut account = keeper.load(number).map_err(|_| Why::NotDealtWith)?;
-        let grant = admin::GrantSecret::from_bytes(*random::<32>().ok_or(Why::NotDealtWith)?);
-        account.request(restore, keeper.clock(now), |turn| turn.grant_leave(receipt, &grant))
-            .apply(|effects| keeper.persist(effects, &[], now))
-            .map_err(|_| Why::NotDealtWith)?
-            .map_err(admin_said)?;
-        Ok(admin::GrantIssued { grant })
-    }).await.map_err(|_| busy())?
+    let request = request.ok_or_else(admin_denied)?.map_err(|_| admin::Refusal::Malformed)?;
+    let ingress = service.admitted(headers, caller, head(&request)).map_err(admin_from_account)?;
+    Ok((request, ingress))
 }
 
 fn admin_target(keeper: &mut Keeper, actor: &Account, target: AccountId) -> Result<Option<Account>, admin::Refusal> {
@@ -2330,14 +2213,12 @@ fn current_lidarr(
 
 async fn set_requests_enabled(
     State(service): State<Arc<Requests>>,
-    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    caller: Option<Extension<Caller>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !ingress.page || ingress.kind != SessionKind::AdminPage {
-        return send_admin_denied();
-    }
-    let request = match read_admin(body, admin::read::<admin::SetRequestsEnabled>) {
-        Ok(request) => request,
+    let (request, ingress) = match admin_input(&service, caller, &headers, body, admin::read::<admin::SetRequestsEnabled>, |ask| &ask.head) {
+        Ok(input) => input,
         Err(why) => return admin_reply::<admin::Applied>(Err(why)),
     };
     let clock = service.accounts.clock.clone();
@@ -2362,9 +2243,7 @@ async fn set_requests_enabled(
 fn admin_actor(keeper: &mut Keeper, head: &RequestHead, ingress: &Ingress, now: u64) -> Result<(DeviceId, Account), admin::Refusal> {
     let (_, device, mut actor, kind) = events::authenticated(keeper, head, &ingress.hash, Access::Read, now)
         .map_err(admin_from_account)?;
-    if session_id(&actor, device).map_err(admin_from_account)? != ingress.session || kind != SessionKind::AdminPage {
-        return Err(admin_denied());
-    }
+    ingress.check(&actor, device, kind).map_err(admin_from_account)?;
     actor.request(head.restore, keeper.clock(now), |turn| {
         turn.admin_read(Bearer { device, hash: &ingress.hash, grant: None })
     }).apply(|effects| keeper.persist(effects, &[], now))
@@ -2398,21 +2277,19 @@ fn admin_said(why: Denied) -> admin::Refusal {
 
 async fn get_lidarr(
     State(service): State<Arc<Requests>>,
-    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    caller: Option<Extension<Caller>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !ingress.page || ingress.kind != SessionKind::AdminPage {
-        return send_admin_denied();
-    }
-    let request = match read_admin(body, admin::read::<admin::GetLidarrSetting>) {
-        Ok(request) => request,
+    let (request, ingress) = match admin_input(&service, caller, &headers, body, admin::read::<admin::GetLidarrSetting>, |ask| &ask.head) {
+        Ok(input) => input,
         Err(why) => return admin_reply::<admin::LidarrSetting>(Err(why)),
     };
     let clock = service.accounts.clock.clone();
     let endpoint = service.endpoint.clone();
+    let address = service.accounts.lidarr.clone();
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        let address = endpoint.as_ref().map(|endpoint| endpoint.address.clone());
         let configured = match endpoint {
             None => false,
             Some(endpoint) => credential(keeper, &endpoint).map(|key| key.is_some())
@@ -2425,17 +2302,15 @@ async fn get_lidarr(
 
 async fn set_lidarr(
     State(service): State<Arc<Requests>>,
-    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    caller: Option<Extension<Caller>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !ingress.page || ingress.kind != SessionKind::AdminPage {
-        return send_admin_denied();
-    }
-    let request = match read_admin(body, admin::read::<admin::SetLidarr>) {
-        Ok(request) => request,
+    let (request, ingress) = match admin_input(&service, caller, &headers, body, admin::read::<admin::SetLidarr>, |ask| &ask.head) {
+        Ok(input) => input,
         Err(why) => return admin_reply::<admin::Applied>(Err(why)),
     };
-    let address = service.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+    let address = service.accounts.lidarr.clone();
     let clock = service.accounts.clock.clone();
     let finished = service.accounts.desk.ask(move |keeper| {
         let now = clock();
@@ -2461,27 +2336,25 @@ async fn set_lidarr(
 
 async fn attribution(
     State(service): State<Arc<Requests>>,
-    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    caller: Option<Extension<Caller>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !ingress.page || ingress.kind != SessionKind::AdminPage {
-        return send_admin_denied();
-    }
-    let request = match wire::read_attribution(&body) {
-        Ok(request) => request,
-        Err(_) => return admin_reply::<AttributionPage>(Err(admin::Refusal::Malformed)),
+    let (request, ingress) = match admin_input(&service, caller, &headers, body, wire::read_attribution, |ask| &ask.head) {
+        Ok(input) => input,
+        Err(why) => return admin_reply::<AttributionPage>(Err(why)),
     };
     let clock = service.accounts.clock.clone();
     let state = service.clone();
     let finished = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
         let answer = if let Some(after) = request.after {
-            lock(&state.books).attribution_next(ingress.session, after)
+            lock(&state.books).attribution_next(ingress.caller.session, after)
         } else {
             let rows = state.endpoint.as_ref().map(|endpoint| {
                 attributed_requests(keeper.data().connection(), &binding(endpoint))
             }).transpose().map_err(|_| admin::Refusal::NotDealtWith)?.unwrap_or_default();
-            lock(&state.books).attribution_first(ingress.session, rows)
+            lock(&state.books).attribution_first(ingress.caller.session, rows)
         };
         answer.map_err(|why| match why {
             Refusal::SearchAgain => admin::Refusal::NotAllowed(admin::Denial::Conflict),

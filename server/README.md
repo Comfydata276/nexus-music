@@ -4,7 +4,8 @@ One small service of our own, in one container, beside the music server. The des
 `docs/backend-design.md` on its own branch. It answers `hello` (S1), keeps its data and a
 store kept apart (S3), signs people in with an email and a password (S8), and hands each of a
 person's devices a music login made for it from the one an admin typed in (S9). The admin's
-page's other calls (S10b) are not in yet.
+page manages accounts, devices, music logins and Diagnostics (S10b). Requests for music go
+through the backend when the container has a Lidarr address and an admin installs its key (S13).
 
 ## Building and testing
 

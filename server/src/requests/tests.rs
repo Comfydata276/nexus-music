@@ -66,7 +66,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn endpoint(address: SocketAddr) -> Endpoint {
-    Endpoint::parse(&format!("http://{address}")).unwrap()
+    Endpoint::new(admin::InternalAddress::new(&format!("http://{address}")).unwrap()).unwrap()
 }
 
 #[test]
@@ -361,7 +361,7 @@ impl TestServer {
         name: &str, endpoint: Option<Endpoint>, clock: crate::accounts::session::Clock,
     ) -> (Self, [OneTimeCode; 3]) {
         let (root, keeper, codes) = fixture(name);
-        let accounts = fixture_accounts(keeper, clock);
+        let accounts = fixture_accounts(keeper, clock, endpoint.map(|endpoint| endpoint.address));
         let id = accounts.backend;
         let server = accounts.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -369,8 +369,8 @@ impl TestServer {
         let thread = thread::spawn(move || runtime().block_on(async move {
             let listener = serve::listen("127.0.0.1:0".parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            let shell = Shell::backend_with_requests(address.ip(), &crate::hello(id), server,
-                Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT, endpoint);
+            let shell = Shell::backend(address.ip(), &crate::hello(id), server,
+                Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT);
             ready.send(address).unwrap();
             let serving = tokio::spawn(serve::serve(listener, shell, false));
             let _ = stopped.await;
@@ -454,6 +454,13 @@ impl TestServer {
             account::Reply::Done { result, receipt } => Person { signed_in: result, restore: receipt.stamp.restore, headers: headers.to_owned() },
             refusal => panic!("sign-in failed: {refusal:?}"),
         }
+    }
+
+    fn admin_app(&self, page: &Person) -> Person {
+        self.sign_in(SignInCredential::Password {
+            email: page.signed_in.person.email.clone(),
+            password: Password::presented(PASSWORD).unwrap(),
+        }, 5, "")
     }
 
     fn grant(&self, who: &Person, headers: &str, action: admin::Action, number: u64) -> admin::Reply<GrantIssued> {
@@ -677,8 +684,9 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     ]));
     assert_eq!(server.post(wire::ADMIN_ATTRIBUTION, Some(&first.signed_in), TEST_PAGE, read.bytes()).0, 403);
     assert!(matches!(server.call(&first, begin(2, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
-    let cancel = begun(server.call(&admin, begin(1, cancelled())));
-    assert_eq!(server.done(&admin, cancel), Completed::Cancelled);
+    let admin_app = server.admin_app(&admin);
+    let cancel = begun(server.call(&admin_app, begin(1, cancelled())));
+    assert_eq!(server.done(&admin_app, cancel), Completed::Cancelled);
     assert!(matches!(server.call(&first, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
     assert!(!lidarr.take_calls().iter().any(|line| line == "POST command"));
 
@@ -706,6 +714,12 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     assert!(albums[0].removable);
     assert!(matches!(server.call(&other, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.is_empty()));
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, next: None } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    assert!(matches!(server.call(&other, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, next: None } if rows.is_empty()));
+    assert!(matches!(server.call(&other, begin(1, cancelled())),
+        Answer::Refused { reason: Refusal::AskedByOthers }));
     let target = &albums[0];
     let removal = Change::Cancel { album: target.id, release: target.album.clone() };
     let job = begun(server.call(&member, begin(2, removal)));
@@ -729,12 +743,14 @@ fn asking_for_an_already_monitored_album_does_not_grant_removal() {
         Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
     assert!(matches!(server.call(&member, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.len() == 1 && !albums[0].removable));
+    lidarr.take_calls();
     assert!(matches!(server.call(&member, begin(2, cancelled())),
         Answer::Refused { reason: Refusal::NotAllowed }));
     assert!(lock(&lidarr.state).monitored);
     assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ") || call.starts_with("POST ")));
-    let job = begun(server.call(&admin, begin(1, cancelled())));
-    assert_eq!(server.done(&admin, job), Completed::Cancelled);
+    let admin_app = server.admin_app(&admin);
+    let job = begun(server.call(&admin_app, begin(1, cancelled())));
+    assert_eq!(server.done(&admin_app, job), Completed::Cancelled);
 }
 
 #[test]
@@ -856,7 +872,9 @@ fn fixture(name: &str) -> (PathBuf, Keeper, [OneTimeCode; 3]) {
         (root, keeper, codes)
 }
 
-fn fixture_accounts(mut keeper: Keeper, clock: crate::accounts::session::Clock) -> Arc<Accounts> {
+fn fixture_accounts(
+    mut keeper: Keeper, clock: crate::accounts::session::Clock, lidarr: Option<admin::InternalAddress>,
+) -> Arc<Accounts> {
         let now = clock();
         let id = keeper.backend();
         let admission = Arc::new(Admission::open(&mut keeper, clock.clone()).unwrap());
@@ -864,6 +882,7 @@ fn fixture_accounts(mut keeper: Keeper, clock: crate::accounts::session::Clock) 
             workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
             set_up_code: SetUpCode::at_start(keeper.set_up(), now).0,
             admission,
+            lidarr,
             desk: Desk::open(keeper, clock.clone()).unwrap(),
             clock,
             backend: id,
@@ -885,12 +904,12 @@ fn serve_in_a_child_for_the_restart_case() {
     let address: SocketAddr = std::env::var("NEXUS_REQUESTS_TEST_LISTEN").unwrap().parse().unwrap();
     let lidarr: SocketAddr = std::env::var("NEXUS_REQUESTS_TEST_LIDARR").unwrap().parse().unwrap();
     assert!(address.ip().is_loopback() && lidarr.ip().is_loopback());
-    let accounts = fixture_accounts(reopen(&root), Arc::new(now));
+    let accounts = fixture_accounts(reopen(&root), Arc::new(now), Some(endpoint(lidarr).address));
     let id = accounts.backend;
     runtime().block_on(async {
         let listener = serve::listen(address).unwrap();
-        let shell = Shell::backend_with_requests(address.ip(), &crate::hello(id), accounts,
-            Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT, Some(endpoint(lidarr)));
+        let shell = Shell::backend(address.ip(), &crate::hello(id), accounts,
+            Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT);
         serve::serve(listener, shell, false).await;
     });
 }
@@ -1045,8 +1064,9 @@ fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
     };
     let (server, [admin, _, _]) =
         TestServer::start_with_clock("fallback-expiry", Some(endpoint(lidarr.address)), clock);
-    let admin = server.redeem(admin, 1, TEST_PAGE);
-    server.configure(&admin);
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&page);
+    let admin = server.admin_app(&page);
     let job = begun(server.call(&admin, begin(1, Change::Batch {
         singles: false,
         lines: vec![BatchLine { artist: "Quillon Vane".into(), album: String::new(), song: "First Light".into() }],
@@ -1079,6 +1099,56 @@ fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
     assert!(matches!(server.call(&admin, Call::BatchLines { job, after: None }), Answer::BatchLines { lines, .. }
         if lines.len() == 1 && lines[0].progress == BatchLineProgress::NotFound));
     assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ") || call.starts_with("POST ")));
+}
+
+#[test]
+fn sign_out_closes_an_awaiting_line_and_finishes_the_rest_of_the_batch() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("signout-fallback", Some(endpoint(lidarr.address)));
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let member = server.redeem(member, 2, "");
+    let another_device = server.sign_in(SignInCredential::Password {
+        email: member.signed_in.person.email.clone(),
+        password: Password::presented(PASSWORD).unwrap(),
+    }, 3, "");
+    let album = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let song = BatchLine { album: String::new(), ..album.clone() };
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines: vec![album, song] })));
+    let until = Instant::now() + Duration::from_secs(6);
+    loop {
+        if matches!(server.call(&member, Call::BatchLines { job, after: None }),
+            Answer::BatchLines { lines, .. } if lines[1].progress == BatchLineProgress::NeedsResolution)
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "the batch did not wait for the submitting device");
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    let sign_out = account::encode(&account::SignOut {
+        head: RequestHead { speaks: SPEAKS, restore: member.restore },
+        request_id: account::RequestId::new(1).unwrap(),
+        revoke: None,
+    }).unwrap();
+    assert_eq!(server.post(account::SIGN_OUT, Some(&member.signed_in), "", sign_out.bytes()).0, 200);
+    assert!(matches!(server.call(&another_device, Call::BatchLines { job, after: None }),
+        Answer::Refused { reason: Refusal::JobNotFound }));
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if matches!(server.call(&another_device, Call::AskedHistory { after: None }),
+            Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM)
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "the accepted line did not finish after sign-out");
+        thread::sleep(Duration::from_millis(30));
+    }
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let text: String = db.query_row("SELECT progress FROM requests_lines WHERE job = ?1 AND line = 1",
+        [row_id(job).unwrap()], |row| row.get(0)).unwrap();
+    assert_eq!(decode::<SavedLine>(text.as_bytes()).unwrap().progress, Some(BatchLineProgress::NotFound));
+    assert_eq!(lidarr.take_calls().iter().filter(|&call| call == "POST command").count(), 1);
 }
 
 #[test]
