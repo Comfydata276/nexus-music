@@ -991,6 +991,9 @@ impl Controller {
                 // closed, and what was typed into it with it (SHOULD 17).
                 let app = ctl.ui.global::<ui::App>();
                 app.set_show_sign_in(false);
+                // What was typed into the form and not sent goes too, whether the form stays
+                // made or not (W7c item 13).
+                app.set_form_wipe(app.get_form_wipe().wrapping_add(1));
                 app.invoke_form_closed();
                 if !ctl.stays_in_tray() {
                     ctl.quit();

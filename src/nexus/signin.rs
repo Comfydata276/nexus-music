@@ -486,16 +486,21 @@ fn press_on(_weak: &slint::Weak<ui::MainWindow>, press: Press) {
     tell(Happened::Pressed(press));
 }
 
-/// After a look that found the backend where the one before did not: the network is back
-/// (what was owed is asked, by the core's rule). Only a change is told (SHOULD 10).
-pub fn after_look(found: bool) {
-    static LAST: Mutex<Option<bool>> = Mutex::new(None);
-    let before = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replace(found);
-    if found && before == Some(false) {
-        tell(Happened::Network { up: true });
-    } else if !found && before == Some(true) {
-        tell(Happened::Network { up: false });
+/// After a look at the backend at `url`: found where the look before **at that same backend**
+/// did not, the network is back (what was owed is asked, by the core's rule). Only a change is
+/// told, kept per backend (SHOULD 10, W7c item 13): one backend's failure is never compared
+/// with another's success.
+pub fn after_look(url: &str, found: bool) {
+    if let Some(up) = reachability_changed(url, found) {
+        tell(Happened::Network { up });
     }
+}
+
+/// What a look at `url` changed of that backend's reachability, if anything.
+fn reachability_changed(url: &str, found: bool) -> Option<bool> {
+    static LAST: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+    let before = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new).insert(url.to_string(), found);
+    (before == Some(!found)).then_some(found)
 }
 
 /// The music server refused the login of this number, handed under this generation (the
@@ -748,16 +753,16 @@ fn perform(paths: &config::Paths, batch: Batch) -> Done {
             Do::Keep(Keep::Note(kept_note)) => keep_note(paths, &kept_note),
             Do::Forget(Forget::Note { backend_id, session }) => forget_note(paths, &backend_id, session),
             Do::Forget(Forget::UnreadableNote { index }) => {
-                let mut view = view();
-                if let Some(at) = view.unreadable.iter().position(|slot| *slot == index) {
-                    if !vault::forget(paths, &note_slot(index)) {
-                        false
-                    } else {
-                        view.unreadable.remove(at);
-                        true
-                    }
-                } else {
+                // The view is locked to look and to note, never across Credential Manager's
+                // own work (W7c item 13): this worker alone changes it.
+                let unreadable = view().unreadable.contains(&index);
+                if !unreadable {
                     true
+                } else if vault::forget(paths, &note_slot(index)) {
+                    view().unreadable.retain(|slot| *slot != index);
+                    true
+                } else {
+                    false
                 }
             }
             Do::Keep(Keep::DiagSchedule(schedule)) => match on_window_settled(epoch, move || crate::diagnostics::keep_schedule(Some(schedule))) {
@@ -898,25 +903,28 @@ fn keep_saved(paths: &config::Paths, epoch: u64, saved: Saved, cause: &Cause) ->
 fn keep_note(paths: &config::Paths, kept_note: &Note) -> bool {
     let (backend_id, session) = kept_note.key();
     let key = (backend_id.to_string(), session);
-    let mut view = view();
-    let slot = view.slots.iter().position(|slot| slot.as_ref() == Some(&key)).or_else(|| (0..NOTE_SLOTS).find(|slot| view.slots[*slot].is_none() && !view.unreadable.contains(slot)));
+    // Locked to choose the slot and to note it, never across the write (W7c item 13).
+    let slot = {
+        let view = view();
+        view.slots.iter().position(|slot| slot.as_ref() == Some(&key)).or_else(|| (0..NOTE_SLOTS).find(|slot| view.slots[*slot].is_none() && !view.unreadable.contains(slot)))
+    };
     let Some(slot) = slot else { return false };
     let Ok(text) = serde_json::to_string(kept_note) else { return false };
     if !vault::write(paths, &note_slot(slot), &text) {
         return false;
     }
-    view.slots[slot] = Some(key);
+    view().slots[slot] = Some(key);
     note(format_args!("sign-out note kept"));
     true
 }
 
 fn forget_note(paths: &config::Paths, backend_id: &str, session: u64) -> bool {
-    let mut view = view();
-    let Some(slot) = view.slots.iter().position(|slot| slot.as_ref().is_some_and(|(backend, kept)| backend == backend_id && *kept == session)) else { return true };
+    let slot = view().slots.iter().position(|slot| slot.as_ref().is_some_and(|(backend, kept)| backend == backend_id && *kept == session));
+    let Some(slot) = slot else { return true };
     if !vault::forget(paths, &note_slot(slot)) {
         return false;
     }
-    view.slots[slot] = None;
+    view().slots[slot] = None;
     note(format_args!("sign-out note forgotten"));
     true
 }
@@ -1513,6 +1521,20 @@ mod tests {
         // What followed the keep was not done.
         assert!(vault::read(&paths, DEVICE).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7c item 13: reachability is kept per backend. A down, then B found (its first look):
+    /// nothing; B down then up: B's own recovery alone is told; A found again: A's.
+    #[test]
+    fn reachability_is_kept_per_backend() {
+        let (a, b) = ("https://a.example.org/nexus/api/hello", "https://b.example.org/nexus/api/hello");
+        assert_eq!(reachability_changed(a, true), None);
+        assert_eq!(reachability_changed(a, false), Some(false));
+        assert_eq!(reachability_changed(b, true), None, "A's failure is not compared with B's success");
+        assert_eq!(reachability_changed(b, true), None);
+        assert_eq!(reachability_changed(b, false), Some(false));
+        assert_eq!(reachability_changed(b, true), Some(true));
+        assert_eq!(reachability_changed(a, true), Some(true));
     }
 
     /// W7c item 11: what the journal and Diagnostics acknowledge waits for the real result of

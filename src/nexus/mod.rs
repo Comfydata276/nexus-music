@@ -353,7 +353,7 @@ fn commit(ui: &ui::MainWindow, generation: u64, account: &str, url: &str, outcom
     note(format_args!("shown {generation} {outcome:?}"));
     schedule(ui, generation, again());
     if !sabotaged {
-        signin::after_look(outcome == Outcome::Found);
+        signin::after_look(url, outcome == Outcome::Found);
     }
 }
 

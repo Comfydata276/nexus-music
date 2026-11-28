@@ -2969,6 +2969,14 @@ export component LoginPage inherits Rectangle {
     property <string> code-in;
     property <string> again-in;
 
+    // The window went (to the tray too): what was typed and not sent goes.
+    property <int> wipe: App.form-wipe;
+    changed wipe => {
+        root.password-in = "";
+        root.code-in = "";
+        root.again-in = "";
+    }
+
     // A try answered: what was typed as a password goes.
     property <bool> busy: App.login-busy;
     changed busy => {

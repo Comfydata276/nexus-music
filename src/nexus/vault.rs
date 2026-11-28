@@ -51,6 +51,10 @@ pub enum Trouble {
 pub fn read(paths: &Paths, name: &str) -> Result<Option<Zeroizing<String>>, Trouble> {
     let Some(head) = raw::get(paths, name).map_err(|()| Trouble::Unreachable)? else { return Ok(None) };
     let head = Zeroizing::new(head);
+    // Every length the store hands back is checked before it is used (W7c item 13).
+    if head.len() > BLOB_MAX {
+        return Err(Trouble::Garbled);
+    }
     let rest = head.strip_prefix(MARK).ok_or(Trouble::Garbled)?;
     if let Some(whole) = rest.strip_prefix(WHOLE) {
         return text(whole.to_vec()).map(Some);
@@ -59,7 +63,11 @@ pub fn read(paths: &Paths, name: &str) -> Result<Option<Zeroizing<String>>, Trou
     let mut bytes = Zeroizing::new(Vec::with_capacity(parts.len));
     for index in 0..parts.count {
         match raw::get(paths, &part_name(name, &parts.generation, index)) {
-            Ok(Some(part)) => bytes.extend_from_slice(&Zeroizing::new(part)),
+            Ok(Some(part)) if part.len() <= BLOB_MAX && bytes.len() + part.len() <= parts.len => bytes.extend_from_slice(&Zeroizing::new(part)),
+            Ok(Some(part)) => {
+                drop(Zeroizing::new(part));
+                return Err(Trouble::Garbled);
+            }
             Ok(None) => return Err(Trouble::Garbled),
             Err(()) => return Err(Trouble::Unreachable),
         }
@@ -288,28 +296,45 @@ mod raw {
             // SAFETY: plain call.
             return if unsafe { GetLastError() } == ERROR_NOT_FOUND { Ok(Vec::new()) } else { Err(()) };
         }
+        /// The longest name a generic credential may have (`CRED_MAX_GENERIC_TARGET_NAME_LENGTH`).
+        const NAME_MAX: usize = 32_767;
         let mut names = Vec::new();
+        if list.is_null() {
+            // Said to have listed, and handed back nothing to read: not taken for empty.
+            return if count == 0 { Ok(Vec::new()) } else { Err(()) };
+        }
         // SAFETY: `list` holds `count` valid pointers until CredFree.
         for index in 0..count as usize {
             // SAFETY: `list` holds `count` pointers to valid CREDENTIALWs until CredFree; only
             // each one's type and name are read. Read unaligned: Wine packs them without
             // aligning (Windows aligns them), and both are read the same way.
-            let credential: CREDENTIALW = unsafe { list.add(index).read_unaligned().read_unaligned() };
+            // SAFETY: as above; a null entry is passed over.
+            let pointer = unsafe { list.add(index).read_unaligned() };
+            if pointer.is_null() {
+                continue;
+            }
+            // SAFETY: a valid CREDENTIALW until CredFree.
+            let credential: CREDENTIALW = unsafe { pointer.read_unaligned() };
             if credential.Type != CRED_TYPE_GENERIC || credential.TargetName.is_null() {
                 continue;
             }
-            // SAFETY: TargetName is a NUL-terminated wide string, read a unit at a time.
-            let wide: Vec<u16> = unsafe {
+            // SAFETY: TargetName is a NUL-terminated wide string of at most NAME_MAX units,
+            // read a unit at a time and never past that: one with no end within it is
+            // passed over whole, never read as a shorter name (W7c item 13).
+            let wide: Option<Vec<u16>> = unsafe {
                 let mut units = Vec::new();
                 loop {
+                    if units.len() > NAME_MAX {
+                        break None;
+                    }
                     let unit = credential.TargetName.add(units.len()).read_unaligned();
-                    if unit == 0 || units.len() > 32 * 1024 {
-                        break units;
+                    if unit == 0 {
+                        break Some(units);
                     }
                     units.push(unit);
                 }
             };
-            if let Ok(name) = String::from_utf16(&wide)
+            if let Some(name) = wide.and_then(|wide| String::from_utf16(&wide).ok())
                 && name.ends_with(SUFFIX)
             {
                 names.push(name);
@@ -561,6 +586,23 @@ mod tests {
         assert_eq!(other.get_password().unwrap(), "theirs");
         let _ = other.delete_credential();
         assert!(forget(&paths, "t8-nexus-sign-in"));
+    }
+
+    /// W7c item 13: a length the store hands back over one credential's limit is never used:
+    /// a head or a part that long is garbled.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_length_over_the_limit_is_never_used() {
+        let (_dir, paths) = paths();
+        let mut head = MARK.to_vec();
+        head.extend_from_slice(WHOLE);
+        head.resize(BLOB_MAX + 1, b'x');
+        std::fs::write(paths.secret_file("secret-t9-big"), &head).unwrap();
+        assert_eq!(read(&paths, "t9-big"), Err(Trouble::Garbled));
+        assert!(write(&paths, "t9-parts", &"y".repeat(2 * BLOB_MAX)));
+        let part = mine(&paths, "t9-parts").into_iter().find(|name| name.ends_with("~0")).unwrap();
+        std::fs::write(paths.secret_file(&format!("secret-{part}")), vec![b'y'; BLOB_MAX + 1]).unwrap();
+        assert_eq!(read(&paths, "t9-parts"), Err(Trouble::Garbled));
     }
 
     /// A write cut short leaves the record before, whole; its stray parts go at the sweep.
