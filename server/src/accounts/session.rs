@@ -250,13 +250,18 @@ impl Accounts {
             .desk
             .ask_in(lane, move |keeper| -> Result<Option<Prepared>, Refusal> {
                 let now = clock();
-                let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else {
-                    // 8.3: an email with no account does the same work here as one with an
-                    // account: kept's decision keeps the clock (the store kept apart written as
-                    // for any decision), so this keeps it too. Measured without it: 19 ms
-                    // against 42 ms, which told the two apart (A1).
+                // 8.3 (the review of S8, C4): an email with no account does the very same work
+                // here as one with an account, by one path: a real account is loaded in its place
+                // (the first, as a decoy), with its password, its devices and kept's check, and
+                // what kept says to keep is kept but for its rows (the decoy is not changed: only
+                // the clock is, as for any decision). Measured before (S8): an unknown email
+                // about 2.5 ms quicker, the account's load.
+                let named = keeper.account_named(asked.as_str()).map_err(not_dealt_with)?;
+                // Looked up whichever it is, so that both do the same queries.
+                let decoy = rows::first_account(keeper.data().connection()).map_err(not_dealt_with)?;
+                let Some(number) = named.or(decoy) else {
+                    // No account at all (not set up): nothing to tell apart.
                     let effects = Effects { high_water: keeper.clock(now).effective(), updates: Vec::new() };
-                    let _ = keeper.data().password(0);
                     keeper.persist(&effects, &[], now).map_err(not_dealt_with)?;
                     return Ok(None);
                 };
@@ -267,11 +272,21 @@ impl Accounts {
                 let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
                 let print = Fingerprint::of(secret_for_check.expose_bytes());
                 let found = account.rows().devices.iter().find(|(_, row)| row.secret == print).map(|(id, _)| *id);
+                let real = named.is_some();
                 let check = account
                     .sign_in_turn(keeper.clock(now), |turn| turn.check_sign_in(&secret_for_check, vacant, expected))
-                    .apply(|effects| keeper.persist(effects, &[], now))
-                    .map_err(not_dealt_with)?
-                    .map_err(said)?;
+                    .apply(|effects| {
+                        if real {
+                            keeper.persist(effects, &[], now)
+                        } else {
+                            keeper.persist(&Effects { high_water: effects.high_water, updates: Vec::new() }, &[], now)
+                        }
+                    })
+                    .map_err(not_dealt_with)?;
+                if !real {
+                    return Ok(None);
+                }
+                let check = check.map_err(said)?;
                 let device = found.unwrap_or(vacant);
                 Ok(Some(Prepared { number, email: asked, known: check.known_device_id(), check, stored, device }))
             })
