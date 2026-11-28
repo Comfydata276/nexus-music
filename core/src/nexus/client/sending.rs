@@ -360,7 +360,11 @@ impl Client {
     /// next thing that changes.
     pub(super) fn retire_life(&mut self, life: u64) {
         let Some(live) = self.live.as_mut() else { return };
-        live.flight.retain(|flight| !matches!(&flight.what, Purpose::Events { batch, .. } if batch.life() < life));
+        live.flight.retain(|flight| match &flight.what {
+            Purpose::Events { batch, .. } => batch.life() >= life,
+            Purpose::App { endpoint, life: asked, .. } if endpoint.life_bound() => *asked >= life,
+            _ => true,
+        });
         live.sending.reset();
         if live.sending.waiting.is_some_and(|waiting| waiting.life < life) {
             live.sending.waiting = None;

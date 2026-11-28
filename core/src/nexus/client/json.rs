@@ -17,6 +17,8 @@
 //! {"waits_for":{"ask":7}}          gives {"generation":N,"do":[],"waits":true|false}
 //!
 //! EVENT: {"pressed":PRESS}
+//!        {"app_post":{"request":9,"scope":SCOPE,"path":"…","body":"<the typed request as text>"}}
+//!        {"app_cancelled":{"request":9}}
 //!        {"answered":{"ask":7,"status":200,"body":"<the body as text>"}}   (or "body_bytes":[…]
 //!                                                                         when it is not UTF-8)
 //!        {"failed":{"ask":7,"failure":{"how":"connect","inside":true,"permission":false}}}
@@ -28,6 +30,7 @@
 //!        {"diagnostics_read":{"read":5,"text":"Nexus Music 0.41.0 on phone …"|null}}
 //!        {"diagnostics_switch":true|false|null}  {"diagnostics_fault":{"at_ms":…}}
 //!        {"in_use":true|false}
+//! SCOPE: The scope in the latest output app_session, without any secret.
 //! ACCOUNT: {"backend_id":"<32 hex>","account":21}
 //! LINE:    one journal line's JSON object, exactly as `events::Placed::line` wrote it (without
 //!          its LF); a line that does not read is left out of the batch
@@ -47,7 +50,10 @@
 //! `{"journal":{"resend_all":{"backend_id":"<32 hex>"}}}` ([`JournalDo`]), event ids as 32
 //! lower-case hex digits.
 //!
-//! Out: `{"generation":N,"do":[…]}`, each thing to do as [`Do`] serialises it; or
+//! A feature POST yields an ask tagged with app_request. Wait for app_result with that
+//! request after handing the answer back, and use the answer only if result is "checked".
+//! Out: `{"generation":N,"do":[…]}`, with app_session when present and each effect as
+//! [`Do`] serialises it; or
 //! `{"error":"input"}` for input this cannot read, which names no part of it and changes
 //! nothing: an envelope that is not one of these, and an answer larger than its ask allows
 //! (the ask is still waited for). **What was kept never stops a start**: a part of it that
@@ -241,6 +247,8 @@ struct NoteIn {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum EventIn {
     Pressed(PressIn),
+    AppPost { request: u64, scope: AppScopeIn, path: String, body: Typed },
+    AppCancelled { request: u64 },
     Answered {
         ask: u64,
         status: u16,
@@ -289,6 +297,30 @@ enum EventIn {
         at_ms: u64,
     },
     InUse(bool),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppScopeIn {
+    generation: u64,
+    backend: String,
+    account: u64,
+    session: u64,
+    restore: u64,
+    life: u64,
+}
+
+impl AppScopeIn {
+    fn checked(self) -> Option<AppScope> {
+        Some(AppScope {
+            generation: self.generation,
+            backend: BackendId::from_hex(&self.backend)?,
+            account: AccountId::new(self.account)?,
+            session: SessionId::new(self.session)?,
+            restore: self.restore,
+            life: self.life,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -462,6 +494,10 @@ fn event(event: EventIn) -> Result<Happened, ()> {
             PressIn::ChangePassword { current, new, again } => Press::ChangePassword { current, new, again },
             PressIn::NoticeSeen {} => Press::NoticeSeen,
         }),
+        EventIn::AppPost { request, scope, path, body } => Happened::AppPost {
+            request, scope: scope.checked().ok_or(())?, path, body,
+        },
+        EventIn::AppCancelled { request } => Happened::AppCancelled { request },
         EventIn::Answered { ask, status, body, body_bytes } => {
             let bytes = match (body, body_bytes) {
                 // Moved, not copied: the wiping buffer is handed on whole.
@@ -501,6 +537,8 @@ struct Out<'a> {
     things: &'a [Do],
     #[serde(skip_serializing_if = "Option::is_none")]
     waits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_session: Option<AppSession>,
 }
 
 fn error() -> Vec<u8> {
@@ -538,9 +576,9 @@ impl Client {
             }
             Call::WaitsFor { ask } => {
                 let waits = Some(self.waits_for(ask));
-                return serde_json::to_vec(&Out { generation: self.generation, things: &[], waits }).unwrap_or_else(|_| error());
+                return serde_json::to_vec(&Out { generation: self.generation, things: &[], waits, app_session: None }).unwrap_or_else(|_| error());
             }
         };
-        serde_json::to_vec(&Out { generation: self.generation, things: &things, waits: None }).unwrap_or_else(|_| error())
+        serde_json::to_vec(&Out { generation: self.generation, things: &things, waits: None, app_session: self.app_session() }).unwrap_or_else(|_| error())
     }
 }
