@@ -86,9 +86,11 @@ async fn listening(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) 
 
         let clock = calls.accounts.clock.clone();
         calls.accounts.desk.ask(move |keeper| {
-            // A deletion, restore, or revocation may have raced the read.
+            // Loading may finish a pending deletion. Read the change mark
+            // after that repair and before recording this session's activity.
+            let (_, device, mut account) = caller(keeper, &head, &hash)?;
             let current = keeper.data().meta().map_err(not_dealt_with)?.changes;
-            authorize(keeper, &head, &hash, clock())?;
+            live_admin(keeper, &mut account, head.restore, device, &hash, clock())?;
             if current != changes {
                 return Err(busy());
             }
