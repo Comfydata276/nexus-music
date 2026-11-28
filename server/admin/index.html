@@ -99,13 +99,13 @@ dd, li { overflow-wrap: anywhere; }
 <body>
 <main>
   <h1>Nexus Music administration</h1>
-  <form id="signin" method="post" autocomplete="off">
+  <form id="signin" method="post">
     <h2>Sign in</h2>
     <label>Email
-      <input id="email" type="text" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
+      <input id="email" name="username" autocomplete="username" type="text" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
     </label>
     <label>Password
-      <input id="password" type="password" maxlength="256" required>
+      <input id="password" name="password" autocomplete="current-password" type="password" maxlength="256" required>
     </label>
     <button id="submit" type="submit" disabled>Sign in</button>
     <noscript><p>Enable JavaScript to sign in.</p></noscript>
@@ -114,9 +114,9 @@ dd, li { overflow-wrap: anywhere; }
     <summary>Set up this server for the first time</summary>
     <p>Use the one-time setup code from the Nexus server’s log.</p>
     <form id="setup-form" method="post" autocomplete="off">
-      <label>Setup code <input id="setup-code" inputmode="text" autocomplete="off" spellcheck="false" required></label>
-      <label>Your name <input id="setup-name" maxlength="128" required></label>
-      <label>Email <input id="setup-email" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required></label>
+      <label>Setup code <input id="setup-code" inputmode="text" autocomplete="one-time-code" spellcheck="false" required></label>
+      <label>Your name <input id="setup-name" autocomplete="off" maxlength="128" required></label>
+      <label>Email <input id="setup-email" autocomplete="off" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required></label>
       <label>New password <input id="setup-password" type="password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
       <button id="setup-submit" type="submit">Create my administrator account</button>
     </form>
@@ -133,8 +133,8 @@ dd, li { overflow-wrap: anywhere; }
         <details id="new-account-details">
           <summary>Add an account</summary>
           <form id="create-form" method="post" autocomplete="off">
-            <label>Name <input id="create-name" maxlength="128" required></label>
-            <label>Email <input id="create-email" type="text" inputmode="email" autocapitalize="none"
+            <label>Name <input id="create-name" autocomplete="off" maxlength="128" required></label>
+            <label>Email <input id="create-email" autocomplete="off" type="text" inputmode="email" autocapitalize="none"
               spellcheck="false" maxlength="254" required></label>
             <button type="submit">Add account</button>
           </form>
@@ -152,7 +152,7 @@ dd, li { overflow-wrap: anywhere; }
         </dl>
         <form id="address-form" method="post" autocomplete="off" hidden>
           <label>New address people will use
-            <input id="new-address" type="url" inputmode="url" maxlength="2048" required>
+            <input id="new-address" autocomplete="off" type="url" inputmode="url" maxlength="2048" required>
           </label>
           <p>Nexus doesn’t test this address. Check it by signing in on a phone or PC.</p>
           <button type="submit">Review new address</button>
@@ -179,7 +179,7 @@ dd, li { overflow-wrap: anywhere; }
           <summary>Set up Lidarr</summary>
           <form id="lidarr-form" method="post" autocomplete="off">
             <p id="lidarr-address"></p>
-            <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="off" maxlength="512" required></label>
+            <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
             <button type="submit">Review Lidarr settings</button>
           </form>
         </details>
@@ -198,8 +198,8 @@ dd, li { overflow-wrap: anywhere; }
       <h2 id="music-login-title">Set music sign-in</h2>
       <p id="music-login-account"></p>
       <form id="music-login-form" method="post" autocomplete="off">
-        <label>Music server username <input id="music-user" autocomplete="off" maxlength="128" required></label>
-        <label>Music server password <input id="music-password" type="password" autocomplete="off" maxlength="512" required></label>
+        <label>Music server username <input id="music-user" name="music-account" autocomplete="off" maxlength="128" required></label>
+        <label>Music server password <input id="music-password" type="password" autocomplete="new-password" maxlength="512" required></label>
         <div class="dialog-actions">
           <button type="submit">Review music sign-in</button>
           <button id="music-login-cancel" type="button" class="secondary">Cancel</button>
@@ -222,7 +222,9 @@ dd, li { overflow-wrap: anywhere; }
     </dialog>
     <dialog id="new-code" aria-labelledby="code-title">
       <h2 id="code-title">One-time sign-in code</h2>
-      <p>Pass this code to the person privately. They’ll use it to choose a password. You can see it here just once.</p>
+      <p id="code-person"></p>
+      <p>Pass this code to them privately. They open the Nexus Music app, choose “I have a code” on the sign-in screen, enter their email and this code, then choose a password.</p>
+      <p>The code works once and expires in 7 days. You can see it here just once.</p>
       <p id="code-value"></p>
       <button id="code-done" type="button">Done</button>
     </dialog>
@@ -268,6 +270,7 @@ dd, li { overflow-wrap: anywhere; }
   const grantLabel = byId("grant-label");
   const codeDialog = byId("new-code");
   const codeValue = byId("code-value");
+  const codePerson = byId("code-person");
   const loginDialog = byId("music-login");
   const createForm = byId("create-form");
   const addressForm = byId("address-form");
@@ -613,7 +616,7 @@ dd, li { overflow-wrap: anywhere; }
       makeButton("Set music sign-in", () => openLogin(account, person)),
       makeButton("Reset password", () => reviewChange("reset-password", { account }, account, "Reset password",
         "Reset the password for " + person + ". They’ll need the new code to sign in again.",
-        { code: true, saved: "Password reset.", refresh: "accounts" })),
+        { codeFor: person, saved: "Password reset.", refresh: "accounts" })),
     );
     if (!own) {
       const admin = !row.admin;
@@ -737,10 +740,11 @@ dd, li { overflow-wrap: anywhere; }
 
   function clearCode() {
     writeText(codeValue, "");
+    writeText(codePerson, "");
     if (codeDialog.open) codeDialog.close();
   }
 
-  function showCode(code) {
+  function showCode(code, person) {
     if (code === "already_shown") {
       message("That code was already shown. Reset the password if the person needs a new code.", true);
       return;
@@ -748,6 +752,7 @@ dd, li { overflow-wrap: anywhere; }
     if (typeof code?.issued !== "string" || !/^[0-9A-HJKMNP-TV-Z]{12}$/.test(code.issued)) {
       throw new Error();
     }
+    writeText(codePerson, "Code for " + person);
     writeText(codeValue, code.issued);
     codeDialog.showModal();
     byId("code-done").focus();
@@ -808,8 +813,8 @@ dd, li { overflow-wrap: anywhere; }
         request_id, change: proposed.change, grant: issued.grant,
       }, 4096);
       if (session !== current) return;
-      message(proposed.options.saved, !proposed.options.code);
-      if (proposed.options.code) showCode(saved.code);
+      message(proposed.options.saved, !proposed.options.codeFor);
+      if (proposed.options.codeFor) showCode(saved.code, proposed.options.codeFor);
       if (proposed.options.done) proposed.options.done();
       refreshAfter(current, proposed.options.refresh);
     } catch (error) {
@@ -853,7 +858,7 @@ dd, li { overflow-wrap: anywhere; }
     }
     reviewChange("create-account", { name, email }, email, "Add account",
       "Add " + name + " (" + email + "). They’ll be able to request music.",
-      { code: true, saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
+      { codeFor: name + " (" + email + ")", saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
   });
 
   function addressInput(value) {
