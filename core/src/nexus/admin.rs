@@ -249,14 +249,22 @@ object! { GetMusicServer { head: RequestHead } }
 object! { MusicServer { internal: InternalAddress, public: Option<MusicAddress> } }
 object! { GetDiagnosticsDefault { head: RequestHead } }
 object! { GetLidarrSetting { head: RequestHead } }
-object! {
-    /// The configured container address and whether its current key is usable.
-    LidarrSetting { address: Option<InternalAddress>, configured: bool }
-    check(value) {
-        if value.configured && value.address.is_none() {
+/// The configured container address and whether its current key is usable.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct LidarrSetting {
+    pub address: Option<InternalAddress>,
+    pub configured: bool,
+}
+
+impl wire::Value for LidarrSetting {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let address: Option<InternalAddress> = fields.get("address")?;
+        let configured = fields.get("configured")?;
+        if configured && address.is_none() {
             return Err(BadMessage::Form);
         }
-        Ok(())
+        Ok(Self { address, configured })
     }
 }
 object! { DiagnosticsDefault { enabled: bool } }
