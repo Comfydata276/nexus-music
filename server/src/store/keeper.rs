@@ -895,6 +895,7 @@ impl Keeper {
     /// so that a restart finds the same clock the running backend had.
     pub fn heard(&mut self, device: u64, now: u64) -> Result<(), Failed> {
         self.heal()?;
+        self.flush_clock()?;
         match self.data.apply(&[Change::Heard { device, at: now }], self.store.high_water) {
             Ok(changes) => self.changes = changes,
             Err(error) => return Err(Failed(data_failed(&error))),
@@ -912,6 +913,7 @@ impl Keeper {
     /// here: that is `persist`'s, store first.
     pub fn write_data<T>(&mut self, now: u64, step: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, bool)>) -> Result<T, Failed> {
         self.heal()?;
+        self.flush_clock()?;
         let (value, changed) = self.data.apply_with(self.store.high_water, step).map_err(|error| Failed(data_failed(&error)))?;
         if let Some(changes) = changed {
             self.changes = changes;
@@ -962,6 +964,19 @@ impl Keeper {
         let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
         if self.changes > self.store.mark && due {
             self.write_mark(now)?;
+        }
+        Ok(())
+    }
+
+    /// Before a step that changes a row and is no decision (a device heard from, another
+    /// slice's rows): the latest time acted at goes to the store first if the running backend
+    /// is ahead of it (the review of S3b, 7: every step that changes a row carries the clock,
+    /// store first). The step itself is written at that time; what it observed (when a device
+    /// was heard from) is its own.
+    fn flush_clock(&mut self) -> Result<(), Failed> {
+        if self.high_water > self.store.high_water {
+            let next = self.store.clone();
+            self.write_store(next)?;
         }
         Ok(())
     }

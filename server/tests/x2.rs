@@ -1830,3 +1830,30 @@ fn exactly_one_verifier_for_a_change_and_only_the_live_code_for_a_reset() {
     assert!(stored_code(&keeper, BOB, 46).is_some());
     keeper.close();
 }
+
+/// The review of S3b, 7: a step that changes a row carries the clock to the store first,
+/// though a decision that changed none moved the running clock by less than a minute.
+#[test]
+fn a_row_written_carries_the_running_clock_to_the_store_first() {
+    let root = Root::new("row-clock");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    // (A start's clock is the store's plus a minute: a first row written brings them level.)
+    keeper.heard(ids.a1, T0 + 2 * MINUTE).unwrap();
+    let stored = store_of(&root).high_water;
+    assert_eq!(stored, keeper.clock(0).effective());
+    // A decision with no row to change, half a minute on from the store's clock: not written.
+    let at = keeper.clock(0).effective() + MINUTE / 2;
+    let held = fp(5);
+    let _ = decide(&mut keeper, BOB, at, &[], |turn| turn.arrive(bearer(ids.b1, &held), Access::Read).map(|_| ())).unwrap();
+    assert_eq!(store_of(&root).high_water, stored, "a decision with no row wrote the clock before its minute");
+    let running = keeper.clock(0).effective();
+    assert!(running >= at);
+    // A device heard from at a time of its own: the running clock reaches the store first.
+    keeper.heard(ids.b1, T0 + 3 * MINUTE).unwrap();
+    assert_eq!(store_of(&root).high_water, running);
+    let written = keeper.data().meta().unwrap().written_at;
+    assert!(written <= running, "{written} > {running}");
+    assert_eq!(last_heard(&keeper, ids.b1), Some(T0 + 3 * MINUTE), "the observation's own time is kept");
+    keeper.close();
+}
