@@ -112,6 +112,13 @@ fn spend<T: admin::Change>(
     let state = change.action.target_account().map(|_| other.as_ref().unwrap_or(&actor).state());
     let intent = change.grant_intent(state).ok_or(Refusal::Malformed)?;
     let LeaveFor::Admin { action, target: named } = intent.change else { return Err(Refusal::Malformed) };
+    // We already proved the actor is an enabled administrator in this writer
+    // turn. These changes cannot leave zero enabled admins if the actor stays one.
+    if other.is_none()
+        && matches!(action, AdminAction::SetOn(false) | AdminAction::DeleteAccount | AdminAction::SetAdmin(false))
+    {
+        return Err(Refusal::NotAllowed(Denial::Denied));
+    }
     let forced = match &action {
         AdminAction::ForceOut(target) => Some(target.device),
         _ => None,

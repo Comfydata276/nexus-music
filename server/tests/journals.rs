@@ -903,3 +903,40 @@ fn admin_devices_show_live_page_sessions_and_omit_forced_out_or_idle_pages() {
     assert_eq!(remaining.rows().iter().find(|row| row.page).unwrap().session, Some(fresh.session_id));
     assert!(remaining.rows().iter().any(|row| row.device == app.device && !row.page));
 }
+
+#[test]
+fn a_page_cannot_spend_a_grant_that_locks_out_its_own_administrator() {
+    let mut fixture = Fixture::new("protect-own-admin");
+    let code = fixture.set_up();
+    fixture.start_with_clock();
+    let (admin, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+    let account = admin.person.id.get();
+    let restore = stamp.restore;
+    let off = format!(r#"{{"account":{account},"enabled":false}}"#);
+    let demote = format!(r#"{{"account":{account},"admin":false}}"#);
+    let remove = format!(r#"{{"account":{account}}}"#);
+    let remove_target = account.to_string();
+    for (id, (action, target, change)) in [
+        ("set_account_enabled", off.as_str(), off.as_str()),
+        ("delete_account", remove_target.as_str(), remove.as_str()),
+        ("set_admin", demote.as_str(), demote.as_str()),
+    ].into_iter().enumerate() {
+        let request_id = id + 1;
+        let request = format!(
+            r#"{{"head":{{"speaks":[1,1],"restore":{restore}}},"change":{{"request_id":{request_id},"action":{{"{action}":{target}}}}},"password":"{PASSWORD}"}}"#,
+        );
+        let (status, grant) = fixture.post_with(nexus_core::nexus::admin::REQUEST_GRANT, Some(&admin), BROWSER, request.as_bytes());
+        assert_eq!(status, 200, "grant issued for the spend test");
+        let grant = json::<String>(&grant, "$.done.grant");
+        let path = format!("/nexus/api/admin/{}", action.replace('_', "-"));
+        let request = format!(
+            r#"{{"head":{{"speaks":[1,1],"restore":{restore}}},"request_id":{request_id},"grant":"{grant}","change":{change}}}"#,
+        );
+        let (status, refusal) = fixture.post_with(&path, Some(&admin), BROWSER, request.as_bytes());
+        assert_eq!(status, 403);
+        assert_eq!(json::<String>(&refusal, "$.refused.not_allowed"), "denied");
+    }
+    let (again, _) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    assert_eq!(again.person.id, admin.person.id);
+    assert!(again.person.admin);
+}
