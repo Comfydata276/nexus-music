@@ -797,5 +797,7 @@ export global Settings {
     callback check-jam();
     callback check-updates-now();
     callback save-diagnostics();
+    callback preview-diagnostics();
+    in-out property <string> diagnostics-preview;
     callback install-update();
 }

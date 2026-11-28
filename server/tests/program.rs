@@ -166,6 +166,30 @@ fn it_serves_its_id_kept_across_starts_and_says_it_is_healthy() {
 }
 
 #[test]
+fn the_health_check_opens_the_store_kept_apart_and_the_data() {
+    // 19.4: the container's own check opens both; hello answering is not enough.
+    let folders = Folders::new("stores");
+    let settings = settings_with_proxy(&folders, free_port(), "127.0.0.1");
+    let child = serve(&settings);
+    healthy(&settings);
+    let kept = std::fs::read(folders.state().join("kept")).unwrap();
+    let mut damaged = kept.clone();
+    damaged[10] ^= 1;
+    std::fs::write(folders.state().join("kept"), &damaged).unwrap();
+    let output = health(&settings);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("store kept apart can't be read"), "{}", String::from_utf8_lossy(&output.stderr));
+    std::fs::write(folders.state().join("kept"), &kept).unwrap();
+    healthy(&settings);
+    std::fs::rename(folders.data().join("nexus.db"), folders.data().join("elsewhere.db")).unwrap();
+    let output = health(&settings);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("data"), "{}", String::from_utf8_lossy(&output.stderr));
+    std::fs::rename(folders.data().join("elsewhere.db"), folders.data().join("nexus.db")).unwrap();
+    stop(child);
+}
+
+#[test]
 fn two_started_at_once_on_one_backends_folders_one_serves_and_the_other_says_so_and_stops() {
     // Design 13.4: one thread writes. A second program on the same folders (from the first
     // slice on, two served one id; from S3, the data must have one writer) is refused before

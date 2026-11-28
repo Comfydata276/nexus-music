@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use super::account::DeviceId;
 use super::kept::{Apart, ApartDevice, Rows, Startup, Status, StoreComparison, at_start};
 
 /// The one change the store has been told of first and the data may not yet have: written
@@ -147,14 +148,14 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
             if device.number > record.number {
                 return Found::stop(Contradiction::DeviceAhead);
             }
-            if device.session.as_ref().is_some_and(|session| session.id > record.last_session) {
+            if device.session.as_ref().is_some_and(|session| session.id.get() > record.last_session) {
                 return Found::stop(Contradiction::SessionNeverReserved);
             }
             if device.number < record.number {
                 if cut { ending = true } else { older = true }
                 continue;
             }
-            match (&device.session, record.permit) {
+            match (&device.session, &record.permit) {
                 (None, None) => {}
                 (Some(session), Some(permit)) if session.id == permit.id && session.leave == permit.leave => {}
                 // What the store still permits is never missing from data its own age:
@@ -164,7 +165,7 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
                 // A session, or leave, given in the data and not yet recognized in the store;
                 // or one the store has ended and the data not yet.
                 (Some(session), permit) => {
-                    let given = permit.is_none() && session.id == record.last_session || permit.is_some_and(|p| p.id == session.id && session.leave.is_some());
+                    let given = permit.is_none() && session.id.get() == record.last_session || permit.as_ref().is_some_and(|p| p.id == session.id && session.leave.is_some());
                     if given { grant = true } else { ending = true }
                 }
             }
@@ -301,28 +302,32 @@ pub fn needs_taking(store: Option<&StoreView>, data: &DataView) -> bool {
 ///   away stays away; each count at the higher of the two (so a password changed since, or a
 ///   life moved on, fences the data's as `kept` loads it); a device's numbers at the higher.
 ///
-/// Every session ends anyway (the restore that follows): no permit is kept.
+/// Every session ends anyway (the restore that follows): no permit is kept, and no device
+/// is known again until it signs in (a force-out the store took is kept with it).
 ///
-/// (Kept's to take: asked of C3r as `RestoreMode::Adopt` deciding this itself. Until then it
-/// is here, in core, and the server only carries it out.)
+/// The restore that follows is `kept::Account::restore(.., RestoreMode::Adopt, ..)`, which
+/// itself makes every account wait for a new code (the final `kept`). What is here is the
+/// baseline it starts from; the count of passwords moved on with no authority is the stricter
+/// fence carried until C3r's follow-up round (`t3/nexus-core-fu`) lands.
 pub fn recovery_baseline(rows: &Rows, authority: Option<&Apart>) -> Apart {
     let mut account = rows.account.clone();
-    let device = |id: &u64, row: &super::kept::DeviceRow| {
+    let device = |id: &DeviceId, row: &super::kept::DeviceRow| {
         let session = row.session.as_ref();
         let record = ApartDevice {
             number: row.number,
-            last_session: session.map_or(0, |session| session.id),
-            last_leave: session.and_then(|session| session.leave).map_or(0, |leave| leave.fields().3),
+            known: false,
+            last_session: session.map_or(0, |session| session.id.get()),
+            last_leave: session.and_then(|session| session.leave.as_ref()).map_or(0, |leave| leave.fields().5),
             permit: None,
         };
         (*id, record)
     };
-    let mut devices: std::collections::BTreeMap<u64, ApartDevice> = rows.devices.iter().map(|(id, row)| device(id, row)).collect();
+    let mut devices: std::collections::BTreeMap<DeviceId, ApartDevice> = rows.devices.iter().map(|(id, row)| device(id, row)).collect();
     match authority {
         None => {
             account.password_changes = account.password_changes.saturating_add(1);
             account.password_reset_required = true;
-            account.code_available = false;
+            account.code = None;
         }
         Some(kept) => {
             let was = &kept.account;
@@ -338,10 +343,12 @@ pub fn recovery_baseline(rows: &Rows, authority: Option<&Apart>) -> Apart {
             account.music_login = account.music_login.max(was.music_login);
             account.music_recovery = account.music_recovery.or(was.music_recovery);
             account.password_reset_required |= was.password_reset_required;
-            account.code_available &= was.code_available;
+            // A code is live only if the store has it live too, as the same code.
+            account.code = account.code.filter(|code| was.code == Some(*code));
             account.history_held |= was.history_held;
             for (id, record) in &kept.devices {
-                let entry = devices.entry(*id).or_insert_with(|| ApartDevice { permit: None, ..record.clone() });
+                let entry = devices.entry(*id).or_insert_with(|| ApartDevice { permit: None, known: false, ..record.clone() });
+                entry.known = record.known && rows.devices.contains_key(id);
                 entry.number = entry.number.max(record.number);
                 entry.last_session = entry.last_session.max(record.last_session);
                 entry.last_leave = entry.last_leave.max(record.last_leave);

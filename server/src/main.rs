@@ -3,13 +3,21 @@
 //! two commands (design 11.2, 13.2), each refused while the backend serves:
 //! `nexus-music-server put-back [<copy>]` puts a copy of the data back (with no copy named,
 //! it lists the nightly copies); `nexus-music-server take-as-is` takes the data as it is when
-//! the store kept apart is lost.
+//! the store kept apart is lost. And S8's two (design 8.4): `nexus-music-server set-up <email>
+//! [<name>]` sets the backend up without printing anything to its log, and `nexus-music-server
+//! recover <email>` makes a one-time code for any account, with no sign-in.
 
 use std::process::ExitCode;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::sync::Arc;
+
+use nexus_music_server::accounts::check::PasswordWorkers;
+use nexus_music_server::accounts::desk::Desk;
+use nexus_music_server::accounts::session::Accounts;
+use nexus_music_server::accounts::{rows, setup};
 use nexus_music_server::store::keeper::{self, Keeper};
 use nexus_music_server::store::copies;
 use nexus_music_server::{health, serve, settings::Settings};
@@ -49,9 +57,52 @@ fn main() -> ExitCode {
             Some(copy) => keeper::put_back(state, data, Path::new(&copy), now()),
         }),
         Some("take-as-is") => command(&settings, |state, data| keeper::take_as_is(state, data, now())),
-        Some(_) => {
-            eprintln!("Run it with nothing after it to serve; with `health` to check that it is serving; with `put-back <copy>` to put a copy of the data back (`put-back` alone lists the copies); or with `take-as-is` to take the data as it is when the store kept apart is lost.");
-            ExitCode::from(2)
+        Some("set-up") => match std::env::args().nth(2) {
+            None => usage(),
+            Some(email) => with_keeper(&settings, |keeper| setup::set_up_command(keeper, &email, std::env::args().nth(3).as_deref(), now())),
+        },
+        Some("recover") => match std::env::args().nth(2) {
+            None => usage(),
+            Some(email) => with_keeper(&settings, |keeper| setup::recover(keeper, &email, now())),
+        },
+        Some(_) => usage(),
+    }
+}
+
+fn usage() -> ExitCode {
+    eprintln!(
+        "Run it with nothing after it to serve; with `health` to check that it is serving; with `put-back <copy>` to put a copy of the data back (`put-back` alone lists the copies); with `take-as-is` to take the data as it is when the store kept apart is lost; with `set-up <email> [<name>]` to set the backend up and make its first admin, without the set-up code; or with `recover <email>` to get a one-time code for an account. Each of these is refused while the backend serves."
+    );
+    ExitCode::from(2)
+}
+
+/// One of S8's commands, on the two stores opened and compared as a start does, while the
+/// backend does not serve (the stores' lock).
+fn with_keeper(settings: &Settings, run: impl FnOnce(&mut Keeper) -> Result<Vec<String>, String>) -> ExitCode {
+    if let Err(why) = settings.check_folders() {
+        eprintln!("{why}");
+        return ExitCode::from(2);
+    }
+    let (mut keeper, started) = match Keeper::open(&settings.state, &settings.data, now()) {
+        Ok(opened) => opened,
+        Err(why) => {
+            eprintln!("{why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{}", started.said());
+    let done = run(&mut keeper);
+    keeper.close();
+    match done {
+        Ok(said) => {
+            for line in said {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("{why}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -101,6 +152,31 @@ fn run(settings: Settings) -> ExitCode {
     };
     println!("{}", started.said());
     let id = keeper.backend();
+    // 8.4: while the backend is not set up, its set-up code for this start, printed once.
+    let (set_up_code, code) = setup::SetUpCode::at_start(keeper.set_up(), now());
+    if let Some(code) = code {
+        println!("{}", setup::said_at_start(&code).as_str());
+    } else if rows::admins(keeper.data().connection()).unwrap_or(0) == 0 {
+        println!("This backend is set up, and no account that is an admin's and switched on is left: run `nexus-music-server recover <email>` while it is stopped to get a one-time code for one.");
+    }
+    if settings.public_origin.is_none() {
+        println!("NEXUS_PUBLIC_ORIGIN is not given: the admin's page can neither sign in nor set up until it is.");
+    }
+    let workers = match PasswordWorkers::new(setup::dummy_salt_key(&keeper)) {
+        Ok(workers) => workers,
+        Err(_) => {
+            eprintln!("The two workers that check passwords couldn't be started.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let desk = match Desk::open(keeper) {
+        Ok(desk) => desk,
+        Err(why) => {
+            eprintln!("The thread that writes couldn't be started ({}).", why.kind());
+            return ExitCode::FAILURE;
+        }
+    };
+    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(runtime) => runtime,
@@ -130,12 +206,13 @@ fn run(settings: Settings) -> ExitCode {
             settings.data,
             settings.state,
         );
-        let shell = serve::Shell::new(settings.proxy, &nexus_music_server::hello(id));
+        let shell = serve::Shell::backend(settings.proxy, &nexus_music_server::hello(id), accounts.clone());
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });
-    // The stores are held, and no other program may use them, for as long as it serves.
-    keeper.close();
+    // The stores are held, and no other program may use them, for as long as it serves; the
+    // thread that writes closes them when the last request lets go.
+    drop(accounts);
     served
 }
 

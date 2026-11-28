@@ -38,11 +38,26 @@ rusqlite = { version = "0.43", default-features = false, features = ["bundled", 
 # The store kept apart's check sum, and the fingerprint it keeps of an account's name. The
 # version the shared library uses (already in the lock).
 sha2 = "0.11"
+# Passwords (design 8.2): Argon2id, 19 MiB, two passes, one lane, done by the two workers of
+# `accounts::check` (S8b) into memory they wipe (`zeroize`; `alloc` for the blocks).
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = "1.8"
+subtle = { version = "2", default-features = false }
+# The keyed fingerprint a one-time code is kept by (8.5), the version the shared library uses.
+hmac = "0.13"
 
 [dev-dependencies]
 # Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a
 # stranger), which the standard library cannot bind a client to. The relay uses it already.
 socket2 = "0.6"
+
+# Argon2id is the slow work it is meant to be, and no slower: 19 MiB and two passes take
+# seconds unoptimised, past the answer's deadline, so its crates are optimised in tests too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

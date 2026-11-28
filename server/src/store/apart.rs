@@ -22,7 +22,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use nexus_core::nexus::compare::{Pending, StoreView};
-use nexus_core::nexus::kept::{AccountName, AccountState, AdminKind, Apart, ApartDevice, Leave, LeaveFor, MusicRecovery, Permit, SECRET_BYTES, StampKey, Status};
+use nexus_core::nexus::account::{AccountId, DeviceId, Email, MusicAddress, RequestId, SECRET_BYTES, SessionId};
+use nexus_core::nexus::kept::{AccountState, AdminAction, GrantIntent, AdminTarget, Apart, ApartDevice, Fingerprint, Leave, LeaveFor, LiveCode, MusicRecovery, Permit, SessionTarget, StampKey, Status};
 use nexus_core::nexus::proto::BackendId;
 use sha2::{Digest, Sha256};
 
@@ -31,7 +32,7 @@ use crate::store::crash;
 /// The file's name inside `NEXUS_STATE`.
 pub const FILE: &str = "kept";
 const STAGING: &str = "kept.new-";
-const HEAD: &str = "nexus-music-server store kept apart 3";
+const HEAD: &str = "nexus-music-server store kept apart 5";
 /// The most a store may be: what [`read`] reads, and so what [`write`] ever publishes.
 pub const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// The most a store may be after a write that adds an account or a device. The room above it
@@ -39,7 +40,7 @@ pub const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// adds no record, so that nothing a capacity rule refuses is ever a revocation.
 pub const GROWTH_MAX_BYTES: u64 = FILE_MAX_BYTES - 1024 * 1024;
 
-/// One account: the fingerprint of its email, and C3r's record. The record's `name` is not
+/// One account: the fingerprint of its email, and C3r's record. The record's `email` is not
 /// kept: it is filled from the data when the two are used together ([`Store::apart`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Account {
@@ -65,6 +66,8 @@ pub struct Store {
     pub data_made: bool,
     pub next_account: u64,
     pub next_device: u64,
+    /// The next session id: never given twice, across restores too (C3r's `FreshSession`).
+    pub next_session: u64,
     pub accounts: BTreeMap<u64, Account>,
     pub pending: Option<Pending>,
 }
@@ -92,9 +95,9 @@ pub fn name_fingerprint(name: &str) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// The name a record carries until the data's is filled in: never a real email (`.invalid`).
-pub fn placeholder(number: u64) -> Option<AccountName> {
-    AccountName::from_canonical(format!("account-{number}@kept-apart.invalid"))
+/// The email a record carries until the data's is filled in: never a real one (`.invalid`).
+pub fn placeholder(number: u64) -> Option<Email> {
+    Email::new(&format!("account-{number}@kept-apart.invalid"))
 }
 
 impl Store {
@@ -111,6 +114,7 @@ impl Store {
             data_made: false,
             next_account: 1,
             next_device: 1,
+            next_session: 1,
             accounts: BTreeMap::new(),
             pending: None,
         }
@@ -130,15 +134,15 @@ impl Store {
         self.seal
     }
 
-    /// An account's record, with the name `name` (the data's) in it.
-    pub fn apart(&self, number: u64, name: Option<&AccountName>) -> Option<Apart> {
+    /// An account's record, with the email `name` (the data's) in it.
+    pub fn apart(&self, number: u64, name: Option<&Email>) -> Option<Apart> {
         let mut apart = self.accounts.get(&number)?.apart.clone();
-        apart.account.name = name.cloned().or_else(|| placeholder(number))?;
+        apart.account.email = name.cloned().or_else(|| placeholder(number))?;
         Some(apart)
     }
 
-    /// What `compare` reads, with the data's names filled in.
-    pub fn view(&self, names: &BTreeMap<u64, AccountName>) -> StoreView {
+    /// What `compare` reads, with the data's emails filled in.
+    pub fn view(&self, names: &BTreeMap<u64, Email>) -> StoreView {
         StoreView {
             restore: self.restore,
             mark: self.mark,
@@ -170,6 +174,7 @@ impl Store {
         line(format!("data-made {}", u8::from(self.data_made)));
         line(format!("next-account {}", self.next_account));
         line(format!("next-device {}", self.next_device));
+        line(format!("next-session {}", self.next_session));
         for (number, account) in &self.accounts {
             let a = &account.apart.account;
             line(format!(
@@ -180,7 +185,7 @@ impl Store {
                 status_word(a.status),
                 a.password_changes,
                 u8::from(a.password_reset_required),
-                u8::from(a.code_available),
+                code_word(a.code),
                 u8::from(a.admin),
                 a.music_login,
                 u8::from(a.music_managed),
@@ -190,11 +195,13 @@ impl Store {
             ));
             for (id, device) in &account.apart.devices {
                 line(format!(
-                    "device {id} number {} last {} leaves {} permit {}",
+                    "device {} number {} known {} last {} leaves {} permit {}",
+                    id.get(),
                     device.number,
+                    u8::from(device.known),
                     device.last_session,
                     device.last_leave,
-                    device.permit.map_or_else(|| "-".to_string(), |permit| format!("{}:{}", permit.id, leave_text(permit.leave)))
+                    device.permit.as_ref().map_or_else(|| "-".to_string(), |permit| format!("{}:{}", permit.id.get(), leave_text(permit.leave.as_ref())))
                 ));
             }
         }
@@ -237,8 +244,9 @@ impl Store {
         let data_made = flag(field(next()?, "data-made")?)?;
         let next_account = number(field(next()?, "next-account")?)?;
         let next_device = number(field(next()?, "next-device")?)?;
+        let next_session = number(field(next()?, "next-session")?)?;
         drop(next);
-        let mut store = Store { restore, high_water, mark, mark_at, set_up, data_made, next_account, next_device, ..Store::new(backend, key, seal, 0) };
+        let mut store = Store { restore, high_water, mark, mark_at, set_up, data_made, next_account, next_device, next_session, ..Store::new(backend, key, seal, 0) };
         let mut line = lines.next()?;
         let mut devices_seen = std::collections::BTreeSet::new();
         while let Some(rest) = line.strip_prefix("account ") {
@@ -255,12 +263,13 @@ impl Store {
             let state = AccountState {
                 backend,
                 restore: number(r)?,
-                name: placeholder(n)?,
+                id: AccountId::new(n)?,
+                email: placeholder(n)?,
                 life: number(life)?,
                 status: unstatus(status)?,
                 password_changes: number(passwords)?,
                 password_reset_required: flag(reset)?,
-                code_available: flag(code)?,
+                code: uncode(code)?,
                 admin: flag(admin)?,
                 music_login: number(music)?,
                 music_managed: flag(managed)?,
@@ -272,18 +281,22 @@ impl Store {
             line = lines.next()?;
             while let Some(rest) = line.strip_prefix("device ") {
                 let words: Vec<&str> = rest.split(' ').collect();
-                let [id, "number", device_number, "last", last, "leaves", leaves, "permit", permit] = words.as_slice() else { return None };
+                let [id, "number", device_number, "known", known, "last", last, "leaves", leaves, "permit", permit] = words.as_slice() else { return None };
                 let id = number(id)?;
                 if id == 0 || id >= store.next_device || !devices_seen.insert(id) {
                     return None;
                 }
+                let id = DeviceId::new(id)?;
                 let permit = if *permit == "-" {
                     None
                 } else {
                     let (session, leave) = permit.split_once(':')?;
-                    Some(Permit { id: number(session)?, leave: unleave(leave)? })
+                    Some(Permit { id: SessionId::new(number(session)?)?, leave: unleave(leave)? })
                 };
-                apart.devices.insert(id, ApartDevice { number: number(device_number)?, last_session: number(last)?, last_leave: number(leaves)?, permit });
+                if number(last)? >= store.next_session {
+                    return None;
+                }
+                apart.devices.insert(id, ApartDevice { number: number(device_number)?, known: flag(known)?, last_session: number(last)?, last_leave: number(leaves)?, permit });
                 line = lines.next()?;
             }
             store.accounts.insert(n, Account { name: unhex(name)?, apart });
@@ -489,26 +502,109 @@ fn unrecovery(text: &str) -> Option<Option<MusicRecovery>> {
     }
 }
 
-const ADMIN_KINDS: [(AdminKind, &str); 11] = [
-    (AdminKind::CreateAccount, "create-account"),
-    (AdminKind::ChangeAccountStatus, "account-status"),
-    (AdminKind::DeleteAccount, "delete-account"),
-    (AdminKind::ResetPassword, "reset-password"),
-    (AdminKind::MakeAdmin, "make-admin"),
-    (AdminKind::ForceOut, "force-out"),
-    (AdminKind::ChangeMusicLogin, "music-login"),
-    (AdminKind::SetMusicAddress, "music-address"),
-    (AdminKind::SetDiagnosticsDefault, "diagnostics"),
-    (AdminKind::SetRequests, "requests"),
-    (AdminKind::SetLidarr, "lidarr"),
+fn code_word(code: Option<LiveCode>) -> String {
+    code.map_or_else(|| "-".to_string(), |code| format!("{}:{}:{}", code.number, u8::from(code.used), code.expires))
+}
+
+fn uncode(text: &str) -> Option<Option<LiveCode>> {
+    if text == "-" {
+        return Some(None);
+    }
+    let mut parts = text.split(':');
+    let (n, used, expires) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Some(LiveCode { number: number(n)?, used: flag(used)?, expires: number(expires)? }))
+}
+
+/// Text a person typed (an email, an address), as one word: its bytes in hex.
+fn text_word(text: &str) -> String {
+    hex(text.as_bytes())
+}
+
+fn untext(word: &str) -> Option<String> {
+    if word.len() % 2 != 0 || word.len() > 2 * 4096 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = word.as_bytes().chunks_exact(2).map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect();
+    String::from_utf8(bytes?).ok().filter(|text| text_word(text) == word)
+}
+
+fn target_word(target: &AdminTarget) -> String {
+    match target {
+        AdminTarget::Account { id, revision } => format!("account.{}.{revision}", id.get()),
+        AdminTarget::NewAccount(email) => format!("new.{}", text_word(email.as_str())),
+        AdminTarget::Backend => "backend".into(),
+    }
+}
+
+fn untarget(word: &str) -> Option<AdminTarget> {
+    if word == "backend" {
+        return Some(AdminTarget::Backend);
+    }
+    if let Some(email) = word.strip_prefix("new.") {
+        let email = Email::new(&untext(email)?)?;
+        return Some(AdminTarget::NewAccount(email));
+    }
+    let mut parts = word.strip_prefix("account.")?.split('.');
+    let (id, revision) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(AdminTarget::Account { id: AccountId::new(number(id)?)?, revision: number(revision)? })
+}
+
+const ADMIN_WORDS: [(AdminAction, &str); 8] = [
+    (AdminAction::SetOn(true), "switch-on"),
+    (AdminAction::SetOn(false), "switch-off"),
+    (AdminAction::DeleteAccount, "delete-account"),
+    (AdminAction::ResetPassword, "reset-password"),
+    (AdminAction::SetAdmin(true), "make-admin"),
+    (AdminAction::SetAdmin(false), "unmake-admin"),
+    (AdminAction::MusicLoginChanged, "music-login"),
+    (AdminAction::CreateAccount, "create-account"),
 ];
 
-/// What leave is for, as one word (shared with the data's columns).
-pub fn leave_for_word(purpose: LeaveFor) -> String {
+fn action_word(action: &AdminAction) -> String {
+    match action {
+        AdminAction::ForceOut(target) => format!("force-out.{}.{}", target.device.get(), target.session.get()),
+        AdminAction::SetMusicAddress(address) => format!("music-address.{}", text_word(address.as_str())),
+        AdminAction::SetDiagnosticsDefault(on) => format!("diagnostics.{}", u8::from(*on)),
+        AdminAction::SetRequests(on) => format!("requests.{}", u8::from(*on)),
+        AdminAction::SetLidarr => "lidarr".into(),
+        other => ADMIN_WORDS.iter().find(|(a, _)| a == other).map_or_else(|| "?".into(), |(_, word)| (*word).to_string()),
+    }
+}
+
+fn unaction(word: &str) -> Option<AdminAction> {
+    if let Some(rest) = word.strip_prefix("force-out.") {
+        let (device, session) = rest.split_once('.')?;
+        return Some(AdminAction::ForceOut(SessionTarget { device: DeviceId::new(number(device)?)?, session: SessionId::new(number(session)?)? }));
+    }
+    if let Some(address) = word.strip_prefix("music-address.") {
+        return Some(AdminAction::SetMusicAddress(MusicAddress::new(&untext(address)?)?));
+    }
+    if let Some(on) = word.strip_prefix("diagnostics.") {
+        return Some(AdminAction::SetDiagnosticsDefault(flag(on)?));
+    }
+    if let Some(on) = word.strip_prefix("requests.") {
+        return Some(AdminAction::SetRequests(flag(on)?));
+    }
+    if word == "lidarr" {
+        return Some(AdminAction::SetLidarr);
+    }
+    ADMIN_WORDS.iter().find(|(_, w)| *w == word).map(|(a, _)| a.clone())
+}
+
+/// What leave is for, as one word with no space, comma or colon (shared with the data's
+/// columns): `change-password`, `delete-history`, or `admin/<action>/<target>`; what a person
+/// typed in it (an email, an address) is in hex.
+pub fn leave_for_word(purpose: &LeaveFor) -> String {
     match purpose {
         LeaveFor::ChangePassword => "change-password".into(),
         LeaveFor::DeleteHistory => "delete-history".into(),
-        LeaveFor::Admin(kind) => format!("admin-{}", ADMIN_KINDS.iter().find(|(k, _)| *k == kind).map_or("?", |(_, word)| word)),
+        LeaveFor::Admin { action, target } => format!("admin/{}/{}", action_word(action), target_word(target)),
     }
 }
 
@@ -517,18 +613,34 @@ pub fn leave_for(word: &str) -> Option<LeaveFor> {
         "change-password" => Some(LeaveFor::ChangePassword),
         "delete-history" => Some(LeaveFor::DeleteHistory),
         _ => {
-            let kind = word.strip_prefix("admin-")?;
-            ADMIN_KINDS.iter().find(|(_, w)| *w == kind).map(|(k, _)| LeaveFor::Admin(*k))
+            let mut parts = word.strip_prefix("admin/")?.split('/');
+            let (action, target) = (parts.next()?, parts.next()?);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(LeaveFor::Admin { action: unaction(action)?, target: untarget(target)? })
         }
     }
 }
 
-fn leave_text(leave: Option<Leave>) -> String {
+/// A grant's intent (C3r's `GrantIntent`): the request's number, then what it is for.
+pub fn intent_word(intent: &GrantIntent) -> String {
+    format!("{}/{}", intent.request_id.get(), leave_for_word(&intent.change))
+}
+
+pub fn intent(word: &str) -> Option<GrantIntent> {
+    let (request, change) = word.split_once('/')?;
+    Some(GrantIntent { request_id: RequestId::new(number(request)?)?, change: leave_for(change)? })
+}
+
+/// A grant as the store keeps it: what it is for, under which life, revision and role, when
+/// and its serial, and the fingerprint of its secret (never the secret).
+fn leave_text(leave: Option<&Leave>) -> String {
     match leave {
         None => "-".into(),
         Some(leave) => {
-            let (purpose, life, granted, serial) = leave.fields();
-            format!("{},{life},{granted},{serial}", leave_for_word(purpose))
+            let (intent, life, revision, admin, granted, serial, hash) = leave.fields();
+            format!("{},{life},{revision},{},{granted},{serial},{}", intent_word(intent), u8::from(admin), hex(hash.as_bytes()))
         }
     }
 }
@@ -538,8 +650,8 @@ fn unleave(text: &str) -> Option<Option<Leave>> {
         return Some(None);
     }
     let parts: Vec<&str> = text.split(',').collect();
-    let [purpose, life, granted, serial] = parts.as_slice() else { return None };
-    Some(Some(Leave::stored(leave_for(purpose)?, number(life)?, number(granted)?, number(serial)?)))
+    let [purpose, life, revision, admin, granted, serial, hash] = parts.as_slice() else { return None };
+    Some(Some(Leave::stored(intent(purpose)?, number(life)?, number(revision)?, flag(admin)?, number(granted)?, number(serial)?, Fingerprint::from_bytes(unhex(hash)?))))
 }
 
 #[cfg(test)]
@@ -562,15 +674,17 @@ mod tests {
         store.data_made = true;
         store.next_account = 3;
         store.next_device = 8;
+        store.next_session = 7;
         let state = |number, status| AccountState {
             backend: store.backend,
             restore: 3,
-            name: placeholder(number).unwrap(),
+            id: AccountId::new(number).unwrap(),
+            email: placeholder(number).unwrap(),
             life: 2,
             status,
             password_changes: 4,
             password_reset_required: true,
-            code_available: true,
+            code: Some(LiveCode { number: 4, used: false, expires: 1_800_000_000_000 }),
             admin: true,
             music_login: 6,
             music_managed: true,
@@ -579,8 +693,12 @@ mod tests {
             revision: 9,
         };
         let mut alice = Apart { account: state(1, Status::Off), devices: BTreeMap::new() };
-        alice.devices.insert(7, ApartDevice { number: 4, last_session: 6, last_leave: 2, permit: Some(Permit { id: 6, leave: Some(Leave::stored(LeaveFor::Admin(AdminKind::ResetPassword), 2, 99, 2)) }) });
-        alice.devices.insert(3, ApartDevice { number: 0, last_session: 0, last_leave: 0, permit: None });
+        let reset = GrantIntent {
+            request_id: RequestId::new(17).unwrap(),
+            change: LeaveFor::Admin { action: AdminAction::ForceOut(SessionTarget { device: DeviceId::new(3).unwrap(), session: SessionId::new(5).unwrap() }), target: AdminTarget::Account { id: AccountId::new(2).unwrap(), revision: 8 } },
+        };
+        alice.devices.insert(DeviceId::new(7).unwrap(), ApartDevice { number: 4, known: true, last_session: 6, last_leave: 2, permit: Some(Permit { id: SessionId::new(6).unwrap(), leave: Some(Leave::stored(reset, 2, 9, true, 99, 2, Fingerprint::of(&[3; 32]))) }) });
+        alice.devices.insert(DeviceId::new(3).unwrap(), ApartDevice { number: 0, known: false, last_session: 0, last_leave: 0, permit: None });
         store.accounts.insert(1, Account { name: name_fingerprint("alice@example.org"), apart: alice });
         store.accounts.insert(2, Account { name: name_fingerprint("bob@example.org"), apart: Apart { account: state(2, Status::Deleted), devices: BTreeMap::new() } });
         store.pending = Some(Pending::Change { accounts: vec![1, 2] });
@@ -597,8 +715,31 @@ mod tests {
             let Reading::Found(back) = read(&state) else { panic!("not read back") };
             assert!(back == store, "{pending:?}");
         }
-        for kind in ADMIN_KINDS {
-            assert_eq!(leave_for(&leave_for_word(LeaveFor::Admin(kind.0))), Some(LeaveFor::Admin(kind.0)));
+        let targets = [
+            AdminTarget::Backend,
+            AdminTarget::Account { id: AccountId::new(4).unwrap(), revision: 11 },
+            AdminTarget::NewAccount(Email::new("new.person+nexus@example.org").unwrap()),
+        ];
+        let more = [
+            AdminAction::ForceOut(SessionTarget { device: DeviceId::new(8).unwrap(), session: SessionId::new(12).unwrap() }),
+            AdminAction::SetMusicAddress(MusicAddress::new("https://music.example.org:4533/music/").unwrap()),
+            AdminAction::SetDiagnosticsDefault(true),
+            AdminAction::SetDiagnosticsDefault(false),
+            AdminAction::SetRequests(true),
+            AdminAction::SetLidarr,
+        ];
+        for action in ADMIN_WORDS.iter().map(|(a, _)| a.clone()).chain(more) {
+            for target in &targets {
+                let purpose = LeaveFor::Admin { action: action.clone(), target: target.clone() };
+                let word = leave_for_word(&purpose);
+                assert!(!word.contains([' ', ',', ':']), "{word}");
+                assert_eq!(leave_for(&word), Some(purpose.clone()));
+                let intent = GrantIntent { request_id: RequestId::new(99).unwrap(), change: purpose };
+                assert_eq!(self::intent(&intent_word(&intent)), Some(intent));
+            }
+        }
+        for purpose in [LeaveFor::ChangePassword, LeaveFor::DeleteHistory] {
+            assert_eq!(leave_for(&leave_for_word(&purpose)), Some(purpose));
         }
         assert!(fs::read_dir(&state).unwrap().all(|entry| entry.unwrap().file_name() == FILE));
         #[cfg(unix)]
@@ -633,6 +774,7 @@ mod tests {
         let cases: Vec<(&str, Store)> = vec![
             ("an account past the next number", Store { next_account: 2, ..full() }),
             ("a device past the next number", Store { next_device: 7, ..full() }),
+            ("a session past the next number", Store { next_session: 6, ..full() }),
         ];
         let state = folder("misfit");
         for (name, store) in cases {

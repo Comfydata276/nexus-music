@@ -10,9 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nexus_core::nexus::kept::{
-    Access, Account, AdminAction, AdminKind, Bearer, Denied, DeviceSecret, Fingerprint, LeaveFor, SECRET_BYTES, SESSION_MS, Status, Turn,
-};
+use nexus_core::nexus::account::{AccountId, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
+use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
 use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
@@ -132,8 +131,40 @@ fn decide<T>(keeper: &mut Keeper, account: u64, now: u64, extra: &[Change<'_>], 
     loaded.request(restore, clock, action).apply(|effects| keeper.persist(effects, extra, now))
 }
 
+/// The one grant secret these tests hand out (8.8): only its fingerprint is kept.
+static GRANT: std::sync::LazyLock<GrantSecret> = std::sync::LazyLock::new(|| GrantSecret::from_bytes([77; SECRET_BYTES]));
+
+fn dev(device: u64) -> DeviceId {
+    DeviceId::new(device).unwrap_or(DeviceId::new(u64::MAX).unwrap())
+}
+
+/// The one request number these tests' grants are asked and used under (8.8, 12.2).
+fn request() -> RequestId {
+    RequestId::new(9).unwrap()
+}
+
 fn bearer(device: u64, session: &Fingerprint) -> Bearer<'_> {
-    Bearer { device, hash: session }
+    Bearer { device: dev(device), hash: session, grant: Some(GrantUse { request_id: request(), secret: &GRANT }) }
+}
+
+fn secret(n: u8) -> DeviceSecret {
+    DeviceSecret::from_bytes([n; SECRET_BYTES])
+}
+
+fn fresh(keeper: &mut Keeper, session: u8) -> FreshSession {
+    FreshSession { id: keeper.fresh_session().unwrap(), hash: fp(session), sign_out: fp(session.wrapping_add(100)) }
+}
+
+/// The session `device` of `account` has now, as the data and the store have it.
+fn session_of(keeper: &mut Keeper, account: u64, device: u64) -> SessionTarget {
+    let rows = keeper.load(account).unwrap().rows();
+    let session = rows.devices.get(&dev(device)).and_then(|row| row.session.as_ref()).map(|session| session.id);
+    SessionTarget { device: dev(device), session: session.unwrap_or(nexus_core::nexus::account::SessionId::new(u64::MAX).unwrap()) }
+}
+
+/// The account as the admin names it: its number and its revision now.
+fn target(keeper: &mut Keeper, account: u64) -> AdminTarget {
+    keeper.load(account).map(|loaded| loaded.state().admin_target()).unwrap_or(AdminTarget::Account { id: AccountId::new(account).unwrap(), revision: 0 })
 }
 
 fn failed(why: Denied) -> Failed {
@@ -146,13 +177,13 @@ fn sign_in(keeper: &mut Keeper, account: u64, secret: u8, pass: u8, session: u8,
     // The verifier the data keeps, as S8 reads it: none, and nothing can sign in.
     let kept = keeper.data().password(account).map_err(|_| Failed("unreadable".into()))?.ok_or_else(|| Failed("no password".into()))?;
     let expected = Fingerprint::from_bytes(kept.hash);
-    let check = decide(keeper, account, now, &[], |turn| turn.check_sign_in(&DeviceSecret::new([secret; SECRET_BYTES]), vacant, expected))?.map_err(failed)?;
+    let check = decide(keeper, account, now, &[], |turn| turn.check_sign_in(&self::secret(secret), dev(vacant), expected))?.map_err(failed)?;
     let receipt = check.check(fp(pass), keeper.clock(now)).map_err(failed)?;
-    let signed = decide(keeper, account, now, &[], |turn| turn.sign_in(receipt, fp(session), None))?.map_err(failed)?;
-    Ok(signed.device)
+    let fresh = fresh(keeper, session);
+    let signed = decide(keeper, account, now, &[], |turn| turn.sign_in(receipt, fresh, None))?.map_err(failed)?;
+    Ok(signed.device.get())
 }
 
-/// A new account's person chooses a password with the code they were given, then signs in.
 /// The fingerprint of a one-time code as the data keeps it, found as S8 finds it: by the
 /// code typed, among the account's codes. None if the data has no such code (finding 11).
 fn stored_code(keeper: &Keeper, account: u64, code: u8) -> Option<Fingerprint> {
@@ -165,44 +196,40 @@ fn stored_code(keeper: &Keeper, account: u64, code: u8) -> Option<Fingerprint> {
     found.map(|bytes| Fingerprint::from_bytes(bytes.try_into().unwrap()))
 }
 
+/// A new account's person redeems the code they were given with the password they choose,
+/// in one step (8.5), and is signed in by it.
 fn first_password(keeper: &mut Keeper, account: u64, secret: u8, code: u8, pass: u8, session: u8, now: u64) -> Result<u64, Failed> {
     let vacant = keeper.vacant_device();
     let code_fp = stored_code(keeper, account, code).ok_or_else(|| Failed("no such code in the data".into()))?;
-    let check = decide(keeper, account, now, &[], |turn| turn.check_code(&DeviceSecret::new([secret; SECRET_BYTES]), vacant, code_fp.clone()))?.map_err(failed)?;
+    let live = keeper.load(account)?.state().code.map_or(0, |code| code.number);
+    let check = decide(keeper, account, now, &[], |turn| turn.check_code(&self::secret(secret), dev(vacant), live, code_fp.clone()))?.map_err(failed)?;
     let receipt = check.check(code_fp, keeper.clock(now)).map_err(failed)?;
-    let restricted = fp(200);
-    let device = decide(keeper, account, now, &[], |turn| turn.sign_in(receipt, restricted.clone(), None))?.map_err(failed)?.device;
     let chosen = password(pass);
-    decide(keeper, account, now, &[Change::Password { account, password: Some(&chosen) }], |turn| turn.choose_password(bearer(device, &restricted)))?.map_err(failed)?;
-    sign_in(keeper, account, secret, pass, session, now)
+    let fresh = fresh(keeper, session);
+    let signed = decide(keeper, account, now, &[Change::Password { account, password: Some(&chosen) }], |turn| turn.redeem_code(receipt, fp(pass), fresh, None))?.map_err(failed)?;
+    Ok(signed.device.get())
 }
 
 /// Leave for one thing (8.8), on a session, by its password typed again.
 fn leave(keeper: &mut Keeper, account: u64, device: u64, session: u8, pass: u8, purpose: LeaveFor, now: u64) -> Result<(), Failed> {
     let held = fp(session);
-    let check = decide(keeper, account, now, &[], |turn| turn.check_leave(bearer(device, &held), purpose, fp(pass)))?.map_err(failed)?;
+    let check = decide(keeper, account, now, &[], |turn| turn.check_leave(bearer(device, &held), GrantIntent { request_id: request(), change: purpose }, fp(pass)))?.map_err(failed)?;
     let receipt = check.check(fp(pass), keeper.clock(now)).map_err(failed)?;
-    decide(keeper, account, now, &[], |turn| turn.grant_leave(receipt))?.map_err(failed)
+    decide(keeper, account, now, &[], |turn| turn.grant_leave(receipt, &GRANT))?.map_err(failed)
 }
 
-fn admin_kind(action: AdminAction) -> AdminKind {
-    match action {
-        AdminAction::SetOn(_) => AdminKind::ChangeAccountStatus,
-        AdminAction::DeleteAccount => AdminKind::DeleteAccount,
-        AdminAction::ResetPassword => AdminKind::ResetPassword,
-        AdminAction::ForceOut(_) => AdminKind::ForceOut,
-        AdminAction::MakeAdmin => AdminKind::MakeAdmin,
-        _ => AdminKind::SetRequests,
-    }
+fn admin_leave(keeper: &mut Keeper, action: AdminAction, account: u64) -> LeaveFor {
+    LeaveFor::Admin { action, target: target(keeper, account) }
 }
 
 /// The admin does `action` to `target`, under leave already granted for it.
-fn administer(keeper: &mut Keeper, ids: &Ids, action: AdminAction, target: u64, extra: &[Change<'_>], now: u64) -> Result<(), Failed> {
-    let mut other = keeper.load(target)?;
+fn administer(keeper: &mut Keeper, ids: &Ids, action: AdminAction, target_number: u64, extra: &[Change<'_>], now: u64) -> Result<(), Failed> {
+    let named = target(keeper, target_number);
+    let mut other = keeper.load(target_number)?;
     let held = fp(30);
     let (restore, clock) = (keeper.restore(), keeper.clock(now));
     let mut root = keeper.load(ROOT)?;
-    root.request(restore, clock, |turn| turn.administer(bearer(ids.root, &held), action, Some(&mut other)))
+    root.request(restore, clock, |turn| turn.administer(bearer(ids.root, &held), action, named, Some(&mut other)))
         .apply(|effects| keeper.persist(effects, extra, now))?
         .map_err(failed)
 }
@@ -365,7 +392,9 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         }
         "forcing out" => {
             let held = fp(1);
-            decide(&mut keeper(), ALICE, now, &[], |turn| turn.force_out(bearer(ids.a1, &held), ids.a2)).map_err(failed)?.map_err(|why| format!("{why:?}"))
+            let mut keeper = keeper();
+            let other = session_of(&mut keeper, ALICE, ids.a2);
+            decide(&mut keeper, ALICE, now, &[], |turn| turn.force_out(bearer(ids.a1, &held), other)).map_err(failed)?.map_err(|why| format!("{why:?}"))
         }
         "a password changed" => {
             let (held, chosen) = (fp(1), password(14));
@@ -379,7 +408,7 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         }
         "an account switched off" => administer(&mut keeper(), &ids, AdminAction::SetOn(false), BOB, &[], now).map_err(failed),
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
-        "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
+        "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
         "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
@@ -512,7 +541,14 @@ fn an_account_made_cut_at_any_point_is_made_or_not_and_its_number_is_never_given
         if cut.whole() {
             assert_eq!(carol, Some(4));
         }
-        let again = keeper.make_account("carol@example.org", "Carol", false, None, T0 + 21 * MINUTE).unwrap();
+        // Made once at most: asked again, an email the data has is refused.
+        let again = match carol {
+            Some(number) => {
+                assert!(keeper.make_account("carol@example.org", "Carol", false, None, T0 + 21 * MINUTE).is_err());
+                number
+            }
+            None => keeper.make_account("carol@example.org", "Carol", false, None, T0 + 21 * MINUTE).unwrap(),
+        };
         assert_eq!(again, carol.unwrap_or(if cut.took() { 5 } else { 4 }), "at {}", cut.at);
         assert_eq!(readers(&mut keeper, &ids, T0 + 21 * MINUTE), [30, 1, 3, 5]);
     });
@@ -595,7 +631,8 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
         let prepared = setup.copied(&format!("admin-{}", scenario.replace(' ', "-")));
         {
             let mut keeper = opened(&prepared, T0 + 4 * MINUTE);
-            leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(admin_kind(action)), T0 + 4 * MINUTE).unwrap();
+            let purpose = admin_leave(&mut keeper, action.clone(), BOB);
+            leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
             keeper.close();
         }
         at_every_point(scenario, &prepared, |root, cut| {
@@ -705,6 +742,7 @@ fn taking_the_data_as_it_is_cut_at_any_point_ends_up_taken_once() {
         // waits for a new one-time code (12.4), and no verifier of the data's is left.
         assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "at {}: the old password signed in", cut.at);
         assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number >= ?1 AND password IS NOT NULL", 1), 0, "at {}", cut.at);
+        assert!(state(&mut keeper, ALICE).unwrap().password_reset_required, "at {}", cut.at);
     });
 }
 
@@ -787,7 +825,8 @@ fn the_data_put_back_by_hand_with_and_without_its_wal_is_found_older_and_nothing
         let copy = snapshot(&root, files);
         // Then a device forced out, and nothing else changed (X2).
         let held = fp(1);
-        decide(&mut keeper, ALICE, T0 + 3 * MINUTE, &[], |turn| turn.force_out(bearer(ids.a1, &held), ids.a2)).unwrap().unwrap();
+        let other = session_of(&mut keeper, ALICE, ids.a2);
+        decide(&mut keeper, ALICE, T0 + 3 * MINUTE, &[], |turn| turn.force_out(bearer(ids.a1, &held), other)).unwrap().unwrap();
         keeper.close();
         put_by_hand(&root, &copy);
         let (mut keeper, started) = settled(&root, T0 + 4 * MINUTE);
@@ -811,8 +850,9 @@ fn what_was_taken_away_since_a_copy_is_taken_away_again_when_it_is_put_back() {
             "password reset" => Some(AdminAction::ResetPassword),
             _ => None,
         };
-        if let Some(action) = kind {
-            leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(admin_kind(action)), T0 + 2 * MINUTE).unwrap();
+        if let Some(action) = kind.clone() {
+            let purpose = admin_leave(&mut keeper, action.clone(), BOB);
+            leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 2 * MINUTE).unwrap();
         } else if change == "password changed" {
             leave(&mut keeper, BOB, ids.b1, 5, 22, LeaveFor::ChangePassword, T0 + 2 * MINUTE).unwrap();
         } else if change == "listening data deleted" {
@@ -852,7 +892,7 @@ fn what_was_taken_away_since_a_copy_is_taken_away_again_when_it_is_put_back() {
                 // The code the copy holds again stays used (the review's item 5).
                 let vacant = keeper.vacant_device();
                 let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
-                let answer = decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&DeviceSecret::new([51; SECRET_BYTES]), vacant, code.clone())).unwrap();
+                let answer = decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&secret(51), dev(vacant), 0, code.clone())).unwrap();
                 assert!(answer.is_err(), "a used code was taken again");
                 // And the copy's code itself is gone from the data (finding 11).
                 assert!(stored_code(&keeper, carol, 44).is_none(), "the used code's fingerprint is back in the data");
@@ -1103,8 +1143,9 @@ fn a_database_from_a_newer_version_is_refused_before_anything_else_is_read() {
 fn a_clock_set_back_between_runs_reopens_nothing_and_stops_no_copy() {
     let root = Root::new("clock");
     let ids = world(&root);
-    // Bob's session, last used at T0, is ended 90 days on (8.6).
-    let late = T0 + SESSION_MS;
+    // Bob's session, last used at T0, is ended 90 days on (8.7); a start can make it look up to
+    // an hour younger than it is (when it was last used is written at most once an hour).
+    let late = T0 + SESSION_MS + 60 * MINUTE;
     {
         // Asked at that time, and what the decision did kept (the ending, and the time).
         let mut keeper = opened(&root, late);

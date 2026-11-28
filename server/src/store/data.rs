@@ -30,7 +30,8 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 
 use nexus_core::nexus::compare::DataView;
-use nexus_core::nexus::kept::{AccountName, AccountState, DeviceRow, Fingerprint, Leave, MusicRecovery, Rows, SECRET_BYTES, Session, Status};
+use nexus_core::nexus::account::{AccountId, DeviceId, Email, SECRET_BYTES, SessionId};
+use nexus_core::nexus::kept::{AccountState, DeviceRow, Fingerprint, Leave, LiveCode, MusicRecovery, Rows, Session, Status};
 use nexus_core::nexus::proto::BackendId;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -51,7 +52,9 @@ pub const FORM: i64 = 1;
 pub const BUSY: Duration = Duration::from_secs(5);
 
 /// Form 1: what the data keeps (design 11): accounts (with C3r's state of each), one-time
-/// codes as fingerprints, devices, and each device's one session as a fingerprint; and the
+/// codes as keyed fingerprints by the number C3r gives each (C3r's `LiveCode` deadline beside
+/// its number), devices, and each device's one session as a fingerprint (with the fingerprint
+/// of the secret that can only end it, 11); and the
 /// restore number, how far its changes have got, and the latest time a step was written at.
 /// **Room is left**, for the slices that bring them, for an account's music login (S9), its
 /// switch for requests (step 4), and the events and Diagnostics kept for it (S12, S7), each a
@@ -81,7 +84,9 @@ CREATE TABLE accounts (
     status TEXT NOT NULL CHECK (status IN ('on', 'off')),
     password_changes INTEGER NOT NULL,
     reset_required INTEGER NOT NULL CHECK (reset_required IN (0, 1)),
-    code_available INTEGER NOT NULL CHECK (code_available IN (0, 1)),
+    code_number INTEGER CHECK (code_number IS NULL OR code_number >= 0),
+    code_used INTEGER NOT NULL CHECK (code_used IN (0, 1)),
+    code_expires INTEGER CHECK ((code_number IS NULL) = (code_expires IS NULL)),
     admin INTEGER NOT NULL CHECK (admin IN (0, 1)),
     music_login INTEGER NOT NULL,
     music_managed INTEGER NOT NULL CHECK (music_managed IN (0, 1)),
@@ -92,10 +97,11 @@ CREATE TABLE accounts (
 ) STRICT;
 CREATE TABLE codes (
     account INTEGER NOT NULL REFERENCES accounts (number) ON DELETE CASCADE,
+    number INTEGER NOT NULL CHECK (number >= 0),
     code BLOB NOT NULL UNIQUE CHECK (length(code) = 32),
     made_at INTEGER NOT NULL,
     until INTEGER NOT NULL,
-    PRIMARY KEY (account, code)
+    PRIMARY KEY (account, number)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE devices (
     id INTEGER PRIMARY KEY CHECK (id > 0),
@@ -115,12 +121,15 @@ CREATE TABLE sessions (
     id INTEGER NOT NULL CHECK (id > 0),
     hash BLOB NOT NULL UNIQUE CHECK (length(hash) = 32),
     last_used INTEGER NOT NULL,
-    restricted INTEGER NOT NULL CHECK (restricted IN (0, 1)),
+    sign_out BLOB NOT NULL CHECK (length(sign_out) = 32),
     leave_for TEXT,
     leave_life INTEGER,
+    leave_revision INTEGER,
+    leave_admin INTEGER,
     leave_granted INTEGER,
     leave_serial INTEGER,
-    CHECK ((leave_for IS NULL) = (leave_serial IS NULL))
+    leave_hash BLOB CHECK (leave_hash IS NULL OR length(leave_hash) = 32),
+    CHECK ((leave_for IS NULL) = (leave_hash IS NULL))
 ) STRICT;
 ";
 
@@ -349,7 +358,7 @@ impl Data {
     }
 
     /// Every account's email, by number.
-    pub fn names(&self) -> rusqlite::Result<BTreeMap<u64, AccountName>> {
+    pub fn names(&self) -> rusqlite::Result<BTreeMap<u64, Email>> {
         names_of(&self.connection)
     }
 
@@ -439,13 +448,13 @@ pub fn meta_of(connection: &Connection) -> rusqlite::Result<Meta> {
 }
 
 /// Every account's email, by number.
-pub fn names_of(connection: &Connection) -> rusqlite::Result<BTreeMap<u64, AccountName>> {
+pub fn names_of(connection: &Connection) -> rusqlite::Result<BTreeMap<u64, Email>> {
     let mut statement = connection.prepare("SELECT number, email FROM accounts")?;
     let found = statement.query_map([], |row| Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?)))?;
     let mut names = BTreeMap::new();
     for found in found {
         let (number, email) = found?;
-        let name = AccountName::from_canonical(email).ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "email".into(), rusqlite::types::Type::Text))?;
+        let name = canonical(&email).ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "email".into(), rusqlite::types::Type::Text))?;
         names.insert(number, name);
     }
     Ok(names)
@@ -473,38 +482,45 @@ pub fn account_named_of(connection: &Connection, email: &str) -> rusqlite::Resul
 pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::Result<Option<Rows>> {
     let found = connection
         .query_row(
-            "SELECT email, life, status, password_changes, reset_required, code_available, admin, music_login, music_managed, music_recovery, history_held, revision FROM accounts WHERE number = ?1",
+            "SELECT email, life, status, password_changes, reset_required, code_number, code_used, admin, music_login, music_managed, music_recovery, history_held, revision, code_expires FROM accounts WHERE number = ?1",
             [self::number(number)?],
             |row| {
                 let bad = |at: usize, what: &str| rusqlite::Error::InvalidColumnType(at, what.into(), rusqlite::types::Type::Text);
                 let flag = |at: usize| -> rusqlite::Result<bool> { Ok(row.get::<_, i64>(at)? == 1) };
-                let name = AccountName::from_canonical(row.get(0)?).ok_or_else(|| bad(0, "email"))?;
+                let email = canonical(&row.get::<_, String>(0)?).ok_or_else(|| bad(0, "email"))?;
+                let id = AccountId::new(number).ok_or_else(|| bad(0, "number"))?;
                 let status = match row.get::<_, String>(2)?.as_str() {
                     "on" => Status::On,
                     "off" => Status::Off,
                     _ => return Err(bad(2, "status")),
                 };
-                let music_recovery = match row.get::<_, Option<String>>(9)?.as_deref() {
+                let music_recovery = match row.get::<_, Option<String>>(10)?.as_deref() {
                     None => None,
                     Some("rotate") => Some(MusicRecovery::RotateManaged),
                     Some("enter") => Some(MusicRecovery::EnterAgain),
-                    Some(_) => return Err(bad(9, "music_recovery")),
+                    Some(_) => return Err(bad(10, "music_recovery")),
+                };
+                let code = match (row.get::<_, Option<i64>>(5)?.map(unsigned).transpose()?, row.get::<_, Option<i64>>(13)?.map(unsigned).transpose()?) {
+                    (Some(number), Some(expires)) => Some(LiveCode { number, used: flag(6)?, expires }),
+                    (None, None) => None,
+                    _ => return Err(bad(13, "code_expires")),
                 };
                 Ok(AccountState {
                     backend: meta.backend,
                     restore: meta.restore,
-                    name,
+                    id,
+                    email,
                     life: unsigned(row.get(1)?)?,
                     status,
                     password_changes: unsigned(row.get(3)?)?,
                     password_reset_required: flag(4)?,
-                    code_available: flag(5)?,
-                    admin: flag(6)?,
-                    music_login: unsigned(row.get(7)?)?,
-                    music_managed: flag(8)?,
+                    code,
+                    admin: flag(7)?,
+                    music_login: unsigned(row.get(8)?)?,
+                    music_managed: flag(9)?,
                     music_recovery,
-                    history_held: flag(10)?,
-                    revision: unsigned(row.get(11)?)?,
+                    history_held: flag(11)?,
+                    revision: unsigned(row.get(12)?)?,
                 })
             },
         )
@@ -512,7 +528,7 @@ pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::R
     let Some(account) = found else { return Ok(None) };
     let mut rows = Rows { account, devices: BTreeMap::new() };
     let mut statement = connection.prepare(
-        "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.restricted, sessions.leave_for, sessions.leave_life, sessions.leave_granted, sessions.leave_serial
+        "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.sign_out, sessions.leave_for, sessions.leave_life, sessions.leave_revision, sessions.leave_admin, sessions.leave_granted, sessions.leave_serial, sessions.leave_hash
          FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1",
     )?;
     let found = statement.query_map([self::number(number)?], |row| {
@@ -526,15 +542,17 @@ pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::R
                 let leave = match row.get::<_, Option<String>>(7)? {
                     None => None,
                     Some(purpose) => {
-                        let purpose = crate::store::apart::leave_for(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "leave_for".into(), rusqlite::types::Type::Text))?;
+                        let intent = crate::store::apart::intent(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "leave_for".into(), rusqlite::types::Type::Text))?;
                         let count = |at: usize| -> rusqlite::Result<u64> { unsigned(row.get::<_, Option<i64>>(at)?.unwrap_or(-1)) };
-                        Some(Leave::stored(purpose, count(8)?, count(9)?, count(10)?))
+                        Some(Leave::stored(intent, count(8)?, count(9)?, count(10)? == 1, count(11)?, count(12)?, Fingerprint::from_bytes(blob(13)?)))
                     }
                 };
-                Some(Session { id: unsigned(id)?, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, restricted: row.get::<_, i64>(6)? == 1, leave })
+                let id = SessionId::new(unsigned(id)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(3, 0))?;
+                Some(Session { id, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, sign_out: Fingerprint::from_bytes(blob(6)?), leave })
             }
         };
-        Ok((unsigned(row.get(0)?)?, DeviceRow { number: unsigned(row.get(1)?)?, secret: Fingerprint::from_bytes(blob(2)?), session }))
+        let id = DeviceId::new(unsigned(row.get(0)?)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+        Ok((id, DeviceRow { number: unsigned(row.get(1)?)?, secret: Fingerprint::from_bytes(blob(2)?), session }))
     })?;
     for found in found {
         let (id, device) = found?;
@@ -602,10 +620,11 @@ pub enum Change<'a> {
     Erase { account: u64 },
     /// An account's password (or none: it waits for one to be chosen).
     Password { account: u64, password: Option<&'a Password> },
-    /// A one-time code's fingerprint, good until `until` (S8 makes it; 8.5).
-    Code { account: u64, code: &'a [u8; 32], made_at: u64, until: u64 },
-    /// Every one-time code of an account gone.
-    Codes { account: u64 },
+    /// The live one-time code's keyed fingerprint, by the number C3r gave it, good until
+    /// `until` (S8 makes it; 8.5). Any code of the account before it goes.
+    Code { account: u64, number: u64, code: &'a [u8; 32], made_at: u64, until: u64 },
+    /// Every one-time code of an account gone, but the live one (`keep`, by its number).
+    Codes { account: u64, keep: Option<u64> },
     /// A new restore number, and when; every session ended (12.4 steps 1 and 2).
     Restore { restore: u64, at: u64, from: Option<u64> },
 }
@@ -621,11 +640,16 @@ impl std::fmt::Debug for Change<'_> {
             Change::Heard { device, at } => f.debug_struct("Heard").field("device", device).field("at", at).finish(),
             Change::Erase { account } => f.debug_struct("Erase").field("account", account).finish(),
             Change::Password { account, password } => f.debug_struct("Password").field("account", account).field("set", &password.is_some()).finish(),
-            Change::Code { account, made_at, until, .. } => f.debug_struct("Code").field("account", account).field("made_at", made_at).field("until", until).finish_non_exhaustive(),
-            Change::Codes { account } => f.debug_struct("Codes").field("account", account).finish(),
+            Change::Code { account, number, made_at, until, .. } => f.debug_struct("Code").field("account", account).field("number", number).field("made_at", made_at).field("until", until).finish_non_exhaustive(),
+            Change::Codes { account, keep } => f.debug_struct("Codes").field("account", account).field("keep", keep).finish(),
             Change::Restore { restore, at, from } => f.debug_struct("Restore").field("restore", restore).field("at", at).field("from", from).finish(),
         }
     }
+}
+
+/// An email as the data keeps it: as C7 tidies one, and nothing else.
+fn canonical(text: &str) -> Option<Email> {
+    Email::new(text).filter(|email| email.as_str() == text)
 }
 
 fn status_word(status: Status) -> &'static str {
@@ -642,21 +666,23 @@ fn recovery_word(recovery: Option<MusicRecovery>) -> Option<&'static str> {
 
 fn set_state(step: &rusqlite::Transaction<'_>, account: u64, state: &AccountState) -> rusqlite::Result<usize> {
     step.execute(
-        "UPDATE accounts SET email = ?2, life = ?3, status = ?4, password_changes = ?5, reset_required = ?6, code_available = ?7, admin = ?8, music_login = ?9, music_managed = ?10, music_recovery = ?11, history_held = ?12, revision = ?13 WHERE number = ?1",
+        "UPDATE accounts SET email = ?2, life = ?3, status = ?4, password_changes = ?5, reset_required = ?6, code_number = ?7, code_used = ?8, admin = ?9, music_login = ?10, music_managed = ?11, music_recovery = ?12, history_held = ?13, revision = ?14, code_expires = ?15 WHERE number = ?1",
         params![
             number(account)?,
-            state.name.as_str(),
+            state.email.as_str(),
             number(state.life)?,
             status_word(state.status),
             number(state.password_changes)?,
             i64::from(state.password_reset_required),
-            i64::from(state.code_available),
+            state.code.map(|code| number(code.number)).transpose()?,
+            i64::from(state.code.is_some_and(|code| code.used)),
             i64::from(state.admin),
             number(state.music_login)?,
             i64::from(state.music_managed),
             recovery_word(state.music_recovery),
             i64::from(state.history_held),
-            number(state.revision)?
+            number(state.revision)?,
+            state.code.map(|code| number(code.expires)).transpose()?
         ],
     )
 }
@@ -666,8 +692,8 @@ impl Change<'_> {
         match *self {
             Change::Account { number: account, shown, state } => {
                 step.execute(
-                    "INSERT INTO accounts (number, email, shown, life, status, password_changes, reset_required, code_available, admin, music_login, music_managed, history_held, revision) VALUES (?1, ?2, ?3, 0, 'on', 0, 0, 0, 0, 0, 0, 0, 0)",
-                    params![number(account)?, state.name.as_str(), shown],
+                    "INSERT INTO accounts (number, email, shown, life, status, password_changes, reset_required, code_used, admin, music_login, music_managed, history_held, revision) VALUES (?1, ?2, ?3, 0, 'on', 0, 0, 0, 0, 0, 0, 0, 0)",
+                    params![number(account)?, state.email.as_str(), shown],
                 )?;
                 set_state(step, account, state)?;
             }
@@ -677,29 +703,41 @@ impl Change<'_> {
                 }
                 let mut ids: Vec<i64> = Vec::new();
                 for (&id, device) in &rows.devices {
+                    let id = id.get();
                     ids.push(number(id)?);
                     step.execute(
                         "INSERT INTO devices (id, account, secret, name, kind, version, first_signed_in, number) VALUES (?1, ?2, ?3, '', 'pc', '', ?4, ?5)
                          ON CONFLICT (id) DO UPDATE SET number = excluded.number WHERE devices.account = excluded.account",
                         params![number(id)?, number(account)?, device.secret.as_bytes().as_slice(), number(at)?, number(device.number)?],
                     )?;
-                    step.execute("DELETE FROM sessions WHERE device = ?1", [number(id)?])?;
-                    if let Some(session) = &device.session {
-                        let leave = session.leave.map(|leave| leave.fields());
-                        step.execute(
-                            "INSERT INTO sessions (device, id, hash, last_used, restricted, leave_for, leave_life, leave_granted, leave_serial) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                            params![
-                                number(id)?,
-                                number(session.id)?,
-                                session.hash.as_bytes().as_slice(),
-                                number(session.last_used)?,
-                                i64::from(session.restricted),
-                                leave.map(|(purpose, ..)| crate::store::apart::leave_for_word(purpose)),
-                                leave.map(|(_, life, ..)| number(life)).transpose()?,
-                                leave.map(|(_, _, granted, _)| number(granted)).transpose()?,
-                                leave.map(|(.., serial)| number(serial)).transpose()?
-                            ],
-                        )?;
+                    match &device.session {
+                        None => {
+                            step.execute("DELETE FROM sessions WHERE device = ?1", [number(id)?])?;
+                        }
+                        Some(session) => {
+                            let leave = session.leave.as_ref().map(|leave| leave.fields());
+                            // With the session, the fingerprint of the secret that can only end it (11).
+                            step.execute(
+                                "INSERT INTO sessions (device, id, hash, last_used, sign_out, leave_for, leave_life, leave_revision, leave_admin, leave_granted, leave_serial, leave_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                 ON CONFLICT (device) DO UPDATE SET id = excluded.id, hash = excluded.hash, last_used = excluded.last_used, sign_out = excluded.sign_out,
+                                 leave_for = excluded.leave_for, leave_life = excluded.leave_life, leave_revision = excluded.leave_revision, leave_admin = excluded.leave_admin,
+                                 leave_granted = excluded.leave_granted, leave_serial = excluded.leave_serial, leave_hash = excluded.leave_hash",
+                                params![
+                                    number(id)?,
+                                    number(session.id.get())?,
+                                    session.hash.as_bytes().as_slice(),
+                                    number(session.last_used)?,
+                                    session.sign_out.as_bytes().as_slice(),
+                                    leave.map(|(intent, ..)| crate::store::apart::intent_word(intent)),
+                                    leave.map(|(_, life, ..)| number(life)).transpose()?,
+                                    leave.map(|(_, _, revision, ..)| number(revision)).transpose()?,
+                                    leave.map(|(_, _, _, admin, ..)| i64::from(admin)),
+                                    leave.map(|(_, _, _, _, granted, ..)| number(granted)).transpose()?,
+                                    leave.map(|(.., serial, _)| number(serial)).transpose()?,
+                                    leave.map(|(.., hash)| hash.as_bytes().to_vec())
+                                ],
+                            )?;
+                        }
                     }
                 }
                 let mut statement = step.prepare("SELECT id FROM devices WHERE account = ?1")?;
@@ -727,14 +765,15 @@ impl Change<'_> {
                     params![number(account)?, hash, salt, memory, passes, lanes],
                 )?;
             }
-            Change::Code { account, code, made_at, until } => {
+            Change::Code { account, number: code_number, code, made_at, until } => {
+                step.execute("DELETE FROM codes WHERE account = ?1", [number(account)?])?;
                 step.execute(
-                    "INSERT INTO codes (account, code, made_at, until) VALUES (?1, ?2, ?3, ?4)",
-                    params![number(account)?, code.as_slice(), number(made_at)?, number(until)?],
+                    "INSERT INTO codes (account, number, code, made_at, until) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![number(account)?, number(code_number)?, code.as_slice(), number(made_at)?, number(until)?],
                 )?;
             }
-            Change::Codes { account } => {
-                step.execute("DELETE FROM codes WHERE account = ?1", [number(account)?])?;
+            Change::Codes { account, keep } => {
+                step.execute("DELETE FROM codes WHERE account = ?1 AND (?2 IS NULL OR number != ?2)", params![number(account)?, keep.map(number).transpose()?])?;
             }
             Change::Restore { restore, at, from } => {
                 step.execute("DELETE FROM sessions", [])?;
