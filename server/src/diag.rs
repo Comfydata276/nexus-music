@@ -12,6 +12,7 @@ use nexus_core::nexus::kept::{Access, SessionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::accounts::session::refused;
+use crate::store::keeper::Keeper;
 use crate::events::{
     Calls, UploadLimit, admit_upload, answer, arrive, authenticated, bearer, denied, finish,
     inspect_session, list_response, receipt, respond, result, signed_in, sql, unavailable,
@@ -36,11 +37,9 @@ pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: B
             let (number, device, mut account) = signed_in(keeper, &upload.head, &hash)?;
             permit.check(number, device)?;
             let at = keeper.clock(now).effective();
-            let db = keeper.data().connection();
-            let wait = report_wait(db, device, at).map_err(unavailable)?;
-            if wait != 0 {
+            if let Err(reason) = check_gap(keeper, device, at) {
                 inspect_session(keeper, &mut account, device, &hash, now)?;
-                return Err(Refusal::Busy { retry_after_seconds: account::Wait::new(wait.div_ceil(1000)) });
+                return Err(reason);
             }
             arrive(keeper, &upload.head, &hash, device, &mut account, Access::Write, now)?;
             let matches = keeper.write_data(now, |tx| keep(tx, number, device, upload, at))
@@ -54,13 +53,19 @@ pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: B
     finish(outcome)
 }
 
-fn report_wait(db: &Connection, device: DeviceId, now: u64) -> rusqlite::Result<u64> {
-    let last = db.query_row(
+pub(crate) fn check_gap(keeper: &Keeper, device: DeviceId, now: u64) -> Result<(), Refusal> {
+    let device = sql(device.get()).map_err(unavailable)?;
+    let last: Option<i64> = keeper.data().connection().query_row(
         "SELECT received_ms FROM diagnostic_reports WHERE device = ?1 ORDER BY row_id DESC LIMIT 1",
-        [sql(device.get())?],
-        |row| row.get::<_, i64>(0),
-    ).optional()?;
-    Ok(last.map_or(0, |received| MIN_GAP_MS.saturating_sub(now.saturating_sub(received as u64))))
+        [device],
+        |row| row.get(0),
+    ).optional().map_err(unavailable)?;
+    let wait = last.map_or(0, |received| MIN_GAP_MS.saturating_sub(now.saturating_sub(received as u64)));
+    if wait == 0 {
+        Ok(())
+    } else {
+        Err(Refusal::Busy { retry_after_seconds: account::Wait::new(wait.div_ceil(1000)) })
+    }
 }
 
 fn keep(tx: &Transaction<'_>, account: u64, device: DeviceId, upload: Upload, now: u64) -> rusqlite::Result<(bool, bool)> {

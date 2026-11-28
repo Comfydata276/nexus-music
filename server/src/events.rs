@@ -201,10 +201,18 @@ pub(crate) async fn admit_upload(
                 reason
             }
         })?;
-        inspect_session(keeper, &mut account, device, &hash, clock())?;
+        let now = clock();
+        inspect_session(keeper, &mut account, device, &hash, now)?;
         let key = match limit {
             UploadLimit::Account => number,
-            UploadLimit::Device => device.get(),
+            UploadLimit::Device => {
+                // The official uploader's head is enough to return the cooldown
+                // here. The write turn checks it again after decoding any upload.
+                if restore == Some(keeper.restore()) {
+                    crate::diag::check_gap(keeper, device, keeper.clock(now).effective())?;
+                }
+                device.get()
+            }
         };
         if !slots.lock().unwrap_or_else(|error| error.into_inner()).insert(key) {
             return Err(busy());

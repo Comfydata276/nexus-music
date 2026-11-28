@@ -518,6 +518,9 @@ fn diagnostics_cooldown_spares_the_writer_and_allows_known_device_sign_in() {
     let before = changes();
     let (status, body) = fixture.post(diag::SEND_PATH, Some(&who), next.bytes());
     assert!(matches!(diag::read_reply(status, &body).unwrap(), Reply::Refused(Refusal::Busy { .. })));
+    let head_end = next.bytes().iter().position(|&byte| byte == b'}').unwrap();
+    let (status, _) = fixture.post(diag::SEND_PATH, Some(&who), &next.bytes()[..=head_end]);
+    assert_eq!(status, 429, "a cooling device is refused before report parsing");
     assert_eq!(changes(), before);
 
     let barrier = Barrier::new(13);
