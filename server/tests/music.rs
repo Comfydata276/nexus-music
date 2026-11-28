@@ -306,11 +306,16 @@ impl Serving {
     }
 
     fn post(&self, path: &str, session: Option<&Session>, body: &[u8]) -> (u16, Vec<u8>) {
+        self.post_with(path, session, "", body)
+    }
+
+    /// The same, with more headers (each line ending in CRLF).
+    fn post_with(&self, path: &str, session: Option<&Session>, more: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.at).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
         let authorization = session.map_or_else(String::new, |session| format!("Authorization: {}\r\n", session.authorization().as_str()));
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}Connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}{more}Connection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
@@ -775,4 +780,56 @@ fn the_address_people_use_is_never_connected_to_and_another_container_address_ne
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// C5's gap (the review of S9): an admin who HAS a music login is handed it on the app, and
+/// never on the admin's page: not in the page's sign-in answer, not when the page asks for it,
+/// and not when the page's session asks without a browser's headers (the session's kind,
+/// core's, is what withholds it).
+#[test]
+fn an_admin_with_a_music_login_is_not_handed_it_at_the_page() {
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("page-login");
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (internal, _) = stand_in(&runtime);
+    let port = free_port();
+    let mut settings = folders.settings_at(port, &internal);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let admin_code = code_from(&settings, &["set-up", ADMIN, "Admin"]);
+    let backend = Serving::start(&settings, port);
+    let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
+    let admin_id = signed.person.id;
+    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    assert!(matches!(admin.set_music_server("https://music.example.test"), admin::Reply::Done(_)));
+    assert_eq!(admin.set_music_login(admin_id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
+    // The admin's app: handed it.
+    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
+    // The page's sign-in, from its own origin, marked: not handed it.
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    let request = SignIn {
+        credential: with_password(ADMIN, PASSWORD),
+        device_secret: DeviceSecret::from_bytes([7; 32]),
+        device_name: Name::new("Nexus admin browser").unwrap(),
+        device_kind: DeviceKind::Pc,
+        app_version: Version::parse("0.41.0").unwrap(),
+        speaks: SPEAKS,
+        restore: None,
+    };
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, account::encode(&request).unwrap().bytes());
+    let at_page = match account::read_reply::<SignedIn>(status, &body).unwrap() {
+        Reply::Done { result, .. } => result,
+        other => panic!("the page did not sign in: {status} {other:?}"),
+    };
+    assert_eq!(at_page.music, MusicLoginResult::NoneSetYet, "the page's sign-in was handed a music login");
+    let asked = |more: &str| {
+        let (status, body) = backend.post_with(account::MUSIC_LOGIN, Some(&at_page.session), more, account::encode(&GetMusicLogin { head: head(at_page.restore) }).unwrap().bytes());
+        match account::read_reply::<MusicLoginResult>(status, &body).unwrap() {
+            Reply::Done { result, .. } => result,
+            other => panic!("no answer: {status} {other:?}"),
+        }
+    };
+    assert_eq!(asked(&page), MusicLoginResult::NoneSetYet, "the page was handed a music login");
+    assert_eq!(asked(""), MusicLoginResult::NoneSetYet, "the page's session was handed a music login without a browser's headers");
+    // The same admin's app, still.
+    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
 }

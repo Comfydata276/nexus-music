@@ -796,3 +796,41 @@ fn with_strangers_holding_every_general_slot_people_already_known_still_get_in()
     }
     assert!(turned.load(Ordering::SeqCst) > 0, "the flood was never turned away");
 }
+
+/// C5's gap (the review of S9): over HTTP, from the page's own origin and marked as the page,
+/// an account that is NOT an admin's, with its right password, is answered exactly as a wrong
+/// password and the try is recorded as one (M2): the route hands the page's sign-in to the
+/// accounts as the page's. From the app, the same account signs in.
+#[test]
+fn a_member_at_the_page_with_the_right_password_is_a_wrong_password_over_http() {
+    use nexus_music_server::accounts::setup::{CodeKey, make_code};
+    use nexus_music_server::store::keeper::{First, Keeper};
+    const PAGE: &str = "https://nexus.example.test";
+    const MEMBER: &str = "member@example.org";
+    let folders = Folders::new("page-member");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    set_up(&settings, EMAIL);
+    // An account that is not an admin's, made in the data with a code of its own (the page's
+    // call that makes one is the admin page's slice).
+    let code = {
+        let now = now_ms();
+        let (mut keeper, _) = Keeper::open(&folders.root.join("state"), &folders.root.join("data"), now).unwrap();
+        let (code, print) = make_code(&CodeKey::of(&keeper)).unwrap();
+        keeper.make_account(MEMBER, "Sam", false, First::Code(&print, now + 15 * 60 * 1000), now).unwrap();
+        keeper.close();
+        code
+    };
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Sam's phone", DeviceKind::Phone));
+    assert!(!signed_in(status, &body).person.admin);
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    std::thread::sleep(Duration::from_millis(1_100));
+    let (wrong_status, wrong) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, "not robin's password, a guess"), 7, "Nexus admin browser", DeviceKind::Pc));
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(MEMBER, PASSWORD), 8, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 403);
+    assert_eq!((status, &body), (wrong_status, &wrong), "the right password of a member at the page said something a wrong one does not");
+    let (status, _) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(MEMBER, PASSWORD), 8, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 429, "the page's refusal of a member was not recorded as a wrong try");
+}
