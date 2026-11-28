@@ -241,7 +241,7 @@ impl<'a> Fields<'a> {
         plain_json(raw.get()).map(Self)
     }
 
-    pub(crate) fn get<T: wire::Value>(&self, key: &str) -> Result<T, BadMessage> {
+    pub(crate) fn get<T: Value>(&self, key: &str) -> Result<T, BadMessage> {
         T::read(self.0.get(key).ok_or(BadMessage::Form)?)
     }
 
