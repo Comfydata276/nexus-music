@@ -267,6 +267,7 @@ pub const ROUTES: &[Route] = &[
     Route::new(diag::SEND_PATH, "POST", diag::CALL_BYTES),
     Route::new(crate::diag::LIST_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(crate::diag::ADMIN_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::listening::PATH, "POST", admin::REQUEST_MAX_BYTES),
     // The admin's calls of S9: the two that carry a password at 4 KiB, the address at the grant
     // envelope's own ceiling, the read small.
     Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
