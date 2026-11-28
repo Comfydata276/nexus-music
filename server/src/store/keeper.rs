@@ -1195,6 +1195,9 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
         let _ = fs::remove_file(&staged);
         refused
     };
+    // A copy of an older form is brought forward before anything reads it with this
+    // program's forms (the forms' steps; a newer one was refused when it was opened).
+    data::bring_forward(&staged).map_err(|why| unstage(nothing(why)))?;
     // 2. The staged file itself, checked and planned by core before anything is recorded.
     let plan = (|| -> Result<Store, Refused> {
         // The very file staged: its hash, and its own backend id (read from it, not from the
