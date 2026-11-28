@@ -325,8 +325,21 @@ pub(crate) fn begin_search(words: &str, requests: bool) {
     }
     let key = search_key(words);
     let words = events::clean_text(words);
-    let Some(id) = new_id() else { return };
-    let search = Search { key, words, id, at: now_ms(), requests: requests.then(new_id).flatten() };
+    let Some(id) = new_id() else {
+        COUNTERS.drop_event();
+        if requests {
+            COUNTERS.drop_event();
+        }
+        return;
+    };
+    let requests_id = requests.then(|| {
+        let id = new_id();
+        if id.is_none() {
+            COUNTERS.drop_event();
+        }
+        id
+    }).flatten();
+    let search = Search { key, words, id, at: now_ms(), requests: requests_id };
     SEARCH.with_borrow_mut(|pending| {
         if pending.len() == QUEUE_LENGTH {
             finish_search(pending.remove(0), 0, None);
@@ -442,7 +455,10 @@ pub(crate) fn started(
         (play.began, sound)
     });
     let position_ms = ms(position);
-    let Some(song_id) = journal_id(&song.id) else { return };
+    let Some(song_id) = journal_id(&song.id) else {
+        COUNTERS.drop_event();
+        return;
+    };
     let from = origin.cloned().unwrap_or_else(|| played_from(route, song));
     if let Some(start) = note(|| Some(Kind::Start {
         song_id,
