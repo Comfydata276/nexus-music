@@ -230,23 +230,29 @@ fn a_restore_under_way_is_done_again_from_the_start() {
 
 #[test]
 fn what_was_under_way_is_finished_the_same_way_by_a_start_and_by_either_command() {
-    let put_back = Some(Pending::PutBack { restore: 3 });
-    // A put-back's copy still staged: it takes the data's place first.
-    assert_eq!(resume(put_back.as_ref(), true, None), Resume::PutInPlace { restore: 3 });
-    assert_eq!(resume(put_back.as_ref(), true, Some(2)), Resume::PutInPlace { restore: 3 });
-    // In place: brought to the restore number planned, never a new one.
-    assert_eq!(resume(put_back.as_ref(), false, Some(2)), Resume::Restore { restore: 3, adopt: false });
-    assert_eq!(resume(put_back.as_ref(), false, Some(3)), Resume::Restore { restore: 3, adopt: false });
-    assert_eq!(resume(put_back.as_ref(), false, None), Resume::Stop(Halt::CopyLost));
-    assert_eq!(resume(Some(&Pending::Restore { restore: 3 }), false, Some(2)), Resume::Restore { restore: 3, adopt: false });
-    assert_eq!(resume(Some(&Pending::TakeAsIs { restore: 3 }), true, Some(3)), Resume::Restore { restore: 3, adopt: true });
-    assert_eq!(resume(Some(&Pending::Restore { restore: 3 }), false, None), Resume::Stop(Halt::NoData));
-    for pending in [Pending::Restore { restore: 3 }, Pending::PutBack { restore: 3 }, Pending::TakeAsIs { restore: 3 }] {
-        assert_eq!(resume(Some(&pending), false, Some(4)), Resume::Stop(Halt::DataRestoreAhead), "{pending:?}");
+    let copy = CopyIdentity { hash: [7; 32], changes: 40, written_at: 900 };
+    let put_back = Some(Pending::PutBack { restore: 3, copy });
+    let in_place = |restore, changes, written_at| Some(InPlace { restore, changes, written_at });
+    // The copy planned, still staged: it takes the data's place first. Any other: nothing.
+    assert_eq!(resume(put_back.as_ref(), Some(&[7; 32]), in_place(2, 99, 5)), Resume::PutInPlace { restore: 3 });
+    assert_eq!(resume(put_back.as_ref(), Some(&[7; 32]), None), Resume::PutInPlace { restore: 3 });
+    assert_eq!(resume(put_back.as_ref(), Some(&[8; 32]), None), Resume::Stop(Halt::NotTheCopy));
+    // In place: the copy (its changes and time), or the restore's own step already written.
+    assert_eq!(resume(put_back.as_ref(), None, in_place(2, 40, 900)), Resume::Restore { restore: 3, adopt: false });
+    assert_eq!(resume(put_back.as_ref(), None, in_place(3, 41, 950)), Resume::Restore { restore: 3, adopt: false });
+    // Other data in its place (a wrong folder, the incumbent): nothing is done with it.
+    assert_eq!(resume(put_back.as_ref(), None, in_place(2, 41, 900)), Resume::Stop(Halt::NotTheCopy));
+    assert_eq!(resume(put_back.as_ref(), None, in_place(0, 40, 901)), Resume::Stop(Halt::NotTheCopy));
+    assert_eq!(resume(put_back.as_ref(), None, None), Resume::Stop(Halt::CopyLost));
+    assert_eq!(resume(Some(&Pending::Restore { restore: 3 }), None, in_place(2, 0, 0)), Resume::Restore { restore: 3, adopt: false });
+    assert_eq!(resume(Some(&Pending::TakeAsIs { restore: 3 }), Some(&[1; 32]), in_place(3, 0, 0)), Resume::Restore { restore: 3, adopt: true });
+    assert_eq!(resume(Some(&Pending::Restore { restore: 3 }), None, None), Resume::Stop(Halt::NoData));
+    for pending in [Pending::Restore { restore: 3 }, Pending::PutBack { restore: 3, copy }, Pending::TakeAsIs { restore: 3 }] {
+        assert_eq!(resume(Some(&pending), None, in_place(4, 40, 900)), Resume::Stop(Halt::DataRestoreAhead), "{pending:?}");
     }
     // Nothing under way, or only a change between the two stores: the start compares.
-    assert_eq!(resume(None, true, Some(2)), Resume::Nothing);
-    assert_eq!(resume(under_way().as_ref(), false, Some(2)), Resume::Nothing);
+    assert_eq!(resume(None, Some(&[7; 32]), in_place(2, 0, 0)), Resume::Nothing);
+    assert_eq!(resume(under_way().as_ref(), None, in_place(2, 0, 0)), Resume::Nothing);
 }
 
 #[test]
@@ -266,22 +272,10 @@ fn a_copy_is_put_back_only_if_this_store_can_take_it_under_one_new_number() {
     unknown.accounts.insert(ACCOUNT + 1, unknown.accounts[&ACCOUNT].clone());
     assert_eq!(put_back(&store, &unknown), Err(NotPutBack::Contradiction(Contradiction::AccountUnknown)));
     // A restore under way is finished first, not begun again.
-    for pending in [Pending::Restore { restore: 3 }, Pending::PutBack { restore: 3 }, Pending::TakeAsIs { restore: 3 }] {
+    for pending in [Pending::Restore { restore: 3 }, Pending::PutBack { restore: 3, copy: CopyIdentity { hash: [0; 32], changes: 0, written_at: 0 } }, Pending::TakeAsIs { restore: 3 }] {
         assert_eq!(put_back(&StoreView { pending: Some(pending), ..store.clone() }, &copy), Err(NotPutBack::UnderWay));
     }
     assert_eq!(put_back(&StoreView { restore: u64::MAX, ..store.clone() }, &copy), Err(NotPutBack::Spent));
-}
-
-#[test]
-fn a_copy_already_in_place_and_untouched_is_not_put_back_twice() {
-    let (store, data) = both();
-    let written = 77;
-    assert!(already_put_back(&StoreView { mark: 12, ..store.clone() }, &data, Some(written), written));
-    // Written since, another copy, under way, or never restored: put back.
-    assert!(!already_put_back(&StoreView { mark: 11, ..store.clone() }, &data, Some(written), written));
-    assert!(!already_put_back(&StoreView { mark: 12, ..store.clone() }, &data, Some(written), written + 1));
-    assert!(!already_put_back(&StoreView { mark: 12, pending: Some(Pending::PutBack { restore: 2 }), ..store.clone() }, &data, Some(written), written));
-    assert!(!already_put_back(&StoreView { mark: 12, ..store.clone() }, &data, None, written));
 }
 
 #[test]
