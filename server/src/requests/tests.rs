@@ -1050,6 +1050,37 @@ fn restart_after_lidarr_took_the_search_does_not_send_the_command_again() {
 }
 
 #[test]
+fn a_late_lidarr_answer_does_not_lose_the_placement_or_the_cancellation() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("late-mutations", Some(endpoint(lidarr.address)));
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let member = server.redeem(member, 2, "");
+    let change = Change::Request { offer: server.offer(&member) };
+
+    lidarr.hold_response(Some(("POST", "/api/v1/command")));
+    let job = begun(server.call(&member, begin(1, change)));
+    lidarr.wait_for_call("POST command");
+    thread::sleep(UPSTREAM_TIMEOUT + Duration::from_millis(150));
+    lidarr.hold_response(None);
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+    assert!(matches!(server.call(&member, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable));
+    let search_calls = lidarr.take_calls();
+    assert_eq!(search_calls.iter().filter(|&call| call == "POST command").count(), 1);
+
+    lidarr.hold_response(Some(("PUT", "/api/v1/album/monitor")));
+    let job = begun(server.call(&member, begin(2, cancelled())));
+    lidarr.wait_for_call("PUT album/monitor");
+    thread::sleep(UPSTREAM_TIMEOUT + Duration::from_millis(150));
+    lidarr.hold_response(None);
+    assert_eq!(server.done(&member, job), Completed::Cancelled);
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.is_empty()));
+    let cancel_calls = lidarr.take_calls();
+    assert_eq!(cancel_calls.iter().filter(|&call| call == "PUT album/monitor").count(), 1);
+}
+
+#[test]
 fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
     let lidarr = MockLidarr::start();
     lock(&lidarr.state).new_releases = Some("none".into());
