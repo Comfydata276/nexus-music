@@ -528,7 +528,6 @@ dd, li { overflow-wrap: anywhere; }
     no_such_session: "That device has signed out or signed in again. Refresh the devices first.",
     music_login_refused: "That music server username or password is not right. Check both and try again.",
     lidarr_login_refused: "Lidarr refused that key. Check it and try again.",
-    lidarr_unreachable: "Lidarr could not be reached. Check that it’s running and try again.",
     conflict: "Someone changed these settings already. Refresh them and try again.",
   };
 
@@ -1249,7 +1248,8 @@ dd, li { overflow-wrap: anywhere; }
         request_id, change: proposed.change, grant: issued.grant,
       }, 4096);
       if (session !== current) return;
-      message(proposed.options.saved, !proposed.options.codeFor);
+      const confirmation = proposed.options.saved;
+      message(typeof confirmation === "function" ? confirmation(saved) : confirmation, !proposed.options.codeFor);
       if (proposed.options.codeFor) showCode(saved.code, proposed.options.codeFor);
       if (proposed.options.done) proposed.options.done();
       refreshAfter(current, proposed.options.refresh);
@@ -1389,7 +1389,7 @@ dd, li { overflow-wrap: anywhere; }
     const by = document.createElement("p");
     writeText(by, "Requested by " + row.name + " on " + requestDate.format(Number(asked.asked_ms)));
     const arrival = document.createElement("p");
-    writeText(arrival, row.arrived === true ? "Arrived" : row.arrived === false ? "Not here yet" : "Arrival unknown");
+    writeText(arrival, row.arrived === true ? "Arrived" : "Asked");
     item.append(title, by, arrival);
     return item;
   }
@@ -1441,6 +1441,13 @@ dd, li { overflow-wrap: anywhere; }
   });
   requestHistoryPage.more.addEventListener("click", loadRequestHistory);
 
+  function lidarrKeySaved({ check }) {
+    if (check === "works") return "The Lidarr key works and is set.";
+    if (check === "unreachable") return "Lidarr could not be reached. The key was saved without a check.";
+    if (check === undefined) return "Lidarr key saved.";
+    throw new Error();
+  }
+
   lidarrForm.addEventListener("submit", event => {
     event.preventDefault();
     const key = field("lidarr-key");
@@ -1452,7 +1459,7 @@ dd, li { overflow-wrap: anywhere; }
     const change = { key };
     reviewChange("set-lidarr", change, change, "Save Lidarr key",
       "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".",
-      { saved: "Lidarr key saved.", refresh: "lidarr" });
+      { saved: lidarrKeySaved, refresh: "lidarr" });
   });
 
   diagnosticsToggle.addEventListener("click", () => {

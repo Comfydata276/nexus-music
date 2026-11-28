@@ -701,23 +701,31 @@ test("requests shows one container instruction and no key field when Lidarr has 
   assert.ok(page.button("requests-list", "Turn requests off"));
 });
 
-test("a refused Lidarr key and an unreachable Lidarr give distinct guidance", async () => {
+test("Lidarr key setup distinguishes a refusal from both successful saves", async () => {
   const mock = adminStandIn();
-  let reason;
-  const page = loadPage((path, options) => path === "/nexus/api/admin/set-lidarr"
-    ? new Response(JSON.stringify({ refused: { not_allowed: reason } }), { status: 403 })
-    : mock.fetch(path, options));
+  let check;
+  const page = loadPage(async (path, options) => {
+    if (path !== "/nexus/api/admin/set-lidarr") return mock.fetch(path, options);
+    if (check === "refused") {
+      return new Response('{"refused":{"not_allowed":"lidarr_login_refused"}}', { status: 403 });
+    }
+    const saved = await mock.fetch(path, options);
+    assert.equal(saved.status, 200);
+    return new Response(JSON.stringify({ done: { check } }));
+  });
   await page.signIn("owner@example.test", adminPassword);
   await settle();
-  for (const [refusal, message] of [
-    ["lidarr_login_refused", "Lidarr refused that key. Check it and try again."],
-    ["lidarr_unreachable", "Lidarr could not be reached. Check that it’s running and try again."],
+  for (const [outcome, message, configured] of [
+    ["refused", "Lidarr refused that key. Check it and try again.", false],
+    ["unreachable", "Lidarr could not be reached. The key was saved without a check.", true],
+    ["works", "The Lidarr key works and is set.", true],
   ]) {
-    reason = refusal;
+    check = outcome;
     page.submit("lidarr-form", { "lidarr-key": lidarrKey });
     await page.submit("grant-form", { "grant-password": adminPassword });
+    await settle();
     assert.equal(page.from("lidarr-key").value, "");
-    assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is not set.");
+    assert.equal(page.from("lidarr-key-status").textContent, configured ? "Lidarr key is set." : "Lidarr key is not set.");
     assert.equal(page.from("change-status").textContent, message);
   }
 });
@@ -767,11 +775,11 @@ test("request history displays text and uses the exact snapshot cursor", async (
   const list = page.from("request-history-list");
   assert.match(textOf(list), /Night Walk <script>example\(\)<\/script>/);
   assert.match(textOf(list), /Requested by Jamie <b>Chen<\/b> on/);
-  assert.match(textOf(list.children[0]), /Arrival unknown/);
+  assert.equal(list.children[0].children.at(-1).textContent, "Asked");
   assert.match(textOf(list.children[1]), /Arrived/);
   await page.click("request-history-more");
   assert.match(calls[1], /"after":\[18446744073709551614,2\]/);
-  assert.match(textOf(list.children[2]), /Not here yet/);
+  assert.equal(list.children[2].children.at(-1).textContent, "Asked");
   assert.ok(page.from("request-history-more").hidden);
   page.windowEvents.get("pagehide")();
   assert.equal(list.children.length, 0);
