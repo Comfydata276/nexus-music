@@ -282,6 +282,17 @@ impl Address {
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()
     }
+    /// Compare the HTTP stack's parsed request immediately before sending. Supply the
+    /// effective port and an IPv6 host with its URI brackets, without re-parsing the
+    /// stack's encoded path or query. An absent query differs from an empty one.
+    pub fn matches_request(&self, scheme: &str, host: &str, port: u16, path: &str, query: Option<&str>) -> bool {
+        scheme == self.origin.scheme
+            && host == self.origin.host
+            && port == self.origin.port
+            && path == self.path
+            && query == self.query()
+    }
+
     pub fn wire(&self) -> String {
         let mut s = format!("{}{}", self.origin, self.path);
         if let Some(q) = &self.query {
@@ -338,6 +349,95 @@ impl Address {
         }
         let (parent, _) = self.path.rsplit_once('/').ok_or(AddressError::Path)?;
         Self::from_parts(self.origin.clone(), &format!("{parent}/{hier}"), query)
+    }
+}
+
+/// Only the transport opening the answer can attest to the line and device credential.
+/// Supply the address on the dispatched request, never a URL supplied by its response.
+pub enum HandoverSource<'a> {
+    DeviceTokenAnswer(&'a Address),
+    Other,
+}
+
+/// A server base checked for use on the music line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicBase(Address);
+
+impl MusicBase {
+    pub fn typed(text: &str) -> Result<Self, AddressError> {
+        Self::checked(Address::typed(text)?, true)
+    }
+
+    /// Section 7.2's pure checks. Transport lifetime, pairing the returned base with
+    /// the credential in this very answer, and rotating the generation belong to the app.
+    pub fn handed_over(nexus: &Origin, source: HandoverSource<'_>, text: &str) -> Result<Self, AddressError> {
+        use crate::nexus::proto::plain;
+        match source {
+            HandoverSource::DeviceTokenAnswer(sent)
+                if sent.origin() == nexus && sent.query().is_none() && plain(sent.path()).is_ok() =>
+            {
+                ()
+            }
+            _ => return Err(AddressError::HandoverSource),
+        }
+        let addr = Address::parse(text)?;
+        let same_origin = addr.origin() == nexus;
+        Self::checked(addr, same_origin)
+    }
+
+    fn checked(addr: Address, shared: bool) -> Result<Self, AddressError> {
+        // the design does not say how a server base's query would be combined with
+        // operation arguments. Refuse even an empty query on a configured music base.
+        if addr.query().is_some() {
+            return Err(AddressError::BaseQuery);
+        }
+        if shared && addr.under_nexus() {
+            return Err(AddressError::NexusPath);
+        }
+        Ok(Self(addr))
+    }
+
+    pub fn address(&self) -> &Address {
+        &self.0
+    }
+
+    /// The transport supplies one operation and its already encoded arguments.
+    pub fn request(&self, operation: &str, query: Option<&str>) -> Result<MusicRequest, AddressError> {
+        check_length(operation)?;
+        if operation.is_empty() || matches!(operation, "." | "..") || !operation.bytes().all(unreserved) {
+            return Err(AddressError::Path);
+        }
+        if let Some(q) = query {
+            check_length(q)?;
+            if !encoded(q) {
+                return Err(AddressError::Query);
+            }
+        }
+        let path = format!("{}/rest/{operation}", self.0.path.trim_end_matches('/'));
+        Ok(MusicRequest(Address::from_parts(self.0.origin.clone(), &path, query)?))
+    }
+}
+
+/// The source for a music redirect can only be built from a checked base. The operation
+/// is read from this request's own path, so it cannot be mislabeled as a different read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicRequest(Address);
+
+impl MusicRequest {
+    pub fn address(&self) -> &Address {
+        &self.0
+    }
+    pub fn operation(&self) -> &str {
+        self.0.path.trim_end_matches('/').rsplit('/').next().unwrap_or_default()
+    }
+
+    /// Section 5.3 checks the path before the query. Only this constructor can turn a
+    /// redirect target back into a music request.
+    pub(crate) fn with_added_slash(&self, target: Address) -> Option<Self> {
+        (self.0.origin == target.origin
+            && target.path.strip_suffix('/') == Some(self.0.path())
+            && self.0.query == target.query)
+            .then_some(Self(target))
     }
 }
 
@@ -512,6 +612,99 @@ mod tests {
             "g/%2e%2e/h",
         ] {
             assert!(base.location(reference).is_err(), "{reference}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod music_tests {
+    use super::*;
+    #[test]
+    fn only_a_device_token_answer_from_the_nexus_line_may_hand_over_a_base() {
+        let sent = Address::parse("https://NEXUS.example.org:443/nexus/api/account").unwrap();
+        let origin = sent.origin();
+        let handover = |text| MusicBase::handed_over(origin, HandoverSource::DeviceTokenAnswer(&sent), text);
+        for text in [
+            "http://music.example.org",
+            "music.example.org",
+            "https://name:pass@music.example.org",
+            "https://nexus.example.org/NEXUS",
+            "https://nexus.example.org/nexus/child",
+            "https://music.example.org/x/%2e%2e/nexus",
+            "https://music.example.org/?",
+            "https://music.example.org/?token=private",
+        ] {
+            assert!(handover(text).is_err(), "{text}");
+        }
+        for text in [
+            "https://music.example.org/nexus",
+            "https://nexus.example.org:444/nexus",
+            "https://nexus.example.org/nexusmusic",
+        ] {
+            assert!(handover(text).is_ok(), "{text}");
+        }
+        assert_eq!(
+            MusicBase::handed_over(origin, HandoverSource::Other, "https://m"),
+            Err(AddressError::HandoverSource)
+        );
+        for url in [
+            "https://nexus.example.org/rest/getSong",
+            "https://other.example.org/nexus/api/account",
+            "https://nexus.example.org/nexus/api/account?x=1",
+        ] {
+            let other = Address::parse(url).unwrap();
+            assert_eq!(
+                MusicBase::handed_over(origin, HandoverSource::DeviceTokenAnswer(&other), "https://m"),
+                Err(AddressError::HandoverSource)
+            );
+        }
+    }
+
+    #[test]
+    fn compare_the_components_the_stack_will_send() {
+        let a = Address::parse("https://[2001:db8::1]/rest/ping?").unwrap();
+        assert!(a.matches_request("https", "[2001:db8::1]", 443, "/rest/ping", Some("")));
+        for (s, h, p, path, q) in [
+            ("http", "[2001:db8::1]", 443, "/rest/ping", Some("")),
+            ("https", "[2001:db8::2]", 443, "/rest/ping", Some("")),
+            ("https", "[2001:db8::1]", 8443, "/rest/ping", Some("")),
+            ("https", "[2001:db8::1]", 443, "/rest/ping/", Some("")),
+            ("https", "[2001:db8::1]", 443, "/rest/ping", None),
+        ] {
+            assert!(!a.matches_request(s, h, p, path, q));
+        }
+    }
+
+    #[test]
+    fn music_transport_builds_its_own_path() {
+        for text in [
+            "m/nexus",
+            "m/Nexus/sub",
+            "m/sub/../nexus",
+            "m/nexus/../rest",
+            "m/%6eexus",
+            "m//nexus",
+            "http://m",
+            "m?x=private",
+        ] {
+            assert!(MusicBase::typed(text).is_err());
+        }
+        for (base, path) in [
+            ("m", "/rest/ping"),
+            ("m/sub/path", "/sub/path/rest/ping"),
+            ("m/sub/path/", "/sub/path/rest/ping"),
+        ] {
+            let base = MusicBase::typed(base).unwrap();
+            let req = base.request("ping", Some("x=%2F")).unwrap();
+            assert_eq!(req.operation(), "ping");
+            assert_eq!(req.address().path(), path);
+            assert_eq!(req.address().query(), Some("x=%2F"));
+            for operation in ["", ".", "..", "ping/", "/nexus", "../ping", "%2F", "ping?"] {
+                assert!(base.request(operation, None).is_err());
+            }
+            assert!(base.request("ping", Some("x=#hidden")).is_err());
+            assert!(base.request(&"a".repeat(MAX_ADDRESS_BYTES + 1), None).is_err());
+            assert!(base.request("ping", Some(&"a".repeat(MAX_ADDRESS_BYTES + 1))).is_err());
         }
     }
 }
