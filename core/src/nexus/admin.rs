@@ -284,6 +284,7 @@ object! { GetLidarrSetting { head: RequestHead } }
 pub struct LidarrSetting {
     pub address: Option<InternalAddress>,
     pub configured: bool,
+    pub checked: bool,
 }
 
 impl wire::Value for LidarrSetting {
@@ -291,10 +292,11 @@ impl wire::Value for LidarrSetting {
         let fields = Fields::read(raw)?;
         let address: Option<InternalAddress> = fields.get("address")?;
         let configured = fields.get("configured")?;
-        if configured && address.is_none() {
+        let checked = fields.0.get("checked").map(|value| bool::read(value)).transpose()?.unwrap_or(false);
+        if (configured && address.is_none()) || (checked && !configured) {
             return Err(BadMessage::Form);
         }
-        Ok(Self { address, configured })
+        Ok(Self { address, configured, checked })
     }
 }
 object! { DiagnosticsDefault { enabled: bool } }
@@ -769,15 +771,19 @@ mod tests {
     #[test]
     fn lidarr_setting_shows_only_the_configured_address_and_key_status() {
         round_trip(GetLidarrSetting { head: head() });
-        round_trip(Reply::Done(LidarrSetting { address: None, configured: false }));
+        round_trip(Reply::Done(LidarrSetting { address: None, configured: false, checked: false }));
         let address = InternalAddress::new("http://lidarr.example.test:8686").unwrap();
-        let reply = Reply::Done(LidarrSetting { address: Some(address), configured: true });
+        let reply = Reply::Done(LidarrSetting { address: Some(address.clone()), configured: true, checked: true });
         let body = encode(&reply).unwrap();
         assert_eq!(
             body.bytes(),
-            br#"{"done":{"address":"http://lidarr.example.test:8686","configured":true}}"#
+            br#"{"done":{"address":"http://lidarr.example.test:8686","configured":true,"checked":true}}"#
         );
         assert_eq!(read_reply(200, body.bytes()), Ok(reply));
+        let legacy = br#"{"done":{"address":"http://lidarr.example.test:8686","configured":true}}"#;
+        assert_eq!(read_reply(200, legacy), Ok(Reply::Done(LidarrSetting {
+            address: Some(address), configured: true, checked: false,
+        })));
         assert_eq!(
             read_reply::<LidarrSetting>(200, br#"{"done":{"address":null,"configured":true}}"#),
             Err(BadMessage::Form)
@@ -1181,13 +1187,14 @@ mod tests {
             Ok::<_, std::convert::Infallible>(())
         }).unwrap().unwrap();
         actor.request(1, kept::Clock::new(4, 4), |turn| {
-            turn.install_lidarr(bearer(request_id), authorized, &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
+            turn.install_lidarr(bearer(request_id), authorized, &current, &key, LidarrKeyCheck::Works, &sealing, [0x68; LIDARR_NONCE_BYTES])
         }).apply(|effects| {
             let [update] = effects.updates.as_slice() else { panic!("expected one update") };
-            let DataChange::InstallLidarrKey { binding, sealed } = &update.change else {
+            let DataChange::InstallLidarrKey { binding, sealed, check } = &update.change else {
                 panic!("expected the sealed key effect");
             };
             assert_eq!(binding, &other_revision);
+            assert_eq!(*check, LidarrKeyCheck::Works);
             assert!(sealing.open(&current, sealed).is_none());
             assert_eq!(sealing.open(binding, sealed).as_ref(), Some(&key));
             assert!(update.apart_first.devices.get(&device).unwrap().permit.as_ref().unwrap().leave.is_none());

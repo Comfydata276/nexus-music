@@ -241,6 +241,10 @@ pub const MIGRATIONS: &[Migration] = &[
         form: 3,
         sql: "CREATE INDEX listening_by_time ON listening_events(at_ms DESC, row_id DESC) WHERE is_start = 1;",
     },
+    Migration {
+        form: 4,
+        sql: "ALTER TABLE meta ADD COLUMN lidarr_checked_seal BLOB CHECK (length(lidarr_checked_seal) = 32);",
+    },
 ];
 
 /// Form 2 (S13, for the audit's B-M1): the asked history keeps what it shows of each release
@@ -461,6 +465,14 @@ impl Data {
     /// What the data says of itself.
     pub fn meta(&self) -> rusqlite::Result<Meta> {
         meta_of(&self.connection)
+    }
+
+    /// Whether the exact key seal from the separate store passed its check.
+    pub fn lidarr_checked(&self, stamp: &[u8; 32]) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT lidarr_checked_seal IS ?1 FROM meta WHERE one = 1",
+            [stamp.as_slice()], |row| row.get(0),
+        )
     }
 
     /// Every account's email, by number.
@@ -767,6 +779,8 @@ pub enum Change<'a> {
     MusicPublic { address: &'a str },
     /// The admin's default for Diagnostics (14), backend-wide (`hello` says it). `persist` only.
     DiagnosticsDefault { on: bool },
+    /// The identifier of a checked key seal, or none after an unchecked save.
+    LidarrChecked { stamp: Option<[u8; 32]> },
 }
 
 impl std::fmt::Debug for Change<'_> {
@@ -786,6 +800,7 @@ impl std::fmt::Debug for Change<'_> {
             Change::MusicLogin { account, install, .. } => f.debug_struct("MusicLogin").field("account", account).field("count", &install.binding.count).finish_non_exhaustive(),
             Change::MusicPublic { .. } => f.debug_struct("MusicPublic").finish_non_exhaustive(),
             Change::DiagnosticsDefault { on } => f.debug_struct("DiagnosticsDefault").field("on", on).finish(),
+            Change::LidarrChecked { .. } => f.debug_struct("LidarrChecked").finish_non_exhaustive(),
         }
     }
 }
@@ -947,6 +962,10 @@ impl Change<'_> {
             }
             Change::DiagnosticsDefault { on } => {
                 step.execute("UPDATE meta SET diagnostics_default = ?1 WHERE one = 1", [i64::from(on)])?;
+            }
+            Change::LidarrChecked { stamp } => {
+                step.execute("UPDATE meta SET lidarr_checked_seal = ?1 WHERE one = 1",
+                    [stamp.as_ref().map(|bytes| bytes.as_slice())])?;
             }
             Change::Restore { restore, at, from } => {
                 step.execute("DELETE FROM sessions", [])?;
