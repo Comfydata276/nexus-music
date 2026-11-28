@@ -66,6 +66,9 @@ pub struct Downloads {
     /// folder, so signing in as someone else doesn't show the last person's.
     account: String,
     next_attempt: u64,
+    /// Songs whose download the music server's refusal of the login stopped (design 6.3):
+    /// not failed, but held, and asked for once more under a renewed login.
+    held: Vec<Song>,
     /// Songs that couldn't be downloaded this session, and why, newest last.
     pub failed: Vec<(Song, String)>,
     saved_at: std::time::Instant,
@@ -108,10 +111,17 @@ pub fn collections_file(dir: &Path, account: &str) -> PathBuf {
 }
 
 impl Downloads {
-    /// Reads the downloads that belong to `account` (empty for nobody: signed out).
+    /// Reads the downloads that belong to `account` (empty for nobody: signed out), claiming
+    /// what 0.28 and before kept for whoever was signed in.
     pub fn load(dir: PathBuf, account: &str) -> Downloads {
+        Self::load_for(dir, account, true)
+    }
+
+    /// The same; what 0.28 and before kept is claimed only when `legacy` (the folder this PC
+    /// had before, carried over: the review's MUST 14).
+    pub fn load_for(dir: PathBuf, account: &str, legacy: bool) -> Downloads {
         let _ = fs::create_dir_all(&dir);
-        if !account.is_empty() {
+        if !account.is_empty() && legacy {
             // Before 0.29 there was one list for whoever was signed in. It becomes the list
             // of the first account to sign in after updating.
             for name in ["index", "collections"] {
@@ -157,6 +167,7 @@ impl Downloads {
             unreadable,
             account: account.to_string(),
             next_attempt: 0,
+            held: Vec::new(),
             failed: Vec::new(),
             saved_at: std::time::Instant::now(),
             batch_total: 0,
@@ -246,8 +257,19 @@ impl Downloads {
     }
 
     /// The folder the downloads are in.
-    pub fn folder(&self) -> &Path {
-        &self.dir
+    /// At an account's leaving: every download under way is cancelled (its worker stops at
+    /// its next read, and its result is not taken).
+    pub fn cancel_all(&mut self) {
+        for job in self.jobs.drain(..) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.under_way.clear();
+        self.held.clear();
+    }
+
+    /// What a refused login held, to be asked for again (once) under a renewed one.
+    pub fn take_held(&mut self) -> Vec<Song> {
+        std::mem::take(&mut self.held)
     }
 
     pub fn has(&self, id: &str) -> bool {
@@ -567,6 +589,8 @@ pub fn same_drive(from: &Path, to: &Path) -> bool {
 #[derive(Debug)]
 enum FetchFailure {
     Cancelled,
+    /// The music server refused the login (or it was set aside): held, not failed.
+    Held,
     Failed { shape: FaultShape, reason: String },
 }
 
@@ -605,7 +629,7 @@ fn fetch(
     // Each go has a file of its own to arrive in, so two goes at one song can't trip over
     // each other.
     let temp = dir.join(format!("{file}.{attempt}.part"));
-    let (mut body, length) = client.open_stream(&url, None).map_err(|e| FetchFailure::failed(diagnostics::connection_shape(&e), e))?;
+    let (mut body, length) = client.open_stream(&url, None).map_err(|e| if client.refused() { FetchFailure::Held } else { FetchFailure::failed(diagnostics::connection_shape(&e), e) })?;
     let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
     let mut out = fs::File::create(&temp).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
     let mut buf = vec![0u8; 128 * 1024];
@@ -683,6 +707,11 @@ impl Controller {
         }
     }
 
+    /// Downloads these quietly: what a refusal held, asked for again.
+    pub fn download_songs_with_quiet(self: &Rc<Self>, songs: Vec<Song>) {
+        self.download_songs_with(songs, true);
+    }
+
     /// `quiet` skips the messages: used when topping up in the background.
     fn download_songs_with(self: &Rc<Self>, songs: Vec<Song>, quiet: bool) {
         let Some(client) = self.client() else { return };
@@ -755,10 +784,14 @@ impl Controller {
             });
         }
         let (dir, covers) = (self.downloads.borrow().dir.clone(), self.paths.covers.clone());
+        // Whose these are: a result that comes back after the account has changed is not
+        // taken for the next one's.
+        let turn = self.turn.get();
         for (song, attempt, progress, cancel) in started {
             // Show it as on its way straight off.
             self.mark_download(&song.id);
             let (client, dir, covers) = (client.clone(), dir.clone(), covers.clone());
+            let dir = dir.clone();
             self.download_pool.spawn(move || {
                 let result = if cancel.load(Ordering::Relaxed) {
                     Err(FetchFailure::Cancelled)
@@ -770,7 +803,15 @@ impl Controller {
                     let _ = crate::covers::ensure_file(&client, &covers, &song.cover_art);
                 }
                 let id = song.id.clone();
-                post(move |ctl| ctl.download_finished(&id, attempt, result));
+                post(move |ctl| {
+                    if ctl.turn.get() == turn {
+                        ctl.download_finished(&id, attempt, result);
+                    } else if let Ok(entry) = result {
+                        // Arrived for an account that is no longer in: the file is nobody's
+                        // list's, and goes.
+                        let _ = fs::remove_file(dir.join(entry.file));
+                    }
+                });
             });
         }
         self.sync_downloads();
@@ -797,9 +838,16 @@ impl Controller {
                         let _ = fs::remove_file(downloads.dir.join(entry.file));
                     }
                 }
+                (Err(FetchFailure::Held), Some(job)) => {
+                    // Not failed: asked for again, once, when the login is renewed.
+                    downloads.batch_total = downloads.batch_total.saturating_sub(1);
+                    downloads.held.retain(|held| held.id != job.song.id);
+                    downloads.held.push(job.song);
+                }
                 (Err(failure), Some(job)) => {
                     let reason = match failure {
                         FetchFailure::Cancelled => "cancelled".into(),
+                        FetchFailure::Held => unreachable!(),
                         FetchFailure::Failed { shape, reason } => {
                             diagnostics::fault(FaultPlace::Downloads, shape);
                             reason
@@ -910,9 +958,17 @@ impl Controller {
                 match moved {
                     Moved::All(_) => {
                         diagnostics::observe(Line::Note(Note::DownloadsFolderChanged));
-                        ctl.settings.borrow_mut().downloads_dir =
-                            if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
-                        *ctl.downloads.borrow_mut() = Downloads::load(folder.clone(), &account);
+                        // This person's folder alone: everyone else's downloads stay where they
+                        // are, and are never taken for theirs.
+                        {
+                            let mut settings = ctl.settings.borrow_mut();
+                            if account.is_empty() {
+                                settings.downloads_dir = if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
+                            } else {
+                                settings.downloads_dirs.insert(account.clone(), folder.display().to_string());
+                            }
+                        }
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(folder.clone(), &account, ctl.legacy_folder());
                         if ctl.settings.borrow().save_surely(&ctl.paths.settings) {
                             ctl.toast(format!("Your downloads are now in {}", folder.display()));
                         } else {
@@ -933,12 +989,12 @@ impl Controller {
                     }
                     Moved::Back { stuck, of } => {
                         diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
-                        *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(from, &account, ctl.legacy_folder());
                         ctl.toast(format!("{stuck} of {of} files couldn't be moved, so the downloads are staying where they were."));
                     }
                     Moved::Split { left } => {
                         diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
-                        *ctl.downloads.borrow_mut() = Downloads::load(from.clone(), &account);
+                        *ctl.downloads.borrow_mut() = Downloads::load_for(from.clone(), &account, ctl.legacy_folder());
                         ctl.toast(format!(
                             "Some files couldn't be moved, and {left} of those that had been couldn't be brought back: they are in {}. The rest are still in {}, where the app goes on keeping your downloads.",
                             folder.display(),

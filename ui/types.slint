@@ -161,6 +161,14 @@ export global App {
     // the Account tab offers the sign-in screen, which is then shown over the app.
     in property <bool> nexus-sign-in-wanted;
     in-out property <bool> show-sign-in;
+    // The Nexus server's machine has not shown its first screen yet (src/nexus/signin.rs): the
+    // window shows neither the sign-in form nor the player until it has.
+    in property <bool> nexus-starting;
+    // Signed in to the Nexus server, whatever the player holds (an account whose admin has
+    // not set its music sign-in yet is signed in, with no music).
+    in property <bool> nexus-signed-in;
+    // A music login is held.
+    in property <bool> nexus-plays;
     // The music server refused the music sign-in (src/subsonic.rs): the component asks the
     // Nexus server for the current one.
     callback music-login-refused();

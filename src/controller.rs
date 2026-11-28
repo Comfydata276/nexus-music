@@ -367,6 +367,12 @@ pub struct Controller {
     client: RefCell<Option<Client>>,
     /// The folder the signed-in person's things are kept under (`config::SignedIn::folder`).
     folder: RefCell<String>,
+    /// Whether that folder is the one this PC had before the Nexus server, carried over to
+    /// this person (design 11): theirs are the files kept as 0.40 kept them.
+    legacy_folder: Cell<bool>,
+    /// Moved at every account entered and left: a late result of work begun for the account
+    /// before is not taken for this one's (the review's MUST 16).
+    pub turn: Cell<u64>,
     nav: RefCell<Nav>,
     cache: RefCell<HashMap<String, (Instant, PageData)>>,
     /// Pages being fetched ahead of a click, so a hover doesn't fetch the same thing twice.
@@ -503,18 +509,16 @@ impl Controller {
         config::mark_window_thread();
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
-        // What writes killed part-way left beside the app's files, for the account signed
-        // in: cleared now, once, before anything is written (`config::clear_leftovers`).
+        // What writes killed part-way left beside the app's files: cleared now, once, before
+        // anything is written (`config::clear_leftovers`). An account's own are cleared when
+        // it is entered, before anything of it is written (`load_account`).
         {
-            let stem = config::load_sign_in(&paths).map(|kept| kept.folder).unwrap_or_default();
-            let downloads = if settings.downloads_dir.is_empty() { paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
             if let Some(dir) = paths.settings.parent() {
-                config::clear_settings_leftovers(dir, &settings.account_file(), &stem);
+                config::clear_settings_leftovers(dir, &settings.account_file(), "");
             }
             if let Some(dir) = paths.crash_log.parent() {
                 config::clear_data_leftovers(dir);
             }
-            config::clear_downloads_leftovers(&downloads, &stem);
         }
         let play_log = {
             let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
@@ -585,6 +589,8 @@ impl Controller {
             media: RefCell::new(None),
             client: RefCell::new(None),
             folder: RefCell::new(String::new()),
+            legacy_folder: Cell::new(false),
+            turn: Cell::new(0),
             nav: RefCell::default(),
             cache: RefCell::default(),
             prefetching: RefCell::default(),
@@ -735,11 +741,13 @@ impl Controller {
         done: impl FnOnce(&Rc<Controller>, ApiResult<T>) + Send + 'static,
     ) {
         let Some(client) = self.client() else { return };
+        let turn = self.turn.get();
         self.api_pool.spawn(move || {
             let result = job(&client);
             post(move |ctl| {
-                // A reply for a session that has since signed out is of no use.
-                if ctl.client().is_some() {
+                // A reply for an account that has since been left (signed out, or another
+                // signed in) is of no use, and is never taken for the one in now.
+                if ctl.client().is_some() && ctl.turn.get() == turn {
                     done(ctl, result);
                 }
             });
@@ -912,26 +920,9 @@ impl Controller {
                 crate::nexus::trace(format_args!("legacy passwords removed {gone}, left {left}"));
             }
         });
-        // Come back signed in when a sign-in is kept: what the Nexus server handed this
-        // device (design 6.1). It is read from this PC and its music login goes straight to
-        // the music server; the Nexus server is asked nothing first.
-        if let Some(kept) = config::load_sign_in(&self.paths)
-            && let Some(music) = kept.plays()
-        {
-            let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
-            {
-                // (The settings name the music account the kept sign-in is for; a settings
-                // file put back from a copy is brought into line with it.)
-                let mut settings = self.settings.borrow_mut();
-                settings.server = client.server().to_string();
-                settings.username = client.username().to_string();
-            }
-            *self.folder.borrow_mut() = kept.folder.clone();
-            self.enter(client, None);
-            // Find out whether the server can be reached at all, and whether it still takes
-            // the music login (if not, the current one is asked for: `music_refused`).
-            self.check_connection();
-        }
+        // Coming back signed in is the Nexus server's component's: it starts the shared
+        // library's machine from what is kept the moment the window exists, and the player is
+        // handed a music login only by it (`signed_in_with`), never read here.
 
         let weak = Rc::downgrade(self);
         self.tick_timer.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
@@ -996,6 +987,11 @@ impl Controller {
     fn start_shell(self: &Rc<Self>) {
         self.ui.window().on_close_requested(|| {
             with(|ctl| {
+                // The window goes (to the tray, or the app ends): a sign-in form on it is
+                // closed, and what was typed into it with it (SHOULD 17).
+                let app = ctl.ui.global::<ui::App>();
+                app.set_show_sign_in(false);
+                app.invoke_form_closed();
                 if !ctl.stays_in_tray() {
                     ctl.quit();
                 }
@@ -1173,8 +1169,11 @@ impl Controller {
     }
 
     pub fn quit(self: &Rc<Self>) {
-        // From the first moment of shutting down, nothing more is sent to keep in step: a
-        // write about to be made is not, and an answer on its way is dropped.
+        // From the first moment of shutting down, nothing more is asked of the Nexus server:
+        // no ask is granted its send, and what is running is ended.
+        crate::nexus::quitting();
+        // Nothing more is sent to keep in step: a write about to be made is not, and an
+        // answer on its way is dropped.
         self.let_go();
         self.save_queue();
         // (The settings are written once, waiting for the disk, as the app ends: `main`.)
@@ -1301,12 +1300,14 @@ impl Controller {
         });
     }
 
-    /// Signs in with a music login the Nexus server has just handed this device (design 9.4),
-    /// for the person whose things are under `folder`: used as a cold start uses it. Called
-    /// by the Nexus server's component, which does the signing in and has already kept it
-    /// (`config::save_sign_in`); never by anything that plays.
-    pub fn signed_in_with(self: &Rc<Self>, music: &config::MusicLogin, folder: &str, nexus: &str, email: &str) {
+    /// Signs in with a music login the Nexus server's machine has handed the player (design
+    /// 9.4; its `Hand::Login`, the only way a login reaches the player), for the person whose
+    /// things are under `folder` (`legacy`: the folder this PC had before, carried over to
+    /// them). `handed` is the login's number and the generation it was handed under: what a
+    /// refusal of it carries back. Never called by anything that plays.
+    pub fn signed_in_with(self: &Rc<Self>, music: &config::MusicLogin, handed: (u64, u64), folder: &str, legacy: bool, nexus: &str, email: &str) {
         let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
+        client.handed_as(handed);
         if self.client().is_some() {
             self.leave("");
         }
@@ -1319,6 +1320,7 @@ impl Controller {
         }
         self.save_settings();
         *self.folder.borrow_mut() = folder.to_string();
+        self.legacy_folder.set(legacy);
         self.covers.reset();
         self.enter(client, None);
         // The server is plainly worth asking: stop treating it as out of reach, and send
@@ -1326,37 +1328,44 @@ impl Controller {
         self.check_connection();
     }
 
-    /// The music login of this number was refused (the shared library's rule, design 6.3):
-    /// nothing more is sent with it, if it is the one in use.
-    pub fn music_set_aside(&self) {
-        if let Some(client) = self.client() {
+    /// The machine set the login of this number aside (design 6.3): nothing more is begun with
+    /// it, if it is the one in use.
+    pub fn music_set_aside(&self, count: u64, generation: u64) {
+        if let Some(client) = self.client()
+            && client.handed().0 == count
+        {
+            let _ = generation;
             client.set_aside();
         }
     }
 
     /// The music server refused `client`'s sign-in (`Client::was_refused`): it sends nothing
-    /// more. If it is the one in use, what is on this PC plays, and the window's handler (the
-    /// Nexus server's component) is told, to ask for the current login (design 6.3).
+    /// more. If it is the one in use, what is on this PC plays, and the machine is told, with
+    /// the number and generation **that** login was handed under.
     pub fn music_refused(self: &Rc<Self>, client: &Client) {
         if !self.client().is_some_and(|current| current.is(client)) {
             return;
         }
         self.set_unreachable(true);
-        self.ui.global::<ui::App>().invoke_music_login_refused();
+        let (count, generation) = client.handed();
+        crate::nexus::music_refused(count, generation);
     }
 
-    /// A new music login for the person signed in (the Nexus server's answer to a refusal,
-    /// or to its number having gone up), already kept: the client replaced by one built from
-    /// it. The person's folder does not change with it. Then the music server is tried once
-    /// (design 6.3).
-    pub fn music_login_renewed(self: &Rc<Self>, music: &config::MusicLogin) {
+    /// A new music login for the person signed in (the machine's answer to a refusal, or to
+    /// its number having gone up), already kept: the client replaced by one built from it.
+    /// The person's folder does not change with it. **What waited is tried once more under
+    /// it** (design 6.3; the review's MUST 7): the music server once, the song that was
+    /// waiting, and the downloads the refusal held.
+    pub fn music_login_renewed(self: &Rc<Self>, music: &config::MusicLogin, handed: (u64, u64)) {
         let Some(current) = self.client() else { return };
         let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
         // The same pair is the same login: kept as it is (refused, it stays set aside, and is
-        // never sent again as it was).
+        // never sent again as it was), now under the number and generation handed.
         if current.same_pair(&client) {
+            current.handed_as(handed);
             return;
         }
+        client.handed_as(handed);
         if client.server() != current.server() || client.username() != current.username() {
             // Another music server or user for the same person: the same folder, and the
             // music that is shown changes with it.
@@ -1366,16 +1375,19 @@ impl Controller {
                 settings.username = client.username().to_string();
             }
             self.save_settings();
-            let folder = self.folder.borrow().clone();
+            let (folder, legacy) = (self.folder.borrow().clone(), self.legacy_folder.get());
             self.leave("");
             *self.folder.borrow_mut() = folder;
+            self.legacy_folder.set(legacy);
             self.covers.reset();
             self.enter(client, None);
         } else {
             client.set_offline(self.settings.borrow().offline);
             *self.client.borrow_mut() = Some(client);
+            self.covers.reset();
         }
         self.check_connection();
+        self.retry_after_renewal();
     }
 
     /// Switches from the sign-in screen to the app proper.
@@ -1391,7 +1403,14 @@ impl Controller {
         let warm = client.clone();
         self.art_pool.spawn(move || warm.warm_up(6));
         *self.client.borrow_mut() = Some(client);
+        // A new account's turn: what was begun for the one before is not taken for this one.
+        self.turn.set(self.turn.get().wrapping_add(1));
+        // The songs kept from streaming are this person's and this music server's alone.
+        self.song_cache.scope(&format!("{}\n{}\n{}", self.folder.borrow(), self.client().map(|c| c.server().to_string()).unwrap_or_default(), self.client().map(|c| c.username().to_string()).unwrap_or_default()));
         self.load_account();
+        // Recently played is this person's.
+        *self.history.borrow_mut() = config::load_history(&self.queue_files().2);
+        self.sync_history();
         app.set_signed_in(true);
         *self.nav.borrow_mut() = Nav::default();
         self.cache.borrow_mut().clear();
@@ -1422,22 +1441,70 @@ impl Controller {
         (!account.is_empty()).then(|| config::pending_file(&self.paths, &account))
     }
 
+    /// Whether the person's folder is the one this PC had before, carried over to them.
+    pub fn legacy_folder(&self) -> bool {
+        self.legacy_folder.get()
+    }
+
+    /// Where this person's queue, its place and Recently played are kept: as 0.40 kept them
+    /// for the folder this PC had before (carried over) and for nobody; in files of their
+    /// own for everyone else (the review's MUST 16).
+    pub fn queue_files(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let folder = self.folder.borrow();
+        if folder.is_empty() || self.legacy_folder.get() {
+            return (self.paths.queue.clone(), self.paths.queue_place.clone(), self.paths.history.clone());
+        }
+        let at = |name: &str| self.paths.settings.with_file_name(format!("{name}-{folder}.json"));
+        (at("queue"), at("queue-place"), at("history"))
+    }
+
+    /// Where this person's downloads are: the folder chosen for them under Settings, or else,
+    /// for the folder this PC had before (carried over), where 0.40 kept them; for everyone
+    /// else, a folder of their own inside it (the review's MUST 15: one person's files are
+    /// never another's).
+    pub fn downloads_dir_for(&self, folder: &str, legacy: bool) -> PathBuf {
+        let settings = self.settings.borrow();
+        if let Some(chosen) = settings.downloads_dirs.get(folder) {
+            return PathBuf::from(chosen);
+        }
+        let base = if settings.downloads_dir.is_empty() { self.paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
+        if folder.is_empty() || legacy { base } else { base.join(folder) }
+    }
+
     /// Brings in what belongs to the account that has just signed in: its downloads, and
     /// the likes, ratings and plays still waiting to be sent for it. Each account has its
-    /// own, so one person's never show up for, or get sent as, another.
+    /// own, so one person's never show up for, or get sent as, another. What 0.28 and before
+    /// kept for whoever was signed in is claimed only by the folder carried over.
     fn load_account(&self) {
         let account = self.account();
-        let folder = self.downloads.borrow().folder().to_path_buf();
-        *self.downloads.borrow_mut() = crate::downloads::Downloads::load(folder, &account);
+        let legacy = self.legacy_folder.get();
+        let dir = self.downloads_dir_for(&account, legacy);
+        // What writes killed part-way left of this account's: once, before anything of it is
+        // written.
+        if !account.is_empty() {
+            config::clear_account_leftovers(&self.paths, &dir, &account);
+        }
+        *self.downloads.borrow_mut() = crate::downloads::Downloads::load_for(dir, &account, legacy);
         self.sending.borrow_mut().clear();
         let held = self.pending_path().map(|path| {
-            // Before 0.29 there was one list for whoever was signed in.
-            if !path.exists() && self.paths.pending.exists() {
+            // Before 0.29 there was one list for whoever was signed in: the carried-over
+            // folder's alone.
+            if legacy && !path.exists() && self.paths.pending.exists() {
                 let _ = std::fs::rename(&self.paths.pending, &path);
             }
             crate::offline::load_pending(&path)
         });
         *self.pending.borrow_mut() = held.unwrap_or_default();
+    }
+
+    /// After a renewed music login: what the refusal held is tried once under it (design 6.3).
+    fn retry_after_renewal(self: &Rc<Self>) {
+        let waiting = self.downloads.borrow_mut().take_held();
+        if !waiting.is_empty() {
+            self.download_songs_with_quiet(waiting);
+        }
+        self.retry_current_now();
+        self.sync_collections();
     }
 
     // ---- asking for albums that aren't in the library -------------------------------------------
@@ -2530,12 +2597,17 @@ impl Controller {
         self.keep_saved_queue.set(false);
         self.queue_saved.set(0);
         // What belongs to this account is on disk; none of it stays on screen or in hand.
+        // Its downloads under way are cancelled, and a late result of anything begun for it
+        // is not taken for the next account's (`turn`).
+        self.turn.set(self.turn.get().wrapping_add(1));
         {
             let mut downloads = self.downloads.borrow_mut();
+            downloads.cancel_all();
             downloads.save_if_due(true);
-            let folder = downloads.folder().to_path_buf();
+            let folder = self.downloads_dir_for("", false);
             *downloads = crate::downloads::Downloads::load(folder, "");
         }
+        self.fetch_ahead.want(Vec::new());
         self.pending.borrow_mut().clear();
         self.sending.borrow_mut().clear();
         self.stop_sync();
@@ -2558,12 +2630,15 @@ impl Controller {
     /// sign-in left (`config::save_sign_in`), when the person signs out or the Nexus server
     /// says this PC's session has ended (design 11). `message` is said on the sign-in screen.
     pub fn sign_out(self: &Rc<Self>, message: &str) {
-        self.saver.remove(self.paths.queue.clone());
-        self.saver.remove(self.paths.queue_place.clone());
-        let _ = std::fs::remove_file(&self.paths.history);
+        let (queue, place, history) = self.queue_files();
+        self.saver.remove(queue);
+        self.saver.remove(place);
+        let _ = std::fs::remove_file(&history);
         self.history.borrow_mut().clear();
+        self.sync_history();
         self.leave(message);
         self.folder.borrow_mut().clear();
+        self.legacy_folder.set(false);
         // Signing in again starts from whatever the server has.
         self.queue_stamp.set(0);
         self.settings.borrow_mut().sync_playlist.clear();
@@ -4401,6 +4476,7 @@ impl Controller {
         settings.on_set_offline(|on| {
             with(|ctl| {
                 let changed = ctl.settings.borrow().offline != on;
+                crate::nexus::offline_is(on);
                 if changed && on {
                     diagnostics::offline_changed(true);
                 }

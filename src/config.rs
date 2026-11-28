@@ -167,6 +167,11 @@ pub struct Settings {
     pub download_quality: u32,
     /// The folder downloads are kept in; empty for the app's own.
     pub downloads_dir: String,
+    /// A downloads folder chosen under Settings by one person on this PC, by their folder's
+    /// name (`Controller::downloads_dir_for`): moving one person's downloads moves theirs
+    /// alone, and leaves everyone else's where they are.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub downloads_dirs: std::collections::BTreeMap<String, String>,
     /// The folder songs are kept in as they play; empty for the app's own. Read when the app
     /// starts.
     pub songs_dir: String,
@@ -273,6 +278,7 @@ impl Default for Settings {
             exclusive: false,
             download_quality: 0,
             downloads_dir: String::new(),
+            downloads_dirs: Default::default(),
             songs_dir: String::new(),
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
@@ -964,6 +970,19 @@ pub fn clear_settings_leftovers(dir: &Path, account_file: &str, account_stem: &s
     clear_leftovers(dir, own, &old);
 }
 
+/// One account's own, when it is entered (before anything of it is written): its list of
+/// changes waiting to be sent, its queue, its place and Recently played (their files of its
+/// own), and its two lists of downloads.
+pub fn clear_account_leftovers(paths: &Paths, downloads: &Path, account_stem: &str) {
+    if let Some(dir) = paths.settings.parent() {
+        let names = ["pending", "queue", "queue-place", "history"].map(|name| format!("{name}-{account_stem}"));
+        let own = |name: &str| names.iter().any(|stem| name == format!("{stem}.json"));
+        let old: Vec<String> = names.iter().map(|stem| format!("{stem}.tmp")).collect();
+        clear_leftovers(dir, own, &old);
+    }
+    clear_downloads_leftovers(downloads, account_stem);
+}
+
 /// The data folder's: the crash note's marker's (0.40.10 wrote it in place: nothing old).
 pub fn clear_data_leftovers(dir: &Path) {
     clear_leftovers(dir, |name| name == "crash.seen", &[]);
@@ -1097,67 +1116,87 @@ pub struct SignedIn {
     /// the session and the note that can end it, and the music login with its number.
     #[serde(default)]
     pub saved: Option<serde_json::Value>,
-    /// The music login in it, as a cold start reads it (written with it, in the same step).
-    #[serde(default)]
-    pub music: Option<MusicLogin>,
     /// The name of the folder this person's things are kept under on this PC (downloads,
     /// the changes waiting for the music server): decided once, at the sign-in that made it
     /// (`folder_for`), and from then on tied to who they are to the backend, never to the
     /// music server and user.
     #[serde(default)]
     pub folder: String,
+    /// The request that handed over the music login in `saved` (its address, exactly as it
+    /// was sent): what the music server's address is checked against at every start.
+    #[serde(default)]
+    pub handed_at: String,
 }
 
 impl std::fmt::Debug for SignedIn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SignedIn {{ saved: {}, music: {:?}, folder: {:?} }}", self.saved.is_some(), self.music, self.folder)
+        write!(f, "SignedIn {{ saved: {}, folder: {:?} }}", self.saved.is_some(), self.folder)
     }
 }
 
-impl SignedIn {
-    /// Whether a cold start can play from it: a music login, and the folder it is for.
-    pub fn plays(&self) -> Option<&MusicLogin> {
-        self.music.as_ref().filter(|music| !self.folder.is_empty() && !music.server.is_empty() && !music.username.is_empty() && !music.salt.is_empty() && !music.token.is_empty())
-    }
+/// The sign-in this PC had before the Nexus server, and what became of its folder (design
+/// 11; the review of W7, MUST 14): **captured once**, at the first start of this version,
+/// before anything can change the settings' music server and user, and **decided once**, at
+/// the first music login kept on this PC: carried over to that person if the shared library
+/// says their login names that same music server and user, else to nobody, ever. Kept in a
+/// file of its own (`nexus-legacy.json`), which a sign-out does not touch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Legacy {
+    pub server: String,
+    pub username: String,
+    /// Whether the folder's fate is decided (true at once when there was no sign-in before).
+    pub decided: bool,
+    /// Who it was carried over to (`Legacy::who`), if anyone.
+    pub carried_to: Option<String>,
 }
 
-/// The name it is kept under.
-const SIGNED_IN: &str = "nexus-sign-in";
-
-/// What the last sign-in left, if anything is kept and it can be read whole.
-pub fn load_sign_in(paths: &Paths) -> Option<SignedIn> {
-    let text = crate::nexus::vault::read(paths, SIGNED_IN).ok()??;
-    serde_json::from_str(&text).ok()
-}
-
-/// Puts what a sign-in left in place, whole, in one step; nothing kept, if it holds nothing.
-/// Says whether it was done.
-pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
-    if kept.saved.is_none() {
-        return crate::nexus::vault::forget(paths, SIGNED_IN);
-    }
-    serde_json::to_string(kept).is_ok_and(|text| crate::nexus::vault::write(paths, SIGNED_IN, &zeroize::Zeroizing::new(text)))
-}
-
-/// The folder a person's things are kept under, decided at their first sign-in on this PC
-/// (design 11). **What is carried over, exactly:** the folder of the sign-in this PC had
-/// before the Nexus server (named by the music server and user, `account_stem`) becomes
-/// the person's, **once**, when the shared library says the music login they are handed
-/// names that same music server and user (its `client::carries_over`, which
-/// the caller asks and passes as `same`). Every other person, and anyone handed that music
-/// user later, gets a folder named by who they are to the backend: its id and their
-/// account's number. Whoever calls this writes the carry-over down
-/// (`Settings::carried_over`) when it says one was made, so that it happens once.
-pub fn folder_for(settings: &Settings, backend: &str, account: u64, same: bool) -> (String, bool) {
-    let who = format!("{backend}\n{account}");
-    if let Some((owner, folder)) = &settings.carried_over {
-        if owner == &who {
-            return (folder.clone(), false);
+impl Legacy {
+    /// What the settings say now, at the first start of this version (and what the first
+    /// build of W7 decided, if it did).
+    pub fn of(settings: &Settings) -> Legacy {
+        let none = settings.server.is_empty() || settings.username.is_empty();
+        Legacy {
+            server: settings.server.clone(),
+            username: settings.username.clone(),
+            decided: none || settings.carried_over.is_some(),
+            carried_to: settings.carried_over.as_ref().map(|(who, _)| who.clone()),
         }
-    } else if same && !settings.server.is_empty() && !settings.username.is_empty() {
-        return (crate::controller::account_stem(&settings.server, &settings.username), true);
     }
-    (person_folder(backend, account), false)
+
+    /// Who a person is to a backend, as the decision names them.
+    pub fn who(backend: &str, account: u64) -> String {
+        format!("{backend}\n{account}")
+    }
+
+    /// The folder the sign-in before had (`downloads/index-<stem>.json` and the rest).
+    pub fn stem(&self) -> String {
+        crate::controller::account_stem(&self.server, &self.username)
+    }
+}
+
+fn legacy_path(paths: &Paths) -> PathBuf {
+    paths.settings.with_file_name("nexus-legacy.json")
+}
+
+/// The decision, as kept. An unreadable one is an error, never taken for none.
+pub fn load_legacy(paths: &Paths) -> std::io::Result<Legacy> {
+    let bytes = fs::read(legacy_path(paths))?;
+    serde_json::from_slice(&bytes).map_err(std::io::Error::from)
+}
+
+pub fn save_legacy(paths: &Paths, legacy: &Legacy) -> std::io::Result<()> {
+    write_surely(&legacy_path(paths), &serde_json::to_vec(legacy)?)
+}
+
+/// At each start: what the window knew is kept, if nothing is kept yet. Once kept, never
+/// replaced from the settings.
+pub fn keep_legacy(paths: &Paths, legacy: &Legacy) -> std::io::Result<()> {
+    match fs::metadata(legacy_path(paths)) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => save_legacy(paths, legacy),
+        Err(error) => Err(error),
+    }
 }
 
 /// A folder named by who a person is to the backend: its id and their account's number.
@@ -1165,22 +1204,6 @@ pub fn person_folder(backend: &str, account: u64) -> String {
     use sha2::{Digest, Sha256};
     let hash: String = Sha256::digest(format!("{backend}\n{account}").as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
     format!("nexus-{account}-{hash}")
-}
-
-/// The sign-outs the Nexus server has not taken yet (the shared library's notes, as it
-/// serialises them, each ending one session and nothing else), kept beside the sign-in.
-const NOTES: &str = "nexus-sign-out-notes";
-
-pub fn load_notes(paths: &Paths) -> Vec<serde_json::Value> {
-    crate::nexus::vault::read(paths, NOTES).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
-}
-
-/// Puts the notes in place, whole, in one step; says whether it was done.
-pub fn save_notes(paths: &Paths, notes: &[serde_json::Value]) -> bool {
-    if notes.is_empty() {
-        return crate::nexus::vault::forget(paths, NOTES);
-    }
-    serde_json::to_string(notes).is_ok_and(|text| crate::nexus::vault::write(paths, NOTES, &text))
 }
 
 /// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this

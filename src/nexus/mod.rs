@@ -179,6 +179,23 @@ pub fn install(ui: &ui::MainWindow) {
     trigger_for_tests(ui);
 }
 
+/// The music server refused the login of this number and generation: told to the machine.
+pub fn music_refused(count: u64, generation: u64) {
+    signin::music_refused(count, generation);
+}
+
+/// Offline mode switched by the person: kept for the machine's next start.
+pub fn offline_is(on: bool) {
+    signin::offline_is(on);
+}
+
+/// From the first moment of quitting: the machine stops, so that no ask is granted its send,
+/// and every ask's process still running is ended.
+pub fn quitting() {
+    signin::stop();
+    call::shutdown();
+}
+
 /// At the app's end: a look still running is killed, and reaped without blocking for more
 /// than [`REAP`]. Called by `main` after the window has closed.
 pub fn shutdown() {
@@ -335,8 +352,8 @@ fn commit(ui: &ui::MainWindow, generation: u64, account: &str, url: &str, outcom
     settings.set_nexus_for(if sabotaged { published(ui) } else { account.to_string() }.into());
     note(format_args!("shown {generation} {outcome:?}"));
     schedule(ui, generation, again());
-    if outcome == Outcome::Found && !sabotaged {
-        signin::after_look(ui);
+    if !sabotaged {
+        signin::after_look(outcome == Outcome::Found);
     }
 }
 

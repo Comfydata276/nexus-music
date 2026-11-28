@@ -1380,6 +1380,26 @@ impl Controller {
         self.ui.global::<ui::Player>().set_reconnecting(true);
     }
 
+    /// A renewed music login (design 6.3): the song that was waiting for the server, or
+    /// between its tries at reconnecting, is tried once more now, under the new login. A
+    /// stream that is still arriving is left to arrive.
+    pub fn retry_current_now(self: &Rc<Self>) {
+        let (token, waiting) = {
+            let pb = self.playback.borrow();
+            (pb.current_token, pb.waiting_for_server)
+        };
+        if token == 0 {
+            return;
+        }
+        if waiting {
+            return self.resume_waiting();
+        }
+        if self.retry_timer.running() {
+            self.retry_timer.stop();
+            self.retry_current(token);
+        }
+    }
+
     /// The server is back: carry on with a song that was waiting for it.
     pub fn resume_waiting(self: &Rc<Self>) {
         let position = {
@@ -1994,7 +2014,7 @@ impl Controller {
             }
             history.insert(0, crate::config::Played { song, at: chrono::Utc::now().timestamp() });
             history.truncate(HISTORY_LENGTH);
-            crate::config::save_history(&self.paths.history, &history);
+            crate::config::save_history(&self.queue_files().2, &history);
         }
         self.sync_history();
         self.share_soon();
@@ -2055,8 +2075,8 @@ impl Controller {
             // Nothing to come back to, unless the saved copy is being held on to (see `leave`).
             if !self.keep_saved_queue.get() {
                 self.queue_saved.set(0);
-                self.saver.remove(self.paths.queue.clone());
-                self.saver.remove(self.paths.queue_place.clone());
+                self.saver.remove(self.queue_files().0);
+                self.saver.remove(self.queue_files().1);
             }
             return;
         }
@@ -2078,21 +2098,21 @@ impl Controller {
                 stamp,
                 source_list: pb.source_list.clone(),
             };
-            self.saver.write(self.paths.queue.clone(), move || serde_json::to_vec(&saved).ok());
+            self.saver.write(self.queue_files().0, move || serde_json::to_vec(&saved).ok());
         }
         let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_owner.taken() };
-        self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
+        self.saver.write(self.queue_files().1, move || serde_json::to_vec(&place).ok());
     }
 
     /// Brings back the queue from the last run, paused where it stopped.
     pub fn restore_queue(self: &Rc<Self>) {
         // Anything still on its way to disk gets there first.
         self.saver.flush();
-        let Some(mut saved) = SavedQueue::load(&self.paths.queue) else { return };
+        let Some(mut saved) = SavedQueue::load(&self.queue_files().0) else { return };
         let shape =
             crate::config::queue_shape(&saved.songs, &saved.order, &saved.context, &saved.source, &saved.origins, &saved.source_list);
         // Where playback had got to, if that was noted for this same queue.
-        let place = crate::config::QueuePlace::load(&self.paths.queue_place);
+        let place = crate::config::QueuePlace::load(&self.queue_files().1);
         if let Some(place) = place.filter(|place| place.shape == shape && place.cursor < saved.order.len()) {
             saved.cursor = place.cursor;
             saved.position = place.position;
@@ -2128,7 +2148,7 @@ impl Controller {
         let stamp = if saved.stamp > 0 {
             saved.stamp
         } else {
-            std::fs::metadata(&self.paths.queue)
+            std::fs::metadata(&self.queue_files().0)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
