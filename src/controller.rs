@@ -1538,6 +1538,16 @@ impl Controller {
 
     /// Sets up (or drops) the connection to Lidarr from what's in Settings.
     pub fn connect_requests(&self) {
+        let routed = self.ui.global::<ui::Settings>();
+        let direct = crate::requests::direct_selected();
+        routed.set_direct_requests(direct);
+        routed.set_nexus_requests_detail(crate::requests::settings_text().into());
+        crate::lidarr::set_singles(self.settings.borrow().request_singles);
+        if !direct {
+            crate::lidarr::set_current_made_of(None, String::new());
+            self.ui.global::<ui::App>().set_requests(crate::app_nexus_calls::current().is_some());
+            return;
+        }
         // Versions before 0.13.1 could keep a password for a sign-in in front of Lidarr.
         if config::load_secret(&self.paths, "lidarr-password").is_some() {
             config::save_secret(&self.paths, "lidarr-password", "");
@@ -1567,9 +1577,48 @@ impl Controller {
             }
         };
         self.ui.global::<ui::App>().set_requests(lidarr.is_some());
-        crate::lidarr::set_singles(self.settings.borrow().request_singles);
         let (lidarr, made_of) = lidarr.map_or((None, String::new()), |(lidarr, made_of)| (Some(lidarr), made_of));
         crate::lidarr::set_current_made_of(lidarr, made_of);
+    }
+
+    fn requests_folder(&self) -> PathBuf {
+        self.paths.settings.parent().unwrap_or(&self.paths.pages).to_path_buf()
+    }
+
+    pub(crate) fn requests_source_changed(self: &Rc<Self>) {
+        self.connect_requests();
+        if crate::requests::direct_selected() {
+            self.push_settings();
+            self.run_bulk();
+        } else if let Some(connection) = crate::requests::current() {
+            crate::requests::batch::run(connection, self.requests_folder(), None);
+        }
+        self.server_batch_changed();
+        self.refresh_outside();
+        self.reload_requests();
+    }
+
+    pub(crate) fn server_batch_changed(&self) {
+        let view = self.ui.global::<ui::View>();
+        let batch = match crate::requests::current() {
+            Some(crate::requests::Connection::Server { context, .. }) => crate::requests::batch::view(context),
+            _ => crate::requests::batch::View::default(),
+        };
+        view.set_server_batch_notice(batch.notice.into());
+        let lines = batch.lines.into_iter().map(|line| ui::BatchRequestLine {
+            title: line.title.into(),
+            detail: line.detail.into(),
+        }).collect::<Vec<_>>();
+        view.set_server_batch_lines(ModelRc::new(VecModel::from(lines)));
+    }
+
+    fn request_error(self: &Rc<Self>, reason: String, via_server: bool) {
+        if via_server && crate::requests::switched_off(&reason) {
+            crate::requests::refresh();
+            self.navigate(Route::Requests);
+        } else {
+            self.toast(reason);
+        }
     }
 
     /// The credential store, where Lidarr's key and the sign-in's token are kept (see `keep`).
@@ -1629,6 +1678,7 @@ impl Controller {
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
     /// sign-in answers instead, goes on to that.
     fn save_requests(&self, address: &str, key: &str) {
+        if !crate::requests::direct_selected() { return; }
         // An address with a name and password in it, or one the app might read otherwise than
         // its connections would, isn't kept: nor is the key typed with it.
         // (The address already saved, submitted with only a new key, is judged as it was saved.)
@@ -1681,6 +1731,7 @@ impl Controller {
     /// `by_hand` when someone pressed Connect: then a sign-in that's needed is started
     /// straight away, not just offered.
     pub fn check_requests(&self, by_hand: bool) {
+        if !crate::requests::direct_selected() { return; }
         let Some(lidarr) = crate::lidarr::current() else {
             // One kept by an older version that this one won't use says why.
             let address = self.settings.borrow().lidarr_address.clone();
@@ -1703,7 +1754,7 @@ impl Controller {
             };
             post(move |ctl| {
                 // Only the newest check counts.
-                if ctl.requests_check.get() == check {
+                if crate::requests::direct_selected() && ctl.requests_check.get() == check {
                     ctl.requests_checked(by_hand, answer, gate);
                 }
             });
@@ -1741,6 +1792,7 @@ impl Controller {
 
     /// Starts a sign-in to what's in front of Lidarr: opens it in the browser and waits.
     fn sign_in_requests(&self) {
+        if !crate::requests::direct_selected() { return; }
         let found = {
             let settings = self.settings.borrow();
             crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() }
@@ -1850,6 +1902,7 @@ impl Controller {
     }
 
     fn sign_out_requests(&self) {
+        if !crate::requests::direct_selected() { return; }
         self.drop_sign_in();
         self.save_settings();
         self.connect_requests();
@@ -1868,12 +1921,13 @@ impl Controller {
     /// Asks whether to request an album that isn't in the library. `song` is the song that
     /// led here, if it was one: the album is what gets fetched, and that's said.
     pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str, kind: &str) {
-        let (heading, text) = match nexus_core::requests::asking(crate::lidarr::offers(), album, title, by, song, kind) {
+        let Some(connection) = crate::requests::current() else { return };
+        let (heading, text) = match nexus_core::requests::asking(connection.offers(), album, title, by, song, kind) {
             nexus_core::requests::Asking::Already(said) => return self.toast(format!("{said} See Requests in the sidebar.")),
             nexus_core::requests::Asking::Ask { heading, text } => (heading, text),
         };
         *self.prompt.borrow_mut() =
-            Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string(), song: song.to_string() });
+            Some(crate::actions::PromptAction::RequestAlbum { connection, album: album.to_string(), title: title.to_string(), song: song.to_string() });
         self.open_prompt(&heading, &text, "Request", None, false);
     }
 
@@ -1889,23 +1943,32 @@ impl Controller {
         }
     }
 
-    pub fn request_album(self: &Rc<Self>, album: String, title: String, song: String) {
-        let Some(lidarr) = crate::lidarr::current() else { return };
+    pub(crate) fn request_album(self: &Rc<Self>, connection: crate::requests::Connection, album: String, title: String, song: String) {
+        if !connection.still_selected() { return; }
         self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
             // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album, crate::bulk::way_back()).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
-            post(move |ctl| match result {
-                Ok(artist) => {
-                    // Noted, so it can be followed up when it arrives.
-                    let now = chrono::Utc::now().timestamp();
-                    let noted = ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
-                    // Marked once the note is kept and shared (see `asked_for`).
-                    crate::lidarr::mark(&album, true);
-                    ctl.refresh_outside();
-                    ctl.toast(if noted { nexus_core::requests::asked_sentence(&title) } else { nexus_core::requests::asked_unnoted(&title, "computer") });
+            let result = nexus_core::requests::request(connection.lidarr(), connection.offers(), &album, crate::bulk::way_back()).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
+            post(move |ctl| {
+                if !connection.still_selected() { return; }
+                match result {
+                    Ok(_) if connection.server() => {
+                        connection.offers().mark(&album, true);
+                        ctl.refresh_outside();
+                        ctl.reload_requests();
+                        ctl.toast(nexus_core::requests::asked_sentence(&title));
+                    }
+                    Ok(artist) => {
+                        // Noted, so it can be followed up when it arrives.
+                        let now = chrono::Utc::now().timestamp();
+                        let noted = ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
+                        // Marked once the note is kept and shared (see `asked_for`).
+                        crate::lidarr::mark(&album, true);
+                        ctl.refresh_outside();
+                        ctl.toast(if noted { nexus_core::requests::asked_sentence(&title) } else { nexus_core::requests::asked_unnoted(&title, "computer") });
+                    }
+                    Err(reason) => ctl.request_error(reason, connection.server()),
                 }
-                Err(reason) => ctl.toast(reason),
             });
         });
     }
@@ -1954,23 +2017,27 @@ impl Controller {
         if name.is_empty() || albums == 0 {
             return;
         }
+        let Some(connection) = crate::requests::current() else { return };
         let (heading, text) = nexus_core::requests::adding(&name, albums);
-        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::AddArtist { artist, name: name.clone() });
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::AddArtist { connection, artist, name: name.clone() });
         self.open_prompt(&heading, &text, "Add artist", None, false);
     }
 
-    pub fn add_artist(self: &Rc<Self>, artist: String, name: String) {
-        let Some(lidarr) = crate::lidarr::current() else { return };
+    pub(crate) fn add_artist(self: &Rc<Self>, connection: crate::requests::Connection, artist: String, name: String) {
+        if !connection.still_selected() { return; }
         self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
-            let result = lidarr.add_artist(&artist, &name, crate::bulk::way_back());
-            post(move |ctl| match result {
-                Ok(_) => {
-                    ctl.refresh_outside();
-                    crate::discover::forget(&artist);
-                    ctl.toast(format!("{}; see Requests in the sidebar.", nexus_core::requests::added(&name)));
+            let result = connection.lidarr().add_artist(&artist, &name, crate::bulk::way_back());
+            post(move |ctl| {
+                if !connection.still_selected() { return; }
+                match result {
+                    Ok(_) => {
+                        ctl.refresh_outside();
+                        crate::discover::forget(&artist);
+                        ctl.toast(format!("{}; see Requests in the sidebar.", nexus_core::requests::added(&name)));
+                    }
+                    Err(reason) => ctl.request_error(reason, connection.server()),
                 }
-                Err(reason) => ctl.toast(reason),
             });
         });
     }
@@ -2004,12 +2071,9 @@ impl Controller {
     /// Offers to ask for the albums that the songs an import couldn't find are on.
     fn prompt_request_missing(self: &Rc<Self>) {
         let albums = self.missing_wants().len();
-        if albums == 0 || crate::lidarr::current().is_none() {
-            return;
-        }
-        if crate::bulk::running() {
-            self.toast("Lidarr is still being asked for the last lot. See Requests.");
-            return self.navigate(Route::Requests);
+        let Some(connection) = crate::requests::current().filter(|_| albums > 0) else { return };
+        if let Some(message) = crate::requests::batch::busy_message() {
+            return self.toast(message);
         }
         let songs = count(self.import_missing.borrow().len() as u32, "song");
         let many = count(albums as u32, "album");
@@ -2028,26 +2092,34 @@ impl Controller {
                 ),
             )
         };
-        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestMissing);
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestMissing(connection));
         self.open_prompt(&heading, &text, "Request them", None, false);
     }
 
     /// Asks for everything the last import didn't find. It's handed over as one batch, which
     /// is worked through in the background and shown on the Requests page (see `bulk`).
-    pub fn request_missing(self: &Rc<Self>) {
+    pub(crate) fn request_missing(self: &Rc<Self>, connection: crate::requests::Connection) {
         let wants = self.missing_wants();
-        if wants.is_empty() || crate::lidarr::current().is_none() {
-            return;
+        if wants.is_empty() { return; }
+        if let Some(message) = crate::requests::batch::busy_message() {
+            return self.toast(message);
         }
+        if !connection.still_selected() { return; }
         self.toast(format!("Asking Lidarr for {}. How it's going is shown here.", count(wants.len() as u32, "album")));
-        crate::bulk::start(wants);
-        self.run_bulk();
+        if connection.server() {
+            let folder = self.requests_folder();
+            crate::requests::batch::run(connection, folder, Some((wants, crate::lidarr::singles())));
+        } else {
+            crate::bulk::start(wants);
+            self.run_bulk();
+        }
         self.invalidate("requests");
         self.navigate(Route::Requests);
     }
 
     /// Carries on with a batch of albums being asked for, if there is one and Lidarr is set up.
     pub fn run_bulk(self: &Rc<Self>) {
+        if !crate::requests::direct_selected() || crate::requests::batch::running() { return; }
         let Some(lidarr) = crate::lidarr::current() else { return };
         if !crate::bulk::unfinished() {
             return;
@@ -2057,6 +2129,7 @@ impl Controller {
     }
 
     fn bulk_event(self: &Rc<Self>, event: crate::bulk::Event) {
+        if !crate::requests::direct_selected() { return; }
         use crate::bulk::Event;
         match event {
             Event::Changed => self.show_bulk_notice(),
@@ -2145,10 +2218,16 @@ impl Controller {
     /// A button beside what the Requests page says of a batch: stop it, carry on with it,
     /// have another go at what it couldn't ask for, or clear away what's left of it.
     fn bulk_action(self: &Rc<Self>, other: bool) {
+        if !crate::requests::direct_selected() { return; }
         let action = {
             let page = self.page.borrow();
             if other { page.notice_other.clone() } else { page.notice_action.clone() }
         };
+        if matches!(action.as_str(), "Carry on" | "Try again")
+            && let Some(message) = crate::requests::batch::busy_message()
+        {
+            return self.toast(message);
+        }
         match action.as_str() {
             "Stop" => {
                 crate::bulk::stop();
@@ -2197,6 +2276,18 @@ impl Controller {
         // What to note once each one's songs are in their playlists.
         let settle: Vec<(i64, String, usize)> =
             arrivals.iter().filter(|arrival| !arrival.fills.is_empty()).map(|arrival| (arrival.at, arrival.title.clone(), arrival.missing)).collect();
+        self.fill_requested_playlists(arrivals, &news, now, move |ctl| {
+            for (at, title, missing) in &settle {
+                ctl.asked.borrow_mut().filled(*at, title, *missing);
+            }
+        });
+    }
+
+    fn fill_requested_playlists(
+        self: &Rc<Self>, arrivals: Vec<crate::asked::Arrival>, news: &str, now: i64,
+        settled: impl FnOnce(&Rc<Self>) + Send + 'static,
+    ) {
+        let news = news.to_string();
         // The songs playlists were waiting for, gathered by playlist. A playlist that was
         // never made (none of its songs were found at the time) is made now.
         let mut by_list: Vec<(String, String, Vec<(String, i64)>)> = Vec::new();
@@ -2240,9 +2331,7 @@ impl Controller {
                 // If a playlist couldn't be saved, these stay marked as waiting and are tried
                 // again the next time the library is looked at.
                 let Ok(done) = result else { return };
-                for (at, title, missing) in &settle {
-                    ctl.asked.borrow_mut().filled(*at, title, *missing);
-                }
+                settled(ctl);
                 let (mut songs, mut names) = (0, Vec::new());
                 for (id, name, added) in &done {
                     // Dated as they were on the playlist they came from, where that's known.
@@ -2273,7 +2362,31 @@ impl Controller {
     /// no longer shown as asked for where it's offered.
     /// `connection` is the number of the connection the row was drawn under: if it's changed
     /// since, the row is another Lidarr's, nothing is sent, and the page is drawn afresh.
-    pub fn cancel_request(self: &Rc<Self>, connection: u64, id: i64, album: String, title: String, artist: String) {
+    pub fn cancel_request(self: &Rc<Self>, connection: u64, id: i64, album: String, title: String, artist: String, via_server: bool) {
+        if via_server {
+            let Some(active @ crate::requests::Connection::Server { number, .. }) = crate::requests::current() else { return };
+            if number != connection { return; }
+            self.requests_pool.spawn(move || {
+                let crate::requests::Connection::Server { context, client, .. } = &active else { return };
+                let context = *context;
+                let result = crate::requests::cancel(client, id, &album);
+                post(move |ctl| {
+                    if !active.still_selected() { return; }
+                    match result {
+                        Ok(()) => {
+                            active.offers().mark(&album, false);
+                            crate::requests::fill::cancel(ctl.requests_folder(), context, album, title.clone(), artist);
+                            ctl.refresh_outside();
+                            ctl.reload_requests();
+                            ctl.toast(nexus_core::requests::off_the_list(&title));
+                        }
+                        Err(reason) => ctl.request_error(reason, true),
+                    }
+                });
+            });
+            return;
+        }
+        if !crate::requests::direct_selected() { return; }
         let Some(lidarr) = crate::lidarr::for_connection(connection) else {
             self.invalidate("requests");
             if self.current_route() == Some(Route::Requests) {
@@ -2309,7 +2422,9 @@ impl Controller {
         // (a quick question to the server; the library is only read again if it has grown).
         let waited = self.asked_ticks.get() + 1;
         self.asked_ticks.set(waited);
-        if waited % 240 == 0 && self.asked.borrow().waiting() && crate::lidarr::current().is_some() {
+        if waited % 240 == 0 && (crate::requests::current().is_some_and(|connection| connection.server())
+            || (crate::requests::direct_selected() && self.asked.borrow().waiting() && crate::lidarr::current().is_some()))
+        {
             self.load_library();
         }
         if self.current_route() != Some(Route::Requests) {
@@ -2428,7 +2543,7 @@ impl Controller {
                 })
             })
             .collect();
-        let askable = crate::lidarr::current().is_some() && !self.missing_wants().is_empty();
+        let askable = crate::requests::current().is_some() && !self.missing_wants().is_empty();
         let page = PageData {
             action: if askable { "Request the missing albums".into() } else { String::new() },
             title: "Imported from Spotify".into(),
@@ -2470,6 +2585,12 @@ impl Controller {
         }
         // Offline, the copy on disk still serves; there's just no asking for a newer one.
         let online = !self.is_offline();
+        let direct_requests = crate::requests::direct_selected();
+        let nexus_requests = crate::requests::current().and_then(|connection| match connection {
+            crate::requests::Connection::Server { context, .. } => Some(context),
+            _ => None,
+        });
+        let requests_folder = self.requests_folder();
         self.api_pool.spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
             let file = config::library_file(&dir);
@@ -2494,10 +2615,28 @@ impl Controller {
             }
             // Has anything that was asked for turned up?
             let now = chrono::Utc::now().timestamp();
-            let arrived = crate::search::current().map(|index| crate::asked::arrivals(&index, &crate::asked::shared(), now)).unwrap_or_default();
+            let arrived = crate::search::current().map(|index| {
+                if let Some(context) = nexus_requests {
+                    crate::requests::fill::arrivals(&requests_folder, context, &index, now)
+                } else if direct_requests {
+                    crate::asked::arrivals(&index, &crate::asked::shared(), now)
+                } else {
+                    Vec::new()
+                }
+            }).unwrap_or_default();
             post(move |ctl| {
                 ctl.library_busy.set(false);
-                if !arrived.is_empty() {
+                if arrived.is_empty() {
+                    return;
+                }
+                if let Some(context) = nexus_requests {
+                    if online && crate::app_nexus_calls::active(context) {
+                        let done = arrived.clone();
+                        ctl.fill_requested_playlists(arrived, "", now, move |_| {
+                            crate::requests::fill::settled(requests_folder, context, done, now);
+                        });
+                    }
+                } else if crate::requests::direct_selected() {
                     ctl.requests_arrived(arrived);
                 }
             });
@@ -2514,7 +2653,7 @@ impl Controller {
             return self.close_preview();
         }
         // A search beyond the library is likely to follow: have the connection ready for it.
-        if crate::lidarr::current().is_some() {
+        if crate::requests::current().is_some() {
             crate::musicbrainz::warm();
         }
         let Some(client) = self.client() else { return };
@@ -2749,8 +2888,12 @@ impl Controller {
     /// Reloads the page on screen from the server.
     pub fn refresh(self: &Rc<Self>) {
         if let Some(route) = self.current_route() {
-            let scroll = self.ui.global::<ui::View>().get_scroll_y();
-            self.show(route, scroll, true, None);
+            if route == Route::Requests {
+                crate::requests::refresh();
+            } else {
+                let scroll = self.ui.global::<ui::View>().get_scroll_y();
+                self.show(route, scroll, true, None);
+            }
         }
         self.reload_playlists();
     }
@@ -2895,10 +3038,19 @@ impl Controller {
 
         let view = self.ui.global::<ui::View>();
         match route {
+            Route::Requests if !force => {
+                view.set_error("".into());
+                view.set_loading(true);
+                crate::requests::refresh();
+                return;
+            }
             Route::Settings => {
                 view.set_loading(false);
                 view.set_error("".into());
                 self.refresh_cache_size();
+                if self.ui.global::<ui::Settings>().get_tab() == 4 {
+                    crate::requests::refresh();
+                }
                 // Show how the connection to Lidarr stands now, unless a sign-in is under way.
                 if self.ui.global::<ui::Settings>().get_requests_state() != "waiting" {
                     self.check_requests(false);
@@ -3959,18 +4111,20 @@ impl Controller {
         page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
-        page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address, self.key_old_for.borrow().as_deref()).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
-        let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
-        page.set_lidarr_gate(gate.host().into());
-        page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
-        // "Signed in" only at a service that's believed (see `Found::trusted`); a token kept for
-        // one that's refused is offered only to be signed out of, which sends it nowhere.
-        let trusted = gate.trusted(&settings.lidarr_address).is_ok();
-        let vault = self.vault();
-        let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate, self.token_old_for.borrow().as_deref()).is_some();
-        page.set_lidarr_has_token(usable);
-        page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
+        if crate::requests::direct_selected() {
+            page.set_lidarr_address(settings.lidarr_address.as_str().into());
+            page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address, self.key_old_for.borrow().as_deref()).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
+            let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
+            page.set_lidarr_gate(gate.host().into());
+            page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
+            // "Signed in" only at a service that's believed (see `Found::trusted`); a token kept for
+            // one that's refused is offered only to be signed out of, which sends it nowhere.
+            let trusted = gate.trusted(&settings.lidarr_address).is_ok();
+            let vault = self.vault();
+            let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate, self.token_old_for.borrow().as_deref()).is_some();
+            page.set_lidarr_has_token(usable);
+            page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
+        }
         drop(settings);
     }
 
@@ -4122,7 +4276,7 @@ impl Controller {
                 let on_search = matches!(ctl.current_route(), Some(Route::Search(_)));
                 if !query.is_empty() {
                     if crate::journal::recording() {
-                        crate::journal::begin_search(&query, crate::lidarr::current().is_some());
+                        crate::journal::begin_search(&query, crate::requests::current().is_some());
                     }
                     if matches!(ctl.current_route(), Some(Route::Search(ref current)) if *current == query) {
                         if let Some(data) = ctl.search_whole.borrow().as_ref() {
@@ -4415,6 +4569,7 @@ impl Controller {
         settings.on_check_requests(|| {
             with(|ctl| ctl.check_requests(false));
         });
+        settings.on_check_requests_source(crate::requests::refresh);
         settings.on_sign_in_requests(|| {
             with(|ctl| ctl.sign_in_requests());
         });
@@ -4597,7 +4752,7 @@ impl Controller {
             "Artist" => self.page.borrow().title.clone(),
             _ if card.kind == ui::CardKind::Album => card.subtitle.to_string(),
             _ if card.kind == ui::CardKind::Request => {
-                crate::lidarr::offered(&card.id).map(|offer| offer.artist).unwrap_or_default()
+                crate::requests::current().and_then(|connection| connection.offers().offered(&card.id)).map(|offer| offer.artist).unwrap_or_default()
             }
             _ => String::new(),
         };

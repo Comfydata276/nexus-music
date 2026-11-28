@@ -65,6 +65,7 @@ impl<'a> From<Option<(&'a [u8; 32], u64)>> for First<'a> {
 pub struct Lidarr {
     pub binding: Option<LidarrBinding>,
     pub sealed: Option<SealedLidarrKey>,
+    pub(crate) has_saved_key: bool,
 }
 
 pub use crate::store::apart::RequestsSwitch;
@@ -994,7 +995,8 @@ impl Keeper {
         let kept = &self.store.lidarr;
         let binding = configured.map(|address| LidarrBinding { backend: self.backend, address: address.clone(), revision: kept.revision });
         let sealed = kept.sealed.as_deref().filter(|_| binding.is_some()).and_then(SealedLidarrKey::from_bytes);
-        Ok(Lidarr { binding, sealed })
+        let has_saved_key = binding.is_some() && kept.sealed.is_some();
+        Ok(Lidarr { binding, sealed, has_saved_key })
     }
 
     /// The data, to read from (nothing is written through it).

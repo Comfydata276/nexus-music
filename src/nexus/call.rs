@@ -100,7 +100,15 @@ pub fn allowed(get: bool, url: &str, authorization: Option<&str>) -> bool {
     let path = address.path();
     // The account calls, and what the sending half sends (design 13.3, 14.4).
     let sending = [nexus_core::nexus::events::SEND_PATH, nexus_core::nexus::diag::SEND_PATH];
-    let known = if get { path == proto::HELLO } else { account::PATHS.contains(&path) || sending.contains(&path) };
+    let feature = [nexus_core::nexus::events::STATS_PATH, account::GRANT, account::DELETE_LISTENING_DATA,
+        nexus_core::nexus::requests::REQUESTS].contains(&path);
+    let known = if get {
+        path == proto::HELLO
+    } else if feature {
+        authorization.is_some()
+    } else {
+        account::PATHS.contains(&path) || sending.contains(&path)
+    };
     let session_ok = match authorization {
         None => true,
         Some(value) => !get && path != account::SIGN_IN && account::Session::from_authorization(value).is_some(),

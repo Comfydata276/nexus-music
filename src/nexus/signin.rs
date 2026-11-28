@@ -55,6 +55,8 @@ use super::{call, note, vault};
 use crate::config::{self, SignedIn};
 use crate::ui;
 
+mod app_calls;
+
 /// Where this device's own secret is kept.
 const DEVICE: &str = "nexus-device";
 /// What signing in left.
@@ -160,6 +162,10 @@ fn send_job(job: Job) {
 
 /// Tells the machine, from any thread, and has what it says done in order.
 pub fn tell(event: Happened) {
+    tell_for(event, None);
+}
+
+fn tell_for(event: Happened, app_request: Option<u64>) {
     if QUITTING.load(Ordering::SeqCst) {
         return;
     }
@@ -168,6 +174,17 @@ pub fn tell(event: Happened) {
     }
     step(|machine| {
         if !machine.started {
+            if let Some(request) = app_request {
+                app_calls::finish(request, core::AppResult::Stopped);
+            }
+            return None;
+        }
+        if let Some(request) = app_request
+            && let Happened::Answered { ask, .. } | Happened::Failed { ask, .. } = &event
+            && !machine.client.waits_for(*ask)
+        {
+            machine.asks.remove(ask);
+            app_calls::finish(request, core::AppResult::Stopped);
             return None;
         }
         // Where an answer's ask was sent, taken under the same lock as the step it causes.
@@ -396,6 +413,7 @@ pub fn install(ui: &ui::MainWindow) {
     if started.is_err() {
         return;
     }
+    app_calls::attach();
     let app_global = ui.global::<ui::App>();
     app_global.set_nexus_starting(true);
     let weak = ui.as_weak();
@@ -539,17 +557,28 @@ fn worker(paths: config::Paths, jobs: Receiver<Job>) {
 
 /// Does one list. A keep or a forget in it that did not hold: this run is not signed in.
 fn run(paths: &config::Paths, batch: Batch) {
-    if batch.epoch != epoch_now() {
-        return;
+    let results = batch.dos.iter().filter_map(|effect| match effect {
+        Do::AppResult { request, result } => Some((*request, *result)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    let done = if batch.epoch == epoch_now() { run_current(paths, batch) } else { Done::Stopped };
+    for (request, result) in results {
+        app_calls::finish(request, if done == Done::All { result } else { core::AppResult::Stopped });
     }
+}
+
+fn run_current(paths: &config::Paths, batch: Batch) -> Done {
     let start = matches!(batch.cause, Cause::Start);
     let epoch = batch.epoch;
     match perform(paths, batch) {
         Done::All => {}
-        Done::NotKept => return not_kept(),
+        Done::NotKept => {
+            not_kept();
+            return Done::NotKept;
+        }
         // A write of the journal's or Diagnostics' that did not finish: told to nobody (the
         // machine asks again), and nothing after it in the list is done.
-        Done::Stopped => return,
+        Done::Stopped => return Done::Stopped,
     }
     if start {
         // Who is signed in, for the journal and Diagnostics: what was kept, as the start left
@@ -560,6 +589,8 @@ fn run(paths: &config::Paths, batch: Batch) {
             crate::journal::publish_account(saved.as_ref());
         });
     }
+    app_calls::publish();
+    Done::All
 }
 
 /// A keep or a forget did not hold (W7c item 2): the machine stops for the rest of this run,
@@ -573,6 +604,7 @@ fn not_kept() {
         machine.started = false;
         machine.epoch += 1;
     }
+    app_calls::publish();
     note(format_args!("a keep or forget did not hold: not signed in for the rest of this run"));
     window_now(not_kept_shown);
 }
@@ -786,6 +818,7 @@ fn perform(paths: &config::Paths, batch: Batch) -> Done {
                 dispatch(ask);
                 true
             }
+            Do::AppResult { .. } => true,
             Do::Hand(hand) => {
                 let cause = cause.clone();
                 on_window(epoch, move || hand_over(hand, &cause));
@@ -1003,7 +1036,7 @@ fn record_decision_kept_before(paths: &config::Paths, record: &SignedIn) {
 /// (Offline, a sign-out, a newer press, the app ending), it goes unsent and nothing is told.
 /// Its answer or failure is told if the machine still waits for it.
 fn dispatch(ask: Ask) {
-    let (id, url) = (ask.id, ask.url.clone());
+    let (id, url, app_request) = (ask.id, ask.url.clone(), ask.app_request);
     let delay = {
         let mut machine = machine();
         machine.asks.insert(id, url.clone());
@@ -1014,9 +1047,22 @@ fn dispatch(ask: Ask) {
         if !delay.is_zero() && wait_or_quit(delay) {
             return;
         }
-        let waited = || !QUITTING.load(Ordering::SeqCst) && machine().client.waits_for(id);
+        let waited = || {
+            let machine = machine();
+            !QUITTING.load(Ordering::SeqCst)
+                && app_request.is_none_or(|request| !OFFLINE.load(Ordering::SeqCst) && app_calls::waiting(request))
+                && machine.client.waits_for(id)
+        };
+        let stopped = || {
+            if let Some(request) = app_request {
+                app_calls::finish(request, core::AppResult::Stopped);
+                tell(Happened::AppCancelled { request });
+                machine().asks.remove(&id);
+            }
+        };
         if !waited() {
             note(format_args!("ask {id} dropped unsent"));
+            stopped();
             return;
         }
         let request = call::Request {
@@ -1033,10 +1079,14 @@ fn dispatch(ask: Ask) {
             Ok((status, body)) => {
                 if !waited() {
                     note(format_args!("ask {id} answer dropped"));
+                    stopped();
                     return;
                 }
+                if let Some(request) = app_request {
+                    app_calls::stage(request, status, &body);
+                }
                 let hello = request_hello(&url, status, &body);
-                tell(Happened::Answered { ask: id, status, body: AnswerBody::new(body.to_vec()) });
+                tell_for(Happened::Answered { ask: id, status, body: AnswerBody::new(body.to_vec()) }, app_request);
                 if let Some(hello) = hello {
                     let origin = url.strip_suffix(proto::HELLO).unwrap_or_default().to_string();
                     window_now(move || crate::diagnostics::publish_hello(&origin, &hello));
@@ -1045,16 +1095,19 @@ fn dispatch(ask: Ask) {
             Err(call::Unsent::Refused) => {
                 REFUSED_AT_SEND.fetch_add(1, Ordering::SeqCst);
                 note(format_args!("ask {id} refused at the send"));
+                stopped();
             }
             Err(call::Unsent::Failed(how)) => {
                 if waited() {
-                    tell(Happened::Failed { ask: id, failure: Failure { how, inside: None, permission: None } });
+                    tell_for(Happened::Failed { ask: id, failure: Failure { how, inside: None, permission: None } }, app_request);
+                } else {
+                    stopped();
                 }
             }
         }
     });
     if started.is_err() {
-        tell(Happened::Failed { ask: id, failure: Failure { how: core::How::Connect, inside: None, permission: None } });
+        tell_for(Happened::Failed { ask: id, failure: Failure { how: core::How::Connect, inside: None, permission: None } }, app_request);
     }
 }
 

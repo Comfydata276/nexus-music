@@ -113,6 +113,10 @@ impl Client {
             Purpose::SignIn { .. } => (Method::Post, SIGN_IN_WITHIN_MS, account::SIGN_IN_REPLY_MAX_BYTES),
             Purpose::Devices { .. } => (Method::Post, CALL_WITHIN_MS, account::LIST_REPLY_MAX_BYTES),
             Purpose::Events { .. } => (Method::Post, CALL_WITHIN_MS, events::BATCH_REPLY_BYTES),
+            Purpose::App { endpoint, .. } => {
+                let (within, max) = endpoint.limits();
+                (Method::Post, within, max)
+            }
             _ => (Method::Post, CALL_WITHIN_MS, account::SMALL_REPLY_MAX_BYTES),
         };
         if (method == Method::Post) != body.is_some() {
@@ -122,8 +126,12 @@ impl Client {
         self.next_ask = self.next_ask.wrapping_add(1);
         let id = self.next_ask;
         let authorization = credential.map(|session| Hidden(session.authorization()));
+        let app_request = match &what {
+            Purpose::App { request, .. } => Some(*request),
+            _ => None,
+        };
         live.flight.push(Flight { id, what, max_body });
-        out.push(Do::Ask(Ask { id, generation: self.generation, method, url: address.wire(), authorization, body, within_ms, max_body }));
+        out.push(Do::Ask(Ask { id, generation: self.generation, method, url: address.wire(), authorization, body, within_ms, max_body, app_request }));
         true
     }
 
@@ -801,6 +809,10 @@ impl Client {
             }
             Purpose::Events { account, batch } => self.answered_events(account, batch, status, bytes, given, out),
             Purpose::Diagnostics => self.answered_diagnostics(status, bytes, given, out),
+            Purpose::App { request, endpoint, .. } => {
+                let result = self.answer_for_app(endpoint, status, bytes, given, out);
+                out.push(Do::AppResult { request, result });
+            }
         }
         self.settle(given, out);
     }
@@ -1149,8 +1161,11 @@ impl Client {
     // Failures, the network, Offline, ticks, waits, the music server
     // -----------------------------------------------------------------------------------
 
-    pub(super) fn failed(&mut self, ask: u64, failure: Failure, given: &Given) {
+    pub(super) fn failed(&mut self, ask: u64, failure: Failure, given: &Given, out: &mut Vec<Do>) {
         let Some((what, _)) = self.take_flight(ask) else { return };
+        if let Purpose::App { request, .. } = what {
+            out.push(Do::AppResult { request, result: AppResult::Unreachable });
+        }
         self.failed_purpose(what, failure, given);
     }
 
@@ -1220,7 +1235,7 @@ impl Client {
             Purpose::Tell { .. } => {}
             Purpose::Events { account, batch } => self.failed_events((account, batch.life()), given),
             // That attempt is spent; the next is the schedule's.
-            Purpose::Diagnostics => self.unreached(given),
+            Purpose::Diagnostics | Purpose::App { .. } => self.unreached(given),
         }
     }
 
@@ -1258,6 +1273,7 @@ impl Client {
                     live.password = PasswordShown { state: PasswordState::CantReach, words: words::password(PasswordState::CantReach, 0, true) };
                 }
                 Purpose::Tell { .. } => live.flight.push(flight),
+                Purpose::App { request, .. } => out.push(Do::AppResult { request, result: AppResult::Stopped }),
                 Purpose::Verify { .. } | Purpose::Events { .. } | Purpose::Diagnostics => {}
             }
         }

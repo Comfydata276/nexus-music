@@ -1,0 +1,187 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Field, TextButton } from "widgets.slint";
+
+export struct RecentListen {
+    title: string,
+    artist: string,
+    album: string,
+    when: string,
+}
+
+export global Listening {
+    in-out property <string> page;
+    in property <bool> busy;
+    in property <bool> can-delete;
+    in property <string> summary;
+    in property <string> status;
+    in-out property <string> result;
+    in property <[RecentListen]> recent;
+
+    callback show-stats();
+    callback show-recording();
+    callback dismiss();
+    callback refresh();
+    callback delete(string);
+}
+
+component ListeningText inherits Text {
+    color: Theme.muted;
+    font-size: 14px;
+    wrap: word-wrap;
+}
+
+export component ListeningOverlay inherits Rectangle {
+    background: #000000a6;
+
+    // Capture clicks outside the sheet. Use its labelled action to dismiss it.
+    TouchArea { }
+
+    sheet := Rectangle {
+        width: min(580px, root.width - 48px);
+        height: min(root.height - 80px, Listening.page == "stats" ? 580px : 420px);
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.overlay;
+
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+
+            Text {
+                color: Theme.text;
+                text: Listening.page == "recording" ? "What this server records"
+                    : Listening.page == "delete" ? "Delete my listening history"
+                    : "Your stats";
+                font-family: Theme.display;
+                font-size: 25px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            scroll := ScrollView {
+                vertical-stretch: 1;
+                vertical-scrollbar-policy: as-needed;
+                horizontal-scrollbar-policy: always-off;
+
+                VerticalLayout {
+                    width: scroll.visible-width;
+                    alignment: start;
+                    padding-right: 10px;
+                    spacing: 10px;
+
+                    if Listening.page == "recording": VerticalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        ListeningText { text: "Your Nexus server records the songs you start, with their titles, artists and albums. It records when you played them, what you played them from, which device played them, how long you listened, and when you skipped, paused or moved within a song."; }
+                        ListeningText { text: "It also records the words you type into search, including searches that find nothing, when you open the app, and kinds of errors."; }
+                        ListeningText { text: "Your server's admin can see what you listened to and keep a copy. You can delete your listening history in Account settings. The server keeps its nightly backups for seven nights. Copies already taken stay with whoever took them."; }
+                        ListeningText { text: "This PC also sends Diagnostics unless you turn them off in About. The separate Diagnostics report contains counts and kinds of app activity and errors."; }
+                    }
+
+                    if Listening.page == "stats": VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+                        if Listening.result != "": ListeningText { text: Listening.result; }
+                        if Listening.summary != "": Text {
+                            text: Listening.summary;
+                            color: Theme.text;
+                            font-size: 17px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                        if Listening.status != "": ListeningText { text: Listening.status; }
+                        if Listening.recent.length > 0: Text {
+                            text: "Recent plays";
+                            color: Theme.text;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+                        for play in Listening.recent: VerticalLayout {
+                            alignment: start;
+                            spacing: 3px;
+                            Text {
+                                text: play.title;
+                                color: Theme.text;
+                                font-size: 15px;
+                                font-weight: 600;
+                                wrap: word-wrap;
+                            }
+                            ListeningText { text: play.artist + (play.album != "" ? " · " + play.album : ""); }
+                            if play.when != "": ListeningText { text: play.when; }
+                            Rectangle { height: 1px; background: Theme.line; }
+                        }
+                    }
+
+                    if Listening.page == "delete": VerticalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        ListeningText { text: "This deletes the listening and app activity your Nexus server recorded for this account across all your devices, including search words. You can't undo it."; }
+                        ListeningText { text: "Nightly backups can retain this history for seven nights. Your server's admin may also have an earlier copy."; }
+                        ListeningText { text: "Enter your Nexus password to confirm."; }
+                        Field {
+                            text <=> sheet.password;
+                            label: "Nexus password";
+                            placeholder: "Nexus password";
+                            input-type: InputType.password;
+                            accepted => { sheet.submit(); }
+                        }
+                        if Listening.result != "": ListeningText { text: Listening.result; }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 10px;
+
+                if Listening.page == "stats": TextButton {
+                    text: "Delete history…";
+                    enabled: Listening.can-delete && !Listening.busy;
+                    clicked => {
+                        sheet.password = "";
+                        Listening.result = "";
+                        Listening.page = "delete";
+                    }
+                }
+                if Listening.page == "stats": TextButton {
+                    text: "Refresh";
+                    enabled: !Listening.busy;
+                    clicked => { Listening.refresh(); }
+                }
+                if Listening.page == "delete": TextButton {
+                    text: "Cancel";
+                    enabled: !Listening.busy;
+                    clicked => {
+                        sheet.password = "";
+                        Listening.result = "";
+                        Listening.page = "stats";
+                    }
+                }
+                if Listening.page == "delete": TextButton {
+                    text: Listening.busy ? "Deleting…" : "Delete history";
+                    danger: true;
+                    enabled: !Listening.busy && sheet.password != "";
+                    clicked => { sheet.submit(); }
+                }
+
+                if Listening.page != "delete": TextButton {
+                    text: "Done";
+                    primary: true;
+                    clicked => { Listening.dismiss(); }
+                }
+            }
+        }
+
+        property <string> password;
+        function submit() {
+            if !Listening.busy && self.password != "" {
+                Listening.delete(self.password);
+                self.password = "";
+            }
+        }
+    }
+}

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 pub use super::account::DeviceKind;
-use super::account::{self, AccountId, Reply, ReplyResult, RequestHead};
+use super::account::{self, AccountId, DeviceId, Reply, ReplyResult, RequestHead};
 use super::proto::{BackendId, Version};
 use super::wire::{self, BadMessage, Fields, WireBody};
 
@@ -37,6 +37,170 @@ pub const STOP_TOLERANCE_MS: u32 = 999;
 // in its authenticated request. Stats and deletion are separate calls.
 pub const SEND_PATH: &str = "/nexus/api/events/send";
 pub const DELETE_PATH: &str = "/nexus/api/events/delete";
+pub const STATS_PATH: &str = "/nexus/api/events/stats";
+pub const STATS_PAGE: usize = 50;
+pub const STATS_REPLY_BYTES: usize = STATS_PAGE * (EVENT_BYTES + 64) + account::SMALL_REPLY_MAX_BYTES;
+
+/// An opaque position in the account's recent plays, as given by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct StatsCursor(u64);
+
+impl StatsCursor {
+    pub fn new(number: u64) -> Option<Self> {
+        (number > 0 && number <= i64::MAX as u64).then_some(Self(number))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl wire::Value for StatsCursor {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
+    }
+}
+
+wire::object! {
+    StatsRequest { head: RequestHead, after: Option<StatsCursor> }
+}
+
+impl wire::Message for StatsRequest {
+    const MAX_BYTES: usize = account::SMALL_REQUEST_MAX_BYTES;
+}
+
+wire::object! {
+    RecentPlay { device: DeviceId, event: Placed }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct StatsPage {
+    pub starts: u64,
+    pub recent: Vec<RecentPlay>,
+    pub next: Option<StatsCursor>,
+    /// The current revision of this session's account. Older servers omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_revision: Option<u64>,
+}
+
+impl wire::Value for StatsPage {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let rows: Vec<&RawValue> = wire::plain_json(raw_field(&fields, "recent")?.get())?;
+        if rows.len() > STATS_PAGE {
+            return Err(BadMessage::Form);
+        }
+        let recent = rows.into_iter().map(RecentPlay::read).collect::<Result<Vec<_>, _>>()?;
+        let page = Self {
+            starts: fields.get("starts")?,
+            recent,
+            next: fields.get("next")?,
+            account_revision: fields.0.get("account_revision").map(|raw| u64::read(raw)).transpose()?,
+        };
+        page.check()?;
+        Ok(page)
+    }
+
+    fn check(&self) -> Result<(), BadMessage> {
+        if self.recent.len() > STATS_PAGE
+            || self.recent.len() as u64 > self.starts
+            || (self.next.is_some() && self.recent.len() != STATS_PAGE)
+            || self.recent.iter().any(|row| !matches!(row.event.record().kind(), Kind::Start { .. }))
+        {
+            return Err(BadMessage::Form);
+        }
+        Ok(())
+    }
+}
+
+impl ReplyResult for StatsPage {
+    const MAX_DONE_BYTES: usize = STATS_REPLY_BYTES;
+}
+
+pub type StatsReply = Reply<StatsPage>;
+
+/// Read the complete stamped stats page. Refusals keep the account reply's small limit.
+pub fn read_stats_reply(status: u16, whole_body: &[u8]) -> Result<StatsReply, BadMessage> {
+    account::read_reply(status, whole_body)
+}
+
+/// The two self-delete POSTs share one scope, revision and action ID. The
+/// app sends each once through its session driver and hands the whole answer back.
+pub struct HistoryDeletion {
+    head: RequestHead,
+    account: AccountId,
+    backend: BackendId,
+    life: u64,
+    revision: u64,
+    request: account::RequestId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistoryDeleteError {
+    MissingRevision,
+    Invalid,
+    Refused(account::Refusal),
+}
+
+impl From<BadMessage> for HistoryDeleteError {
+    fn from(_: BadMessage) -> Self {
+        Self::Invalid
+    }
+}
+
+impl HistoryDeletion {
+    /// The stamp and current revision come from the same checked stats page.
+    pub fn new(
+        head: RequestHead, stamp: &account::Stamp, page: &StatsPage, request: account::RequestId,
+    ) -> Result<Self, HistoryDeleteError> {
+        if head.restore != stamp.restore {
+            return Err(HistoryDeleteError::Invalid);
+        }
+        let revision = page.account_revision.ok_or(HistoryDeleteError::MissingRevision)?;
+        Ok(Self { head, account: stamp.account, backend: stamp.backend, life: stamp.life, revision, request })
+    }
+
+    pub fn grant(&self, password: account::Password) -> Result<WireBody, HistoryDeleteError> {
+        Ok(account::encode(&account::GrantRequest {
+            head: self.head(),
+            change: account::GrantChange::DeleteListeningData {
+                account: self.account, target_revision: self.revision, request_id: self.request,
+            },
+            password,
+        })?)
+    }
+
+    pub fn spend(&self, status: u16, body: &[u8]) -> Result<WireBody, HistoryDeleteError> {
+        let grant = match account::read_reply::<account::GrantIssued>(status, body)? {
+            Reply::Done { result, receipt } if self.owns(&receipt.stamp) && receipt.stamp.life == self.life => result.grant,
+            Reply::Refused(reason) => return Err(HistoryDeleteError::Refused(reason)),
+            _ => return Err(HistoryDeleteError::Invalid),
+        };
+        Ok(account::encode(&account::DeleteListeningData {
+            head: self.head(),
+            request_id: self.request,
+            change: account::DeleteListeningDataTarget { account: self.account, target_revision: self.revision },
+            grant,
+        })?)
+    }
+
+    pub fn confirmed_life(&self, status: u16, body: &[u8]) -> Result<u64, HistoryDeleteError> {
+        match account::read_reply::<account::SignedOut>(status, body)? {
+            Reply::Done { receipt, .. } if self.owns(&receipt.stamp) && receipt.stamp.life > self.life => Ok(receipt.stamp.life),
+            Reply::Refused(reason) => Err(HistoryDeleteError::Refused(reason)),
+            _ => Err(HistoryDeleteError::Invalid),
+        }
+    }
+
+    fn head(&self) -> RequestHead {
+        RequestHead { speaks: self.head.speaks, restore: self.head.restore }
+    }
+
+    fn owns(&self, stamp: &account::Stamp) -> bool {
+        stamp.account == self.account && stamp.backend == self.backend && stamp.restore == self.head.restore
+    }
+}
 
 /// The design does not say the id's text spelling. Use the backend id's 32 lower-case
 /// hex digits, in its own type. Make the id once, before writing, and send it unchanged.

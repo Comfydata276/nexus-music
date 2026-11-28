@@ -3025,3 +3025,116 @@ fn r11_the_schedule_keep_wrote_is_read_back_and_keeps_the_gap() {
     let later = happen(&mut client, serde_json::json!({"tick": {}}), spent + diag::MIN_GAP_MS);
     assert!(reads(&later), "{later}");
 }
+
+fn feature_post(rig: &mut Rig, request: u64, scope: AppScope, path: &str, body: &account::WireBody) -> Vec<Do> {
+    rig.happen(Happened::AppPost {
+        request, scope, path: path.into(), body: Typed::new(std::str::from_utf8(body.bytes()).unwrap()),
+    })
+}
+
+fn app_result(out: &[Do], number: u64) -> Option<AppResult> {
+    out.iter().find_map(|thing| match thing {
+        Do::AppResult { request, result } if *request == number => Some(*result),
+        _ => None,
+    })
+}
+
+#[test]
+fn app_feature_sends_are_fenced_by_hello_offline_cancel_and_session() {
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let opening = rig.start(kept_signed_in(1));
+    let hello_ask = ask_to(&opening, proto::HELLO).id;
+    let scope = rig.client.app_session().unwrap().scope;
+    let stats = account::encode(&events::StatsRequest { head: scope.head(), after: None }).unwrap();
+    let blocked = feature_post(&mut rig, 1, scope, events::STATS_PATH, &stats);
+    assert!(asks(&blocked).is_empty());
+    assert_eq!(app_result(&blocked, 1), Some(AppResult::Unreachable));
+    rig.reply(hello_ask, hello());
+    assert!(rig.client.app_session().unwrap().verified);
+
+    let out = feature_post(&mut rig, 2, scope, events::STATS_PATH, &stats);
+    let ask = only_ask(&out);
+    assert_eq!((ask.app_request, ask.max_body), (Some(2), events::STATS_REPLY_BYTES));
+    assert_eq!(ask.authorization.as_ref().unwrap().expose(), Session::from_bytes(SESSION).authorization().as_str());
+    assert!(rig.client.waits_for(ask.id));
+    let offline = rig.happen(Happened::Offline(true));
+    assert_eq!(app_result(&offline, 2), Some(AppResult::Stopped));
+    assert!(!rig.client.waits_for(ask.id));
+    let blocked = feature_post(&mut rig, 3, scope, events::STATS_PATH, &stats);
+    assert_eq!(app_result(&blocked, 3), Some(AppResult::Stopped));
+
+    rig.happen(Happened::Offline(false));
+    let out = feature_post(&mut rig, 4, scope, events::STATS_PATH, &stats);
+    let ask = only_ask(&out).id;
+    rig.happen(Happened::AppCancelled { request: 4 });
+    assert!(!rig.client.waits_for(ask));
+    let replaced = AppScope { session: SessionId::new(12).unwrap(), ..scope };
+    let blocked = feature_post(&mut rig, 5, replaced, events::STATS_PATH, &stats);
+    assert_eq!(app_result(&blocked, 5), Some(AppResult::Stopped));
+    let forbidden = feature_post(&mut rig, 6, scope, account::FORCE_OUT, &stats);
+    assert_eq!(app_result(&forbidden, 6), Some(AppResult::Invalid));
+    rig.press(Press::SignOut);
+    let blocked = feature_post(&mut rig, 7, scope, events::STATS_PATH, &stats);
+    assert_eq!(app_result(&blocked, 7), Some(AppResult::Stopped));
+}
+
+#[test]
+fn app_delete_publishes_only_after_keeping_the_new_life_and_moving_the_journal() {
+    let mut rig = running(1);
+    let scope = rig.client.app_session().unwrap().scope;
+    let delete = account::encode(&account::DeleteListeningData {
+        head: scope.head(), request_id: account::RequestId::new(72).unwrap(),
+        grant: account::GrantSecret::from_bytes([4; 32]),
+        change: account::DeleteListeningDataTarget { account: scope.account, target_revision: 9 },
+    }).unwrap();
+    let first = feature_post(&mut rig, 1, scope, account::DELETE_LISTENING_DATA, &delete);
+    let other = feature_post(&mut rig, 2, scope, account::DELETE_LISTENING_DATA, &delete);
+    let out = rig.reply(only_ask(&first).id, done(SignedOut {}, receipt_full(backend(), account(), scope.restore, scope.life + 1, 1)));
+    let kept = index_of(&out, |item| matches!(item, Do::Keep(Keep::Saved(saved)) if saved.life == scope.life + 1));
+    let journal = index_of(&out, |item| matches!(item, Do::Journal(JournalDo::LifeMoved { life, .. }) if *life == scope.life + 1));
+    let completion = index_of(&out, |item| matches!(item, Do::AppResult { request: 1, result: AppResult::Checked }));
+    assert!(kept < journal && journal < completion);
+    assert!(!rig.client.waits_for(only_ask(&other).id));
+    let stale = feature_post(&mut rig, 3, scope, account::DELETE_LISTENING_DATA, &delete);
+    assert_eq!(app_result(&stale, 3), Some(AppResult::Stopped));
+}
+
+#[test]
+fn feature_replies_cannot_bypass_type_receipt_or_terminal_refusal_checks() {
+    let mut rig = running(1);
+    let scope = rig.client.app_session().unwrap().scope;
+    let stats = account::encode(&events::StatsRequest { head: scope.head(), after: None }).unwrap();
+    let read = feature_post(&mut rig, 1, scope, events::STATS_PATH, &stats);
+    let invalid = rig.reply(only_ask(&read).id, done(SignedOut {}, receipt(1)));
+    assert_eq!(app_result(&invalid, 1), Some(AppResult::Invalid));
+    let page = || events::StatsPage { starts: 0, recent: Vec::new(), next: None, account_revision: Some(1) };
+    let read = feature_post(&mut rig, 2, scope, events::STATS_PATH, &stats);
+    let wrong_account = done(page(), receipt_full(backend(), AccountId::new(999).unwrap(), scope.restore, scope.life + 1, 1));
+    let invalid = rig.reply(only_ask(&read).id, wrong_account);
+    assert_eq!(app_result(&invalid, 2), Some(AppResult::Stopped));
+    assert!(kept_saved(&invalid).is_empty());
+    let read = feature_post(&mut rig, 3, scope, events::STATS_PATH, &stats);
+    let ended = rig.reply(only_ask(&read).id, session_ended());
+    assert!(forgets(&ended).contains(&Forget::Saved));
+    assert_eq!(app_result(&ended, 3), Some(AppResult::Stopped));
+    assert!(rig.client.app_session().is_none());
+}
+
+#[test]
+fn feature_post_and_completion_use_the_existing_json_entry() {
+    let mut rig = running(1);
+    let session = rig.client.app_session().unwrap();
+    let stats = account::encode(&events::StatsRequest { head: session.scope.head(), after: None }).unwrap();
+    let ask = serde_json::json!({"happened":{
+        "event":{"app_post":{"request":5, "scope":session.scope, "path":events::STATS_PATH,
+            "body":std::str::from_utf8(stats.bytes()).unwrap()}},
+        "given":{"now_ms":START_MS}
+    }});
+    let out = rig.client.call_json(&serde_json::to_vec(&ask).unwrap());
+    let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(value["do"][0]["ask"]["app_request"], 5);
+    assert_eq!(value["app_session"], serde_json::to_value(session).unwrap());
+    let cancel = serde_json::json!({"happened":{"event":{"app_cancelled":{"request":5}},"given":{"now_ms":START_MS}}});
+    rig.client.call_json(&serde_json::to_vec(&cancel).unwrap());
+    assert!(!rig.client.waits_for(value["do"][0]["ask"]["id"].as_u64().unwrap()));
+}

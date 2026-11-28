@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod app_nexus_calls;
 mod asked;
 mod added;
 mod audio;
@@ -26,6 +27,7 @@ mod media;
 mod lidarr;
 mod lyrics;
 mod listenbrainz;
+mod listening;
 mod mixes;
 mod musicbrainz;
 // The Nexus server's component, which signs in: installed here, after the controller, and
@@ -38,6 +40,7 @@ mod pins;
 #[cfg(windows)]
 mod picker;
 mod playback;
+mod requests;
 mod playlists;
 mod plays;
 mod pool;
@@ -94,6 +97,7 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(debug_assertions)]
     journal::test_account();
     // After the controller is made, never by it.
+    listening::install(&controller.ui);
     nexus::install(&controller.ui);
     controller.ui.show()?;
     // The loop is ended explicitly (see `Controller::quit`): with a tray icon present it

@@ -2,7 +2,6 @@
 //! individual intake and grant outcomes. SQLite owns the kept event and its identity together.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -13,7 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::routing::post;
 use nexus_core::nexus::account::{
     self, AccountId, DeleteListeningData, DeviceId, GrantChange, GrantIssued, GrantRequest,
-    GrantSecret, ListDevices, NotAllowed, NotSignedIn, PasswordDoor, Receipt, Refusal, Reply,
+    GrantSecret, NotAllowed, NotSignedIn, PasswordDoor, Receipt, Refusal, Reply,
     RequestHead, SignedOut, Stamp,
 };
 use nexus_core::nexus::events::{self, Answered, BatchAnswer, IncomingBatch, Outcome};
@@ -26,8 +25,7 @@ use crate::accounts::{check::Checked, rows, setup};
 use crate::accounts::session::{Accounts, Answer, refused};
 use crate::store::keeper::Keeper;
 
-pub const STATS_PATH: &str = "/nexus/api/events/stats";
-pub const STATS_PAGE: usize = 50;
+pub use events::{STATS_PAGE, STATS_PATH};
 
 #[derive(Clone)]
 pub(crate) struct Calls {
@@ -482,23 +480,24 @@ pub(crate) fn list_response(page: String, receipt: Receipt) -> Result<Response<B
 async fn stats(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     let outcome = async {
         let hash = bearer(&calls, &headers)?;
-        let request = account::read::<ListDevices>(&body).map_err(|_| Refusal::Malformed)?;
+        let request = account::read::<events::StatsRequest>(&body).map_err(|_| Refusal::Malformed)?;
         let clock = calls.accounts.clock.clone();
-        let (page, stamp) = answer(calls.accounts.desk.ask(move |keeper| {
+        answer(calls.accounts.desk.ask(move |keeper| {
             let (number, _, account, kind) = authenticated(keeper, &request.head, &hash, Access::ReadHistory, clock())?;
             if kind != SessionKind::App {
                 return Err(denied());
             }
             let db = keeper.data().connection();
-            let page = stats_page(db, number, request.after).map_err(unavailable)?;
-            Ok((page, receipt(keeper, account.state())?))
-        }).await)?;
-        list_response(page, stamp)
+            let page = stats_page(db, number, request.after, account.state().revision).map_err(unavailable)?;
+            result(Reply::Done { result: page, receipt: receipt(keeper, account.state())? }, account::encode)
+        }).await)
     }.await;
-    outcome.unwrap_or_else(|reason| respond(refused(reason)))
+    finish(outcome)
 }
 
-fn stats_page(db: &Connection, number: u64, after: Option<DeviceId>) -> rusqlite::Result<String> {
+fn stats_page(
+    db: &Connection, number: u64, after: Option<events::StatsCursor>, revision: u64,
+) -> rusqlite::Result<events::StatsPage> {
     let number = sql(number)?;
     let total = db.query_row("SELECT starts FROM listening_totals WHERE account = ?1", [number], |row| row.get::<_, i64>(0))
         .optional()?.unwrap_or(0);
@@ -510,7 +509,7 @@ fn stats_page(db: &Connection, number: u64, after: Option<DeviceId>) -> rusqlite
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?,
     };
-    let mut page = format!(r#"{{"starts":{total},"recent":["#);
+    let mut recent = Vec::new();
     let mut next = None;
     if let Some((time, id)) = cursor {
         let mut query = db.prepare(
@@ -522,18 +521,16 @@ fn stats_page(db: &Connection, number: u64, after: Option<DeviceId>) -> rusqlite
         for index in 0..STATS_PAGE {
             let Some(row) = rows.next()? else { break };
             let id: i64 = row.get(0)?;
-            let device: i64 = row.get(1)?;
+            let device = u64::try_from(row.get::<_, i64>(1)?).ok().and_then(DeviceId::new)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
             let line: String = row.get(2)?;
-            if index != 0 {
-                page.push(',');
-            }
-            let _ = write!(page, r#"{{"device":{device},"event":{}}}"#, line.trim_end());
+            let event = events::Placed::read(line.trim_end().as_bytes()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            recent.push(events::RecentPlay { device, event });
             if index + 1 == STATS_PAGE && rows.next()?.is_some() {
-                next = Some(id);
+                next = Some(events::StatsCursor::new(id as u64).ok_or(rusqlite::Error::InvalidQuery)?);
             }
         }
     }
-    let next = next.map_or_else(|| "null".into(), |id| id.to_string());
-    let _ = write!(page, r#"],"next":{next}}}"#);
-    Ok(page)
+    let starts = u64::try_from(total).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(events::StatsPage { starts, recent, next, account_revision: Some(revision) })
 }

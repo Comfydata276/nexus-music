@@ -143,6 +143,8 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 mod json;
+mod app_calls;
+pub use app_calls::{AppResult, AppScope, AppSession};
 mod machine;
 mod sending;
 mod words;
@@ -378,6 +380,10 @@ impl Note {
 pub enum Happened {
     /// The person pressed something.
     Pressed(Press),
+    /// Start one typed feature POST. The caller's request number only correlates effects.
+    AppPost { request: u64, scope: AppScope, path: String, body: Typed },
+    /// The caller stopped waiting. An ask still waiting at the send is retired.
+    AppCancelled { request: u64 },
     /// An answer came back to an ask: its status and its whole body, as the transport read
     /// it (never more than the ask's `max_body`; a body cut short is [`How::Cut`] instead).
     /// A redirect is handed in as it came: it is never followed.
@@ -427,6 +433,8 @@ pub enum Happened {
 impl fmt::Debug for Happened {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Happened::AppPost { request, scope, path, .. } => f.debug_struct("AppPost").field("request", request).field("scope", scope).field("path", path).finish(),
+            Happened::AppCancelled { request } => f.debug_struct("AppCancelled").field("request", request).finish(),
             Happened::Pressed(press) => f.debug_tuple("Pressed").field(press).finish(),
             Happened::Answered { ask, status, body } => f.debug_struct("Answered").field("ask", ask).field("status", status).field("body", body).finish(),
             Happened::Failed { ask, failure } => f.debug_struct("Failed").field("ask", ask).field("failure", failure).finish(),
@@ -588,6 +596,8 @@ pub enum Do {
     /// Send this one request, once, and answer with [`Happened::Answered`] or
     /// [`Happened::Failed`] under its id.
     Ask(Ask),
+    /// The feature's whole transport answer is usable only after this effect is reached.
+    AppResult { request: u64, result: AppResult },
     /// Keep this where it says, whole, replacing what was there, in one step.
     Keep(Keep),
     /// Forget this.
@@ -666,6 +676,8 @@ pub struct Ask {
     pub body: Option<Hidden>,
     pub within_ms: u64,
     pub max_body: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_request: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1010,6 +1022,7 @@ enum Purpose {
     Events { account: JournalAccount, batch: events::Batch },
     /// The Diagnostics report (14.4).
     Diagnostics,
+    App { request: u64, endpoint: app_calls::Endpoint, life: u64 },
 }
 
 impl Purpose {
@@ -1020,6 +1033,7 @@ impl Purpose {
                 session == other && backend == other_backend
             }
             (Purpose::Verify { origin }, Purpose::Verify { origin: other }) => origin == other,
+            (Purpose::App { request, .. }, Purpose::App { request: other, .. }) => request == other,
             (left, right) => std::mem::discriminant(left) == std::mem::discriminant(right),
         }
     }
@@ -1437,12 +1451,26 @@ impl Client {
             }
         }
         if self.live.is_none() {
+            if let Happened::AppPost { request, .. } = event {
+                out.push(Do::AppResult { request, result: AppResult::Stopped });
+            }
             return out;
         }
         match event {
+            Happened::AppPost { request, scope, path, body } => {
+                let result = self.post_for_app(request, scope, &path, body, &mut out);
+                if result != AppResult::Checked {
+                    out.push(Do::AppResult { request, result });
+                }
+            }
+            Happened::AppCancelled { request } => {
+                if let Some(live) = self.live.as_mut() {
+                    live.flight.retain(|flight| !matches!(flight.what, Purpose::App { request: pending, .. } if pending == request));
+                }
+            }
             Happened::Pressed(press) => self.pressed(press, given, &mut out),
             Happened::Answered { ask, status, body } => self.answered(ask, status, &body, given, &mut out),
-            Happened::Failed { ask, failure } => self.failed(ask, failure, given),
+            Happened::Failed { ask, failure } => self.failed(ask, failure, given, &mut out),
             Happened::Network { up } => {
                 if up {
                     self.after_reach(given, &mut out, Reached::Network);

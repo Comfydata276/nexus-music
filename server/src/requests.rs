@@ -27,7 +27,7 @@ use axum::{Extension, Router};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, Response};
+use axum::http::{HeaderMap, Response, Uri};
 use axum::routing::post;
 use nexus_core::nexus::account::{
     self, AccountId, DeviceId, NotSignedIn, Receipt, RequestHead, SessionId,
@@ -260,6 +260,7 @@ impl Requests {
     pub(crate) fn router(self: &Arc<Self>, base: Router) -> Router {
         base.merge(Router::new()
             .route(wire::REQUESTS, post(call))
+            .route(wire::ADMIN_REQUESTS, post(call))
             .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
             .route(admin::GET_LIDARR_SETTING, post(get_lidarr))
             .route(admin::SET_LIDARR, post(set_lidarr))
@@ -290,7 +291,7 @@ impl Requests {
             let now = clock();
             let (_, device, account, kind) = events::authenticated(keeper, &head, &ingress.hash, Access::Read, now)?;
             ingress.check(&account, device, kind)?;
-            let actor = Actor { account: account.state().id, session: ingress.caller.session, admin: account.state().admin,
+            let actor = Actor { account: account.state().id, session: ingress.caller.session, admin_page: kind == SessionKind::AdminPage && account.state().admin,
                 restore: head.restore, now: keeper.clock(now).effective() };
             let done = step(keeper, actor)?;
             Ok((done, events::receipt(keeper, account.state())?))
@@ -336,7 +337,7 @@ impl Ingress {
 struct Actor {
     account: AccountId,
     session: SessionId,
-    admin: bool,
+    admin_page: bool,
     restore: u64,
     now: u64,
 }
@@ -919,7 +920,7 @@ struct Job {
     row: i64,
     account: AccountId,
     restore: u64,
-    admin: bool,
+    admin_page: bool,
     change: Change,
     plan: Plan,
     recovering: bool,
@@ -1091,15 +1092,15 @@ fn keep_line(db: &Connection, row: i64, index: u16, text: &str) -> rusqlite::Res
     )
 }
 
-fn submitting_session_live(
+fn submitting_session_kind(
     keeper: &Keeper, actor: &mut Account, session: i64, now: u64,
-) -> Result<bool, Refusal> {
+) -> Result<Option<SessionKind>, Refusal> {
     let session = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
     let live = rows::session_by_id(keeper.data().connection(), session).map_err(sql_error)?;
-    Ok(live.is_some_and(|(number, device, hash, _)| {
-        number == actor.state().id.get() &&
-        events::inspect_session(keeper, actor, device, &Fingerprint::from_bytes(hash), now).is_ok()
-    }))
+    Ok(live.filter(|(number, ..)| *number == actor.state().id.get())
+        .and_then(|(_, device, hash, _)| {
+            events::inspect_session(keeper, actor, device, &Fingerprint::from_bytes(hash), now).ok()
+        }))
 }
 
 fn close_parked_lines(keeper: &mut Keeper, now: u64) -> Result<(), Refusal> {
@@ -1119,7 +1120,7 @@ fn close_parked_lines(keeper: &mut Keeper, now: u64) -> Result<(), Refusal> {
         let account = unsigned(account)?;
         let session_live = if rows::account_exists(keeper.data().connection(), account).map_err(sql_error)? {
             let mut actor = keeper.load(account).map_err(|_| Refusal::NotDealtWith)?;
-            submitting_session_live(keeper, &mut actor, session, now)?
+            submitting_session_kind(keeper, &mut actor, session, now)?.is_some()
         } else {
             false
         };
@@ -1274,23 +1275,23 @@ fn owner_view(
             let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.as_str()).collect::<Vec<_>>())?;
             albums.retain_mut(|album| {
                 let requesters = known.get(album.album.as_str()).map(Vec::as_slice).unwrap_or_default();
-                album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin, requesters).is_ok();
-                actor.admin || requesters.iter().any(|&(id, _)| id == actor.account)
+                album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin_page, requesters).is_ok();
+                actor.admin_page || requesters.iter().any(|&(id, _)| id == actor.account)
             });
         }
-        Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin => {
+        Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.0.as_str()).collect::<Vec<_>>())?;
             for album in albums {
                 album.requested &= mine(&known, &album.album.0);
             }
         }
-        Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } if !actor.admin => {
+        Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &albums.iter().map(|release| release.album.album.0.as_str()).collect::<Vec<_>>())?;
             for release in albums {
                 release.album.requested &= mine(&known, &release.album.album.0);
             }
         }
-        Answer::Listed { releases, .. } if !actor.admin => {
+        Answer::Listed { releases, .. } if !actor.admin_page => {
             let known = owners(db, binding, actor.account, &releases.iter().map(|release| release.album.as_str()).collect::<Vec<_>>())?;
             for release in releases {
                 release.wanted &= mine(&known, &release.album);
@@ -1318,11 +1319,15 @@ enum Dispatch {
 
 async fn call(
     State(service): State<Arc<Requests>>,
+    uri: Uri,
     caller: Option<Extension<Caller>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if crate::admin::is_browser(&headers) && !crate::admin::browser_origin_allowed(&headers, service.origin.as_deref()) {
+    let page = uri.path() == wire::ADMIN_REQUESTS;
+    if (page || crate::admin::is_browser(&headers))
+        && !crate::admin::browser_origin_allowed(&headers, service.origin.as_deref())
+    {
         return events::respond(crate::accounts::session::refused(account::Refusal::Malformed));
     }
     let message = match wire::read_call(&body) {
@@ -1340,6 +1345,11 @@ async fn call(
     let for_finish = RequestHead { speaks: head.speaks, restore: head.restore };
     let state = service.clone();
     let result = service.shown(ingress.clone(), head, move |keeper, actor| {
+        if page && (!actor.admin_page || !matches!(message.call,
+            Call::Pending { .. } | Call::After { .. } | Call::Begin { change: Change::Cancel { .. }, .. }))
+        {
+            return Err(events::denied());
+        }
         Ok(state.dispatch(keeper, actor, message.call))
     }).await;
     match result {
@@ -1393,12 +1403,12 @@ impl Requests {
                     return Ok(Dispatch::Done(Answer::Begun { job }));
                 }
                 if let Change::Cancel { release, .. } = &change {
-                    let known = if actor.admin {
+                    let known = if actor.admin_page {
                         HashMap::new()
                     } else {
                         owners(db, &binding, actor.account, &[release.as_str()])?
                     };
-                    wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin,
+                    wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin_page,
                         known.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
                 }
                 let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
@@ -1555,19 +1565,22 @@ impl Requests {
         let account_id = actor.state().id;
         let allowed = (|| {
             access(keeper, account_id)?.check()?;
-            if actor.state().status != Status::On ||
-                (!matches!(&change, Change::Batch { .. }) && !submitting_session_live(keeper, &mut actor, session, now)?)
-            {
+            if actor.state().status != Status::On {
                 return Err(Refusal::NotSignedIn);
             }
+            let kind = if matches!(&change, Change::Batch { .. }) {
+                None
+            } else {
+                Some(submitting_session_kind(keeper, &mut actor, session, now)?.ok_or(Refusal::NotSignedIn)?)
+            };
             let key = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
             if plan.binding != binding(endpoint) || plan.revision != key.revision {
                 return Err(Refusal::LidarrNotSetUp);
             }
-            Ok(key)
+            Ok((key, kind == Some(SessionKind::AdminPage) && actor.state().admin))
         })();
-        let key = match allowed {
-            Ok(key) => key,
+        let (key, admin_page) = match allowed {
+            Ok(allowed) => allowed,
             Err(reason) => {
                 finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)?;
                 self.wake.notify_one();
@@ -1584,7 +1597,7 @@ impl Requests {
             row,
             account: account_id,
             restore,
-            admin: actor.state().admin,
+            admin_page,
             change,
             plan,
             recovering: stage == MAY_HAVE_CHANGED,
@@ -2048,14 +2061,14 @@ impl Job {
                 check_pending_target(lidarr, *album, release)?;
                 let binding = self.plan.binding;
                 let account = self.account;
-                let admin = self.admin;
+                let admin_page = self.admin_page;
                 let target = release.clone();
                 journal.ask(move |keeper, _, _| {
                     let current = keeper.load(account.get()).map_err(|_| Refusal::NotAllowed)?;
                     let db = keeper.data().connection();
                     let access = access(keeper, account)?;
                     let owners = owners(db, &binding, account, &[target.as_str()])?;
-                    wire::may_cancel(access, account, admin && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
+                    wire::may_cancel(access, account, admin_page && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
                 })?;
                 lidarr_result(lidarr.cancel((*album).into()), None)?;
                 Ok((Completed::Cancelled, Vec::new(), Some(release.clone())))
@@ -2771,11 +2784,15 @@ fn update_work(
 
 fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credential>, Refusal> {
     let saved = keeper.lidarr(Some(&endpoint.address)).map_err(|_| Refusal::NotDealtWith)?;
-    let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else { return Ok(None) };
+    if !saved.has_saved_key {
+        return Ok(None);
+    }
+    let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else {
+        return Err(Refusal::LidarrUnavailable);
+    };
     let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
-    Ok(sealing.open(&binding, &sealed).map(|key| Credential {
-        revision: binding.revision, key, check_stamp: sealed.check_stamp(),
-    }))
+    let key = sealing.open(&binding, &sealed).ok_or(Refusal::LidarrUnavailable)?;
+    Ok(Some(Credential { revision: binding.revision, key, check_stamp: sealed.check_stamp() }))
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -2904,15 +2921,17 @@ async fn get_lidarr(
     let address = service.accounts.lidarr.clone();
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        let key = match endpoint {
-            None => None,
-            Some(endpoint) => credential(keeper, &endpoint).map_err(|_| admin::Refusal::NotDealtWith)?,
+        let (configured, checked) = match endpoint.as_ref().map(|endpoint| credential(keeper, endpoint)) {
+            Some(Ok(Some(key))) => {
+                let checked = keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?;
+                (true, checked)
+            }
+            // Use the existing unchecked setting so the page asks for the key again.
+            Some(Err(Refusal::LidarrUnavailable)) => (true, false),
+            Some(Err(_)) => return Err(admin::Refusal::NotDealtWith),
+            None | Some(Ok(None)) => (false, false),
         };
-        let checked = match &key {
-            Some(key) => keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?,
-            None => false,
-        };
-        Ok(admin::LidarrSetting { address, configured: key.is_some(), checked })
+        Ok(admin::LidarrSetting { address, configured, checked })
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
     admin_reply(configured)
 }
@@ -3030,7 +3049,11 @@ async fn read_attributed(
         let (rows, key) = if let Some(endpoint) = &state.endpoint {
             let rows = attributed_requests(keeper.data().connection(), &binding(endpoint))
                 .map_err(|_| admin::Refusal::NotDealtWith)?;
-            let key = credential(keeper, endpoint).map_err(|_| admin::Refusal::NotDealtWith)?;
+            let key = match credential(keeper, endpoint) {
+                Ok(key) => key,
+                Err(Refusal::LidarrUnavailable) => None,
+                Err(_) => return Err(admin::Refusal::NotDealtWith),
+            };
             (rows, key)
         } else {
             (Vec::new(), None)
