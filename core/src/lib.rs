@@ -21,6 +21,7 @@ pub mod link;
 pub mod listenbrainz;
 pub mod model;
 pub mod musicbrainz;
+pub mod nexus;
 pub mod notes;
 pub mod offer;
 pub mod playlists;

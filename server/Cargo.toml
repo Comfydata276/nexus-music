@@ -1,0 +1,45 @@
+[package]
+name = "nexus-music-server"
+version = "0.1.0"
+edition = "2024"
+description = "The Nexus server: one small service of our own beside the music server"
+publish = false
+
+# Built by itself, apart from the app, as the relay is:
+# `cargo build --manifest-path server/Cargo.toml`. It links the shared library, so that the
+# backend and the apps read the same words the same way (backend design, R4).
+[workspace]
+
+[dependencies]
+nexus-core = { path = "../core" }
+# The runtime the listener, its deadlines and each request's own task run on.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
+# The HTTP/1 connection itself, served one connection at a time with its bounds set by hand:
+# the deadline for a request's head, the size of a head, the number of its headers.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+# Reading and judging a request's head before hyper sees a byte of it, so that nothing is
+# written before the gate has passed. The parser hyper itself uses (already in the lock).
+httparse = "1"
+# hyper's link to tokio: its sockets and its timer.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# Routing a request, once it has passed the bounds, to what answers it.
+axum = { version = "0.8", default-features = false }
+# Calling the router as a service (axum depends on it already, with this same feature).
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Reading a body no larger than its bound (axum depends on it already).
+http-body-util = "0.1"
+# The backend's id, made at random when its store is first made. The version the relay uses.
+getrandom = "0.3"
+
+[dev-dependencies]
+# Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a
+# stranger), which the standard library cannot bind a client to. The relay uses it already.
+socket2 = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# (Not `panic = "abort"`: a fault in one request is caught and outlived, which needs the
+# program to be able to unwind.)
