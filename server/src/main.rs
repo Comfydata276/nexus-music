@@ -140,6 +140,13 @@ fn list(data: &Path) -> Vec<String> {
 }
 
 fn run(settings: Settings) -> ExitCode {
+    let lidarr = match nexus_music_server::requests::Endpoint::read(std::env::var("NEXUS_LIDARR").ok()) {
+        Ok(endpoint) => endpoint,
+        Err(why) => {
+            eprintln!("{why}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(why) = settings.check_folders() {
         eprintln!("{why}");
         return ExitCode::from(2);
@@ -228,7 +235,9 @@ fn run(settings: Settings) -> ExitCode {
             Some(on) => nexus_music_server::hello(id).with_diagnostics_default(on),
             None => nexus_music_server::hello(id),
         };
-        let shell = serve::Shell::backend(settings.proxy, &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget);
+        let shell = serve::Shell::backend_with_requests(
+            settings.proxy, &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget, lidarr,
+        );
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });

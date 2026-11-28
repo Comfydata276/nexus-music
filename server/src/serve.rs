@@ -132,6 +132,7 @@ pub struct Shell {
     proxy: IpAddr,
     router: Router,
     routes: Vec<Route>,
+    requests: Option<Arc<crate::requests::Requests>>,
     open: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
@@ -153,16 +154,33 @@ impl Shell {
     /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
     /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
     pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
+        Self::backend_with_requests(proxy, hello, accounts, public_origin, data_budget, None)
+    }
+
+    pub fn backend_with_requests(
+        proxy: IpAddr,
+        hello: &Hello,
+        accounts: Arc<crate::accounts::session::Accounts>,
+        public_origin: Option<&str>,
+        data_budget: u64,
+        endpoint: Option<crate::requests::Endpoint>,
+    ) -> Arc<Self> {
         let public_origin = public_origin.map(Arc::<str>::from);
+        let requests = crate::requests::Requests::new(accounts.clone(), public_origin.clone(), endpoint);
         let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
         let router = crate::events::router(router, accounts, public_origin, data_budget);
-        Self::with_routes(proxy, router, head::ROUTES.to_vec())
+        let router = requests.router(router);
+        Self::with_requests(proxy, router, head::ROUTES.to_vec(), Some(requests))
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
     pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, open: AtomicUsize::new(0), refused: Default::default() })
+        Self::with_requests(proxy, router, routes, None)
+    }
+
+    fn with_requests(proxy: IpAddr, router: Router, routes: Vec<Route>, requests: Option<Arc<crate::requests::Requests>>) -> Arc<Self> {
+        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, requests, open: AtomicUsize::new(0), refused: Default::default() })
     }
 
     /// How many connections are open now, turned-away ones included.
@@ -274,6 +292,9 @@ pub fn listen(address: std::net::SocketAddr) -> io::Result<TcpListener> {
 /// Accepts and serves connections on `listener` for as long as the program runs. With `log`,
 /// it writes the counts of refusals every [`COUNTS_EVERY`] that there were any.
 pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
+    if let Some(requests) = &shell.requests {
+        requests.start();
+    }
     if log {
         let shell = shell.clone();
         tokio::spawn(async move {
@@ -474,7 +495,17 @@ where
 }
 
 async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    if let Some(requests) = shell.requests.as_ref().filter(|_| crate::requests::guards(parts.uri.path())) {
+        match tokio::time::timeout(HEAD_DEADLINE, requests.admit(parts.uri.path(), &parts.headers)).await {
+            Ok(Ok(ingress)) => { parts.extensions.insert(Arc::new(ingress)); }
+            Ok(Err(mut response)) => {
+                finish(&mut response);
+                return Ok(response);
+            }
+            Err(_) => return Ok(refusal(StatusCode::SERVICE_UNAVAILABLE)),
+        }
+    }
     let bytes = match tokio::time::timeout(BODY_DEADLINE, take_body(body, length)).await {
         Err(_) => {
             shell.count(Refusal::SlowBody);

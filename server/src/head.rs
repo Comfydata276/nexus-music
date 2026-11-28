@@ -174,6 +174,7 @@ pub const ROUTES: &[Route] = &[
     Route::new(account::DELETE_LISTENING_DATA, "POST", account::GRANTED_CHANGE_MAX_BYTES),
     Route::new(account::GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(crate::events::STATS_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(nexus_core::nexus::requests::REQUESTS, "POST", nexus_core::nexus::requests::CALL_MAX_BYTES),
     Route::new(diag::SEND_PATH, "POST", diag::CALL_BYTES),
     Route::new(crate::diag::LIST_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(crate::diag::ADMIN_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
@@ -181,6 +182,8 @@ pub const ROUTES: &[Route] = &[
     // envelope's own ceiling, the read small.
     Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(admin::SET_MUSIC_LOGIN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(crate::requests::GET_LIDARR, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::SET_REQUESTS_ENABLED, "POST", account::GRANTED_CHANGE_MAX_BYTES),
     Route::new(admin::SET_MUSIC_SERVER, "POST", account::GRANTED_CHANGE_MAX_BYTES),
     Route::new(admin::GET_MUSIC_SERVER, "POST", account::SMALL_REQUEST_MAX_BYTES),
 ];
