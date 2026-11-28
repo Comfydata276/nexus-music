@@ -279,7 +279,7 @@ object! { GetMusicServer { head: RequestHead } }
 object! { MusicServer { internal: InternalAddress, public: Option<MusicAddress> } }
 object! { GetDiagnosticsDefault { head: RequestHead } }
 object! { GetLidarrSetting { head: RequestHead } }
-/// The configured container address and whether its current key is usable.
+/// The configured container address and whether a key is saved for it.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct LidarrSetting {
     pub address: Option<InternalAddress>,
