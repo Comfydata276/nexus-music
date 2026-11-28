@@ -7,6 +7,7 @@ use super::account::{
     Name, NotSignedIn, OneTimeCode, RequestHead, RequestId, SessionId, Wait,
 };
 pub use super::account::{GrantIssued, GrantSecret};
+use super::kept::{self, AccountState, AdminAction, AdminTarget, GrantIntent, LeaveFor};
 use super::proto::Version;
 use super::wire::{self, Fields, object, plain_json, read_text, write_version};
 pub use super::wire::{BadMessage, WireBody, encode, read};
@@ -309,6 +310,38 @@ pub enum Action {
     SetRequestsEnabled(RequestsEnabled),
 }
 
+impl Action {
+    /// Select the stored account whose current revision the grant must fence.
+    pub fn target_account(&self) -> Option<AccountId> {
+        match self {
+            Self::SetAccountEnabled(change) => Some(change.account),
+            Self::SetAdmin(change) => Some(change.account),
+            Self::DeleteAccount(account) | Self::ResetPassword(account) |
+            Self::SetMusicLogin(account) => Some(*account),
+            Self::ForceOut(change) => Some(change.account),
+            Self::SetRequestsEnabled(change) => Some(change.account),
+            Self::CreateAccount(_) | Self::SetMusicServer(_) | Self::SetDiagnosticsDefault(_) => None,
+        }
+    }
+
+    fn kept_action(&self) -> AdminAction {
+        match self {
+            Self::CreateAccount(_) => AdminAction::CreateAccount,
+            Self::SetAccountEnabled(change) => AdminAction::SetOn(change.enabled),
+            Self::SetAdmin(change) => AdminAction::SetAdmin(change.admin),
+            Self::DeleteAccount(_) => AdminAction::DeleteAccount,
+            Self::ResetPassword(_) => AdminAction::ResetPassword,
+            Self::SetMusicServer(address) => AdminAction::SetMusicAddress(address.clone()),
+            Self::SetMusicLogin(_) => AdminAction::MusicLoginChanged,
+            Self::ForceOut(change) => AdminAction::ForceOut(kept::SessionTarget {
+                device: change.device, session: change.session,
+            }),
+            Self::SetDiagnosticsDefault(change) => AdminAction::SetDiagnosticsDefault(change.enabled),
+            Self::SetRequestsEnabled(change) => AdminAction::SetRequests(change.enabled),
+        }
+    }
+}
+
 impl wire::Value for Action {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
         let (action, value) = Fields::read(raw)?.select(&[
@@ -332,9 +365,32 @@ impl wire::Value for Action {
     }
 }
 
-// the design does not say how the grant and idempotency number are related.
-// Name the number alongside the action in C7's common grant envelope.
 object! { NamedChange { request_id: RequestId, action: Action } }
+
+impl NamedChange {
+    /// Derive the named change again from the actual mutation at spend time.
+    pub fn for_request<T: Change>(request: &Granted<T>) -> Self {
+        Self { request_id: request.request_id, action: request.change.action() }
+    }
+
+    /// Resolve an account target under the store lock using its authoritative
+    /// current state. The caller supplies no account for create or global edits.
+    /// Kept is responsible for both issuance and consumption of the intent.
+    pub fn grant_intent(&self, selected: Option<&AccountState>) -> Option<GrantIntent> {
+        let target = match (self.action.target_account(), selected) {
+            (Some(id), Some(state)) if state.id == id => state.admin_target(),
+            (None, None) => match &self.action {
+                Action::CreateAccount(email) => AdminTarget::NewAccount(email.clone()),
+                _ => AdminTarget::Backend,
+            },
+            _ => return None,
+        };
+        Some(GrantIntent {
+            request_id: self.request_id,
+            change: LeaveFor::Admin { action: self.action.kept_action(), target },
+        })
+    }
+}
 
 pub type RequestGrant = GrantRequest<NamedChange>;
 
@@ -605,8 +661,8 @@ mod tests {
             let request = granted(change);
             round_trip(RequestGrant {
                 head: head(),
-                change: NamedChange { request_id: request.request_id, action: request.change.action() },
-                password: Password::new("example admin password").unwrap(),
+                change: NamedChange::for_request(&request),
+                password: Password::presented("example admin password").unwrap(),
             });
             round_trip(request);
         }
@@ -752,7 +808,7 @@ mod tests {
                 request_id: RequestId::new(u64::MAX).unwrap(),
                 action: Action::CreateAccount(Email::new(&email).unwrap()),
             },
-            password: Password::new(&"\0".repeat(account::PASSWORD_MAX_CHARS)).unwrap(),
+            password: Password::presented(&"\0".repeat(account::PASSWORD_MAX_CHARS)).unwrap(),
         };
         round_trip(grant);
 
@@ -786,4 +842,166 @@ mod tests {
         };
         assert_ne!(first.action(), second.action());
     }
+
+    fn stored_account(id: AccountId, admin: bool) -> kept::Account {
+        let mut account = AccountState::new(
+            proto::BackendId::from_bytes([0x51; 16]),
+            1,
+            id,
+            Email::new("sample@example.test").unwrap(),
+            None,
+        );
+        account.admin = admin;
+        account.password_reset_required = false;
+        let apart = kept::Apart { account: account.clone(), devices: Default::default() };
+        let data = kept::Rows { account, devices: Default::default() };
+        kept::Account::load(&apart, Some(&data))
+    }
+
+    fn step<T>(
+        account: &mut kept::Account,
+        now: u64,
+        operation: impl FnOnce(kept::Turn<'_>) -> Result<T, kept::Denied>,
+    ) -> Result<T, kept::Denied> {
+        account.request(1, kept::Clock { now, high_water: now }, operation)
+            .apply(|_| Ok::<(), std::convert::Infallible>(())).unwrap()
+    }
+
+    fn signed_in_admin() -> (kept::Account, DeviceId, kept::Fingerprint) {
+        let mut actor = stored_account(AccountId::new(1).unwrap(), true);
+        let device = DeviceId::new(1).unwrap();
+        let secret = account::DeviceSecret::from_bytes([0x61; account::SECRET_BYTES]);
+        let verifier = kept::Fingerprint::of(&[0x62; account::SECRET_BYTES]);
+        let bearer = kept::Fingerprint::of(&[0x63; account::SECRET_BYTES]);
+        let proof = step(&mut actor, 1, |turn| turn.check_sign_in(&secret, device, verifier.clone()))
+            .unwrap().check(verifier, kept::Clock { now: 1, high_water: 1 }).unwrap();
+        step(&mut actor, 1, |turn| turn.sign_in(proof, kept::FreshSession {
+            id: SessionId::new(1).unwrap(),
+            hash: bearer.clone(),
+            sign_out: kept::Fingerprint::of(&[0x64; account::SECRET_BYTES]),
+        }, None)).unwrap();
+        (actor, device, bearer)
+    }
+
+    fn authorize(
+        actor: &mut kept::Account,
+        device: DeviceId,
+        bearer: &kept::Fingerprint,
+        intent: GrantIntent,
+        secret: &GrantSecret,
+    ) {
+        let verifier = kept::Fingerprint::of(&[0x62; account::SECRET_BYTES]);
+        let proof = step(actor, 2, |turn| {
+            turn.check_leave(kept::Bearer { device, hash: bearer, grant: None }, intent, verifier.clone())
+        }).unwrap().check(verifier, kept::Clock { now: 2, high_water: 2 }).unwrap();
+        step(actor, 2, |turn| turn.grant_leave(proof, secret)).unwrap();
+    }
+
+    fn spend(
+        actor: &mut kept::Account,
+        device: DeviceId,
+        hash: &kept::Fingerprint,
+        secret: &GrantSecret,
+        change: &NamedChange,
+        target: Option<&mut kept::Account>,
+    ) -> Result<(), kept::Denied> {
+        let selected = target.as_deref().map(|account| account.rows().account);
+        let intent = change.grant_intent(selected.as_ref()).unwrap();
+        let LeaveFor::Admin { action, target: named } = intent.change else {
+            unreachable!("an admin mutation");
+        };
+        let bearer = kept::Bearer {
+            device, hash, grant: Some(kept::GrantUse { request_id: intent.request_id, secret }),
+        };
+        step(actor, 3, |turn| {
+            if action == AdminAction::MusicLoginChanged {
+                return turn.authorize_music(bearer, target.as_deref()).map(|_| ());
+            }
+            turn.administer(bearer, action, named, target)
+        })
+    }
+
+    #[test]
+    fn every_admin_mutation_only_spends_its_numbered_kept_grant() {
+        let id = account_id();
+        let cases = [
+            Action::CreateAccount(email()),
+            AccountEnabled { account: id, enabled: false }.action(),
+            AdminRole { account: id, admin: true }.action(),
+            DeleteTarget { account: id }.action(),
+            AccountTarget { account: id }.action(),
+            MusicServerAddress { public: public() }.action(),
+            Action::SetMusicLogin(id),
+            session_target().action(),
+            DiagnosticsDefault { enabled: true }.action(),
+            RequestsEnabled { account: id, enabled: true }.action(),
+        ];
+        for action in cases {
+            let (mut actor, device, hash) = signed_in_admin();
+            let mut target = action.target_account().map(|id| stored_account(id, false));
+            let selected = target.as_ref().map(|account| account.rows().account);
+            let secret = GrantSecret::from_bytes([0x65; account::SECRET_BYTES]);
+            let mut change = NamedChange { action, request_id: RequestId::new(7).unwrap() };
+            authorize(&mut actor, device, &hash, change.grant_intent(selected.as_ref()).unwrap(), &secret);
+            change.request_id = RequestId::new(8).unwrap();
+            assert_eq!(
+                spend(&mut actor, device, &hash, &secret, &change, target.as_mut()),
+                Err(kept::Denied::LeaveRequired),
+            );
+            change.request_id = RequestId::new(7).unwrap();
+            assert_eq!(spend(&mut actor, device, &hash, &secret, &change, target.as_mut()), Ok(()));
+            assert_eq!(
+                spend(&mut actor, device, &hash, &secret, &change, target.as_mut()),
+                Err(kept::Denied::LeaveRequired),
+            );
+        }
+    }
+
+    #[test]
+    fn kept_rejects_other_addresses_emails_accounts_revisions_and_toggle_values() {
+        let id = account_id();
+        let other = AccountId::new(8).unwrap();
+        let request_id = RequestId::new(7).unwrap();
+        let secret = GrantSecret::from_bytes([0x65; account::SECRET_BYTES]);
+        let (mut actor, device, hash) = signed_in_admin();
+
+        for (approved, changed) in [
+            (Action::SetMusicServer(public()), Action::SetMusicServer(MusicAddress::new("https://elsewhere.example.test").unwrap())),
+            (Action::CreateAccount(email()), Action::CreateAccount(Email::new("other@example.test").unwrap())),
+            (DiagnosticsDefault { enabled: true }.action(), DiagnosticsDefault { enabled: false }.action()),
+        ] {
+            let approved = NamedChange { request_id, action: approved };
+            authorize(&mut actor, device, &hash, approved.grant_intent(None).unwrap(), &secret);
+            let changed = NamedChange { request_id, action: changed };
+            assert_eq!(spend(&mut actor, device, &hash, &secret, &changed, None), Err(kept::Denied::LeaveRequired));
+            assert_eq!(spend(&mut actor, device, &hash, &secret, &approved, None), Ok(()));
+        }
+
+        let mut original = stored_account(id, false);
+        let mut elsewhere = stored_account(other, false);
+        let approved = NamedChange { request_id, action: AdminRole { account: id, admin: true }.action() };
+        assert!(approved.grant_intent(Some(&elsewhere.rows().account)).is_none());
+        authorize(&mut actor, device, &hash, approved.grant_intent(Some(&original.rows().account)).unwrap(), &secret);
+        for changed in [
+            AdminRole { account: id, admin: false },
+            AdminRole { account: other, admin: true },
+        ] {
+            let selected = if changed.account == id { &mut original } else { &mut elsewhere };
+            let changed = NamedChange { request_id, action: changed.action() };
+            assert_eq!(
+                spend(&mut actor, device, &hash, &secret, &changed, Some(selected)),
+                Err(kept::Denied::LeaveRequired),
+            );
+        }
+        let mut row = original.rows();
+        row.account.revision += 1;
+        let apart = kept::Apart { account: row.account.clone(), devices: Default::default() };
+        let mut revised = kept::Account::load(&apart, Some(&row));
+        assert_eq!(
+            spend(&mut actor, device, &hash, &secret, &approved, Some(&mut revised)),
+            Err(kept::Denied::LeaveRequired),
+        );
+        assert_eq!(spend(&mut actor, device, &hash, &secret, &approved, Some(&mut original)), Ok(()));
+    }
+
 }
